@@ -39,7 +39,6 @@ async fn main() {
     }
 
     let bot_token = env::var("SLACK_BOT_TOKEN").expect("Bot Token NOT FOUND");
-    let app_token = env::var("SLACK_APP_TOKEN").expect("App Token NOT FOUND");
 
     let state = AppState {
         client: Client::new(),
