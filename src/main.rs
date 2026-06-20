@@ -1,5 +1,7 @@
+use crate::Task::Recipe;
 use axum::{Form, Json, extract::State, routing::post};
 use dotenvy::dotenv;
+use image::{GenericImage, ImageFormat};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -11,6 +13,7 @@ enum Task {
     Recipe {
         item_name: String,
         response_url: String,
+        channel_id: String,
     },
 }
 
@@ -23,7 +26,20 @@ struct AppState {
 }
 
 #[derive(Deserialize)]
-struct McRecipe {}
+#[serde(tag = "type")]
+enum MCRecipe {
+    #[serde(rename = "minecraft:crafting_shaped")]
+    Shaped {
+        key: HashMap<String, String>,
+        pattern: Vec<String>,
+        result: HashMap<String, String>,
+    },
+    #[serde(rename = "minecraft:crafting_shapeless")]
+    Shapeless {
+        ingredients: Vec<String>,
+        result: HashMap<String, String>,
+    },
+}
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
@@ -242,9 +258,20 @@ async fn main() {
                 .filename()
                 .as_str()
                 .expect("Invalid UTF-8 Filename (Step 5 of item reading)");
-            if filename.starts_with("assets/minecraft/textures/") && filename.ends_with(".png") {
+            if filename.eq("assets/minecraft/textures/gui/container/crafting_table.png") {
                 let item_name = filename
                     .strip_prefix("assets/minecraft/textures/")
+                    .unwrap()
+                    .strip_suffix(".png")
+                    .unwrap()
+                    .to_string();
+                temp_items_map.insert(item_name, i);
+            } else if filename.starts_with("assets/minecraft/textures/")
+                && filename.ends_with(".png")
+            {
+                let filename_parts = filename.split('/');
+                let item_name = filename_parts
+                    .last()
                     .unwrap()
                     .strip_suffix(".png")
                     .unwrap()
@@ -263,6 +290,7 @@ async fn main() {
             }
             items.insert(item.0, item_png_bytes);
         }
+
         println!("Saved items to the item map");
     }
 
@@ -277,11 +305,13 @@ async fn main() {
 
     tokio::spawn(async move {
         let client = Client::new();
+        let bot_token = env::var("SLACK_BOT_TOKEN").expect("Bot Token NOT FOUND");
         while let Some(task) = queue_output.recv().await {
             match task {
-                Task::Recipe {
+                Recipe {
                     item_name,
                     response_url,
+                    channel_id,
                 } => {
                     let url = format!(
                         "https://raw.githubusercontent.com/misode/mcmeta/refs/heads/data-json/data/minecraft/recipe/{item_name}.json"
@@ -295,10 +325,118 @@ async fn main() {
                             // TODO: Tell user that it failed and not crash
                         }
                     };
-                    let recipe_json: serde_json::Value = response
+                    let recipe_json: MCRecipe = response
                         .json()
                         .await
                         .expect("Unable to convert... json file to json??");
+
+                    let mut items_placement = Vec::new();
+                    match recipe_json {
+                        MCRecipe::Shaped {
+                            key,
+                            pattern,
+                            result,
+                        } => {
+                            for part in pattern {
+                                part.chars().for_each(|char| {
+                                    let item = if !char.is_whitespace() {
+                                        key.get(char.to_string().as_str())
+                                            .unwrap()
+                                            .strip_prefix("minecraft:")
+                                            .unwrap_or_else(|| " ")
+                                    } else {
+                                        " "
+                                    };
+                                    items_placement.push(item);
+                                });
+                            }
+
+                            let crafting_table_gui_bytes = items
+                                .get("gui/container/crafting_table")
+                                .expect("Unable to find crafting table grid in items vector");
+                            let crafting_table_gui = image::load_from_memory(
+                                crafting_table_gui_bytes,
+                            )
+                            .expect("Unable to make an image from the crafting table bytes");
+
+                            let mut crafting_table_gui = crafting_table_gui.crop_imm(0, 0, 170, 80);
+
+                            let grid_origin_x = 26;
+                            let grid_origin_y = 13;
+                            let cell_size = 17; //+1 for the border
+
+                            let mut i = 0;
+                            for row in 0..3 {
+                                for col in 0..3 {
+                                    let cell_x = grid_origin_x + (col * cell_size);
+                                    let cell_y = grid_origin_y + (row * cell_size);
+
+                                    if items_placement[i] != " " {
+                                        let item_bytes = items
+                                            .get(items_placement[i])
+                                            .expect("How on earth did this happen (1)");
+                                        let item_texture_img = image::load_from_memory(item_bytes)
+                                            .expect("Unable to make an image from an item's bytes");
+                                        crafting_table_gui
+                                            .copy_from(&item_texture_img, cell_x, cell_y)
+                                            .unwrap();
+                                    }
+
+                                    i += 1;
+                                }
+                            }
+
+                            let mut bytes_to_send_to_slack = Vec::new(); // lovely name i know thank you
+                            crafting_table_gui
+                                .write_to(
+                                    &mut Cursor::new(&mut bytes_to_send_to_slack),
+                                    ImageFormat::Png,
+                                )
+                                .expect("Failed to convert the image back into bytes");
+
+                            let upload_url_response = client
+                                .post("https://slack.com/api/files.getUploadURLExternal")
+                                .bearer_auth(&bot_token)
+                                .form(&[
+                                    ("filename", format!("{item_name}_recipe.png")),
+                                    ("length", bytes_to_send_to_slack.len().to_string()),
+                                ])
+                                .send()
+                                .await
+                                .expect(
+                                    "Failed to ask for crafting recipe file upload url from slack",
+                                );
+
+                            let upload_data: serde_json::Value = upload_url_response
+                                .json()
+                                .await
+                                .expect("Unable to convert the upload url response into json");
+                            let upload_url = upload_data["upload_url"].as_str().unwrap();
+                            let file_id = upload_data["file_id"].as_str().unwrap();
+
+                            client
+                                .post(upload_url)
+                                .body(bytes_to_send_to_slack)
+                                .send()
+                                .await
+                                .expect("Failed to upload crafting recipe file bytes to slack");
+
+                            // Step 3: complete it, attach to channel
+                            client
+                                .post("https://slack.com/api/files.completeUploadExternal")
+                                .bearer_auth(&bot_token)
+                                .json(&json!({
+                                    "files": [{ "id": file_id, "title": "Recipe" }],
+                                    "channel_id": channel_id
+                                }))
+                                .send()
+                                .await
+                                .expect("Unable to send the completion request for the file");
+
+                            //TODO: Better error handling. If fails just tell user, don't crash.
+                        }
+                        _ => (),
+                    }
                 } // Add more later obvs
             }
         }
@@ -345,9 +483,25 @@ async fn handle_command(
     match payload.command.as_str() {
         "/recipe" => {
             if state.valid_recipes.contains(&payload.text) {
-                Json(
-                    json!({"response_type": "ephemeral", "text": "Gathering images and sewing 'em up, hang on a second!"}),
-                )
+                match state
+                    .mpsc
+                    .send(Recipe {
+                        item_name: payload.text,
+                        response_url: payload.response_url,
+                        channel_id: payload.channel_id,
+                    })
+                    .await
+                {
+                    Ok(..) => Json(
+                        json!({"response_type": "ephemeral", "text": "Gathering images and sewing 'em up, hang on a second!"}),
+                    ),
+                    Err(e) => {
+                        eprintln!("Error occurred sending task to generate image: {e}");
+                        Json(
+                            json!({"response_type": "ephemeral", "text": "I wasn't able to start generating your image. Please try again."}),
+                        )
+                    }
+                }
             } else {
                 Json(json!({"response_type": "ephemeral", "text": "Your recipe was invalid."}))
             }
