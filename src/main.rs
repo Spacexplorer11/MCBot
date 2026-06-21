@@ -351,6 +351,12 @@ async fn main() {
                                 });
                             }
 
+                            /* Delete this later but
+                            TODO: Fix the item images
+                            TODO: Add the result
+                            TODO: Don't crash for tags / implement them, you need to fetch the stuff from somewhere.
+                             */
+
                             let crafting_table_gui_bytes = items
                                 .get("gui/container/crafting_table")
                                 .expect("Unable to find crafting table grid in items vector");
@@ -361,9 +367,9 @@ async fn main() {
 
                             let mut crafting_table_gui = crafting_table_gui.crop_imm(0, 0, 170, 80);
 
-                            let grid_origin_x = 26;
-                            let grid_origin_y = 13;
-                            let cell_size = 17; //+1 for the border
+                            let grid_origin_x = 29;
+                            let grid_origin_y = 16;
+                            let cell_size = 18; // +2 for the border
 
                             let mut i = 0;
                             for row in 0..3 {
