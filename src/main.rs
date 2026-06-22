@@ -351,7 +351,6 @@ async fn main() {
                         }
 
                         /* Delete this later but
-                        TODO: Add the result
                         TODO: Don't crash for tags / implement them, you need to fetch the stuff from somewhere.
                         TODO: Implement for stuff for shapeless recipes and search if any other recipes exist / test and handle them
                          */
@@ -364,7 +363,7 @@ async fn main() {
 
                         let mut crafting_table_gui = crafting_table_gui.crop_imm(0, 0, 170, 80);
 
-                        let grid_origin_x = 29;
+                        let grid_origin_x = 30;
                         let grid_origin_y = 16;
                         let cell_size = 18; // +2 for the border
 
@@ -390,6 +389,23 @@ async fn main() {
                                 }
 
                                 i += 1;
+
+                                if i == 9 {
+                                    let result_x = cell_x + 58; // magic number obtained through trial and error
+                                    let result_y = 35;
+                                    let item_bytes = items
+                                        .get(&item_name)
+                                        .expect("Unable to get result item image");
+                                    let item_texture_img = image::load_from_memory(item_bytes)
+                                        .expect("Unable to make an image from an item's bytes")
+                                        .to_rgba8();
+                                    imageops::overlay(
+                                        &mut crafting_table_gui,
+                                        &item_texture_img,
+                                        result_x,
+                                        result_y,
+                                    );
+                                }
                             }
                         }
 
