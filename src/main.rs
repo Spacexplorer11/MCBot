@@ -1,7 +1,7 @@
 use crate::Task::Recipe;
 use axum::{Form, Json, extract::State, routing::post};
 use dotenvy::dotenv;
-use image::{GenericImage, ImageFormat};
+use image::{ImageFormat, imageops};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -74,7 +74,7 @@ struct SlackSlashCommand {
 
 #[tokio::main]
 async fn main() {
-    if !dotenv().is_ok() {
+    if dotenv().is_err() {
         eprintln!(".env file NOT LOADED")
     }
 
@@ -102,12 +102,11 @@ async fn main() {
 
         if let Some(entries) = tree["tree"].as_array() {
             for entry in entries {
-                if let Some(name) = entry["path"].as_str() {
-                    if let Some(name) = name.strip_prefix("data/minecraft/recipe/") {
-                        if let Some(item_name) = name.strip_suffix(".json") {
-                            valid_recipes.insert(item_name.to_owned());
-                        }
-                    }
+                if let Some(name) = entry["path"].as_str()
+                    && let Some(name) = name.strip_prefix("data/minecraft/recipe/")
+                    && let Some(item_name) = name.strip_suffix(".json")
+                {
+                    valid_recipes.insert(item_name.to_owned());
                 }
             }
         }
@@ -269,9 +268,9 @@ async fn main() {
             } else if filename.starts_with("assets/minecraft/textures/")
                 && filename.ends_with(".png")
             {
-                let filename_parts = filename.split('/');
+                let mut filename_parts = filename.split('/');
                 let item_name = filename_parts
-                    .last()
+                    .next_back()
                     .unwrap()
                     .strip_suffix(".png")
                     .unwrap()
@@ -331,117 +330,115 @@ async fn main() {
                         .expect("Unable to convert... json file to json??");
 
                     let mut items_placement = Vec::new();
-                    match recipe_json {
-                        MCRecipe::Shaped {
-                            key,
-                            pattern,
-                            result,
-                        } => {
-                            for part in pattern {
-                                part.chars().for_each(|char| {
-                                    let item = if !char.is_whitespace() {
-                                        key.get(char.to_string().as_str())
-                                            .unwrap()
-                                            .strip_prefix("minecraft:")
-                                            .unwrap_or_else(|| " ")
-                                    } else {
-                                        " "
-                                    };
-                                    items_placement.push(item);
-                                });
-                            }
+                    if let MCRecipe::Shaped {
+                        key,
+                        pattern,
+                        result,
+                    } = recipe_json
+                    {
+                        for part in pattern {
+                            part.chars().for_each(|char| {
+                                let item = if !char.is_whitespace() {
+                                    key.get(char.to_string().as_str())
+                                        .unwrap()
+                                        .strip_prefix("minecraft:")
+                                        .unwrap_or(" ")
+                                } else {
+                                    " "
+                                };
+                                items_placement.push(item);
+                            });
+                        }
 
-                            /* Delete this later but
-                            TODO: Fix the item images
-                            TODO: Add the result
-                            TODO: Don't crash for tags / implement them, you need to fetch the stuff from somewhere.
-                             */
+                        /* Delete this later but
+                        TODO: Add the result
+                        TODO: Don't crash for tags / implement them, you need to fetch the stuff from somewhere.
+                        TODO: Implement for stuff for shapeless recipes and search if any other recipes exist / test and handle them
+                         */
 
-                            let crafting_table_gui_bytes = items
-                                .get("gui/container/crafting_table")
-                                .expect("Unable to find crafting table grid in items vector");
-                            let crafting_table_gui = image::load_from_memory(
-                                crafting_table_gui_bytes,
-                            )
+                        let crafting_table_gui_bytes = items
+                            .get("gui/container/crafting_table")
+                            .expect("Unable to find crafting table grid in items vector");
+                        let crafting_table_gui = image::load_from_memory(crafting_table_gui_bytes)
                             .expect("Unable to make an image from the crafting table bytes");
 
-                            let mut crafting_table_gui = crafting_table_gui.crop_imm(0, 0, 170, 80);
+                        let mut crafting_table_gui = crafting_table_gui.crop_imm(0, 0, 170, 80);
 
-                            let grid_origin_x = 29;
-                            let grid_origin_y = 16;
-                            let cell_size = 18; // +2 for the border
+                        let grid_origin_x = 29;
+                        let grid_origin_y = 16;
+                        let cell_size = 18; // +2 for the border
 
-                            let mut i = 0;
-                            for row in 0..3 {
-                                for col in 0..3 {
-                                    let cell_x = grid_origin_x + (col * cell_size);
-                                    let cell_y = grid_origin_y + (row * cell_size);
+                        let mut i = 0;
+                        for row in 0..3 {
+                            for col in 0..3 {
+                                let cell_x = grid_origin_x + (col * cell_size);
+                                let cell_y = grid_origin_y + (row * cell_size);
 
-                                    if items_placement[i] != " " {
-                                        let item_bytes = items
-                                            .get(items_placement[i])
-                                            .expect("How on earth did this happen (1)");
-                                        let item_texture_img = image::load_from_memory(item_bytes)
-                                            .expect("Unable to make an image from an item's bytes");
-                                        crafting_table_gui
-                                            .copy_from(&item_texture_img, cell_x, cell_y)
-                                            .unwrap();
-                                    }
-
-                                    i += 1;
+                                if items_placement[i] != " " {
+                                    let item_bytes = items
+                                        .get(items_placement[i])
+                                        .expect("How on earth did this happen (1)");
+                                    let item_texture_img = image::load_from_memory(item_bytes)
+                                        .expect("Unable to make an image from an item's bytes")
+                                        .to_rgba8();
+                                    imageops::overlay(
+                                        &mut crafting_table_gui,
+                                        &item_texture_img,
+                                        cell_x,
+                                        cell_y,
+                                    );
                                 }
+
+                                i += 1;
                             }
-
-                            let mut bytes_to_send_to_slack = Vec::new(); // lovely name i know thank you
-                            crafting_table_gui
-                                .write_to(
-                                    &mut Cursor::new(&mut bytes_to_send_to_slack),
-                                    ImageFormat::Png,
-                                )
-                                .expect("Failed to convert the image back into bytes");
-
-                            let upload_url_response = client
-                                .post("https://slack.com/api/files.getUploadURLExternal")
-                                .bearer_auth(&bot_token)
-                                .form(&[
-                                    ("filename", format!("{item_name}_recipe.png")),
-                                    ("length", bytes_to_send_to_slack.len().to_string()),
-                                ])
-                                .send()
-                                .await
-                                .expect(
-                                    "Failed to ask for crafting recipe file upload url from slack",
-                                );
-
-                            let upload_data: serde_json::Value = upload_url_response
-                                .json()
-                                .await
-                                .expect("Unable to convert the upload url response into json");
-                            let upload_url = upload_data["upload_url"].as_str().unwrap();
-                            let file_id = upload_data["file_id"].as_str().unwrap();
-
-                            client
-                                .post(upload_url)
-                                .body(bytes_to_send_to_slack)
-                                .send()
-                                .await
-                                .expect("Failed to upload crafting recipe file bytes to slack");
-
-                            // Step 3: complete it, attach to channel
-                            client
-                                .post("https://slack.com/api/files.completeUploadExternal")
-                                .bearer_auth(&bot_token)
-                                .json(&json!({
-                                    "files": [{ "id": file_id, "title": "Recipe" }],
-                                    "channel_id": channel_id
-                                }))
-                                .send()
-                                .await
-                                .expect("Unable to send the completion request for the file");
-
-                            //TODO: Better error handling. If fails just tell user, don't crash.
                         }
-                        _ => (),
+
+                        let mut bytes_to_send_to_slack = Vec::new(); // lovely name I know thank you
+                        crafting_table_gui
+                            .write_to(
+                                &mut Cursor::new(&mut bytes_to_send_to_slack),
+                                ImageFormat::Png,
+                            )
+                            .expect("Failed to convert the image back into bytes");
+
+                        let upload_url_response = client
+                            .post("https://slack.com/api/files.getUploadURLExternal")
+                            .bearer_auth(&bot_token)
+                            .form(&[
+                                ("filename", format!("{item_name}_recipe.png")),
+                                ("length", bytes_to_send_to_slack.len().to_string()),
+                            ])
+                            .send()
+                            .await
+                            .expect("Failed to ask for crafting recipe file upload url from slack");
+
+                        let upload_data: serde_json::Value = upload_url_response
+                            .json()
+                            .await
+                            .expect("Unable to convert the upload url response into json");
+                        let upload_url = upload_data["upload_url"].as_str().unwrap();
+                        let file_id = upload_data["file_id"].as_str().unwrap();
+
+                        client
+                            .post(upload_url)
+                            .body(bytes_to_send_to_slack)
+                            .send()
+                            .await
+                            .expect("Failed to upload crafting recipe file bytes to slack");
+
+                        // Step 3: complete it, attach to channel
+                        client
+                            .post("https://slack.com/api/files.completeUploadExternal")
+                            .bearer_auth(&bot_token)
+                            .json(&json!({
+                                "files": [{ "id": file_id, "title": "Recipe" }],
+                                "channel_id": channel_id
+                            }))
+                            .send()
+                            .await
+                            .expect("Unable to send the completion request for the file");
+
+                        //TODO: Better error handling. If fails just tell user, don't crash.
                     }
                 } // Add more later obvs
             }
