@@ -5,8 +5,7 @@ use image::{ImageFormat, imageops};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
-use std::{env, io::Cursor};
+use std::{collections::HashMap, env, io::Cursor};
 use tokio::{net::TcpListener, sync::mpsc};
 
 enum Task {
@@ -22,7 +21,7 @@ struct AppState {
     client: Client,
     bot_token: String,
     mpsc: mpsc::Sender<Task>,
-    valid_recipes: std::sync::Arc<HashSet<String>>,
+    valid_recipes: std::sync::Arc<HashMap<String, usize>>,
 }
 
 #[derive(Deserialize)]
@@ -81,219 +80,206 @@ async fn main() {
     let bot_token = env::var("SLACK_BOT_TOKEN").expect("Bot Token NOT FOUND");
     let (queue_input, mut queue_output) = mpsc::channel::<Task>(2000);
 
-    let mut valid_recipes = HashSet::new();
+    let mut valid_recipes = HashMap::new();
     let mut items: HashMap<String, Vec<u8>> = HashMap::new();
 
-    {
-        let client = Client::new();
+    let client = Client::new();
 
-        println!("Fetching recipes");
-        let response = client
-            .get("https://api.github.com/repos/misode/mcmeta/git/trees/data?recursive=1")
-            .header("User-Agent", "mcbot") // GitHub API requires a User-Agent header
-            .send()
-            .await
-            .expect("Failed to fetch recipe list from mcmeta");
+    println!("Initiated step 1 of fetching client.jar- (version manifest)");
 
-        let tree: serde_json::Value = response
-            .json()
-            .await
-            .expect("Invalid JSON from GitHub tree API");
+    let response = client
+        .get("https://launchermeta.mojang.com/mc/game/version_manifest_v2.json")
+        .send()
+        .await
+        .expect("An error occurred when fetching the version manifest (Step 1 of item fetching)");
+    let json_data = response
+        .json::<serde_json::Value>()
+        .await
+        .expect("Version manifest returned incorrect json :pensive_face:");
+    let latest_version = &json_data["latest"]["release"]
+        .as_str()
+        .expect("Could not find latest release version string");
+    let versions = &json_data["versions"]
+        .as_array()
+        .expect("Versions part was not array?");
 
-        if let Some(entries) = tree["tree"].as_array() {
-            for entry in entries {
-                if let Some(name) = entry["path"].as_str()
-                    && let Some(name) = name.strip_prefix("data/minecraft/recipe/")
-                    && let Some(item_name) = name.strip_suffix(".json")
-                {
-                    valid_recipes.insert(item_name.to_owned());
-                }
+    let current_version_object = versions
+        .iter()
+        .find(|v| v["id"].as_str() == Some(latest_version))
+        .expect("Could not find the latest version object in the versions array");
+
+    let package_url = current_version_object["url"]
+        .as_str()
+        .expect("Could not get package URL as a string");
+
+    println!(
+        "Step 1 complete, version manifest successfully fetched! Fun fact, the latest version is {latest_version}"
+    );
+
+    let mut client_jar_version_path = env::current_exe()
+        .expect("Failed to get current executable path")
+        .parent()
+        .expect("Failed to get executable directory")
+        .to_path_buf();
+    client_jar_version_path.push("assets");
+    client_jar_version_path.push("version.txt");
+
+    let mut version_valid = false;
+
+    match tokio::fs::read_to_string(&client_jar_version_path).await {
+        Ok(version) => {
+            if version.as_bytes() == latest_version.as_bytes() {
+                println!(
+                    "Skipping fetching client.jar as it already exists and is the latest version."
+                );
+                version_valid = true;
+            } else {
+                println!("Initiated step 2 of fetching items (client.jar url)");
             }
         }
+        Err(e) => {
+            eprintln!(
+                "An error occurred when reading the version.txt for client.jar. *This error may be expected*. On the first run an error is expected as no version.txt exists. Error: {e}"
+            )
+        }
+    }
 
-        println!("Recipes successfully fetched");
-        println!("Initiated step 1 of fetching items (version manifest)");
+    let mut client_jar_path = env::current_exe()
+        .expect("Failed to get current executable path")
+        .parent()
+        .expect("Failed to get executable directory")
+        .to_path_buf();
 
-        let response = client
-            .get("https://launchermeta.mojang.com/mc/game/version_manifest_v2.json")
-            .send()
+    client_jar_path.push("assets");
+    client_jar_path.push("client.jar");
+
+    let client_jar_bytes;
+
+    if version_valid {
+        client_jar_bytes = tokio::fs::read(&client_jar_path)
             .await
-            .expect(
-                "An error occurred when fetching the version manifest (Step 1 of item fetching)",
+            .expect("Unable to convert client.jar to bytes or to read it??")
+    } else {
+        let response =
+            client.get(package_url).send().await.expect(
+                "An error occurred when fetching the package url (Step 2 of item fetching)",
             );
         let json_data = response
             .json::<serde_json::Value>()
             .await
-            .expect("Version manifest returned incorrect json :pensive_face:");
-        let latest_version = &json_data["latest"]["release"]
+            .expect("Package url returned incorrect json :pensive_face:");
+        let client_jar_url = &json_data["downloads"]["client"]["url"]
             .as_str()
-            .expect("Could not find latest release version string");
-        let versions = &json_data["versions"]
-            .as_array()
-            .expect("Versions part was not array?");
+            .expect("Client jar url not a string???");
 
-        let current_version_object = versions
-            .iter()
-            .find(|v| v["id"].as_str() == Some(latest_version))
-            .expect("Could not find the latest version object in the versions array");
+        println!("Step 2 complete, client.jar url successfully fetched");
+        println!("Initiated step 3 of fetching items (client.jar itself)");
 
-        let package_url = current_version_object["url"]
-            .as_str()
-            .expect("Could not get package URL as a string");
-
-        println!(
-            "Step 1 complete, version manifest successfully fetched! Fun fact, the latest version is {latest_version}"
+        let response = client
+            .get(*client_jar_url)
+            .send()
+            .await
+            .expect("An error occurred fetching the client jar (Step 3 of item fetching)");
+        client_jar_bytes = Vec::from(
+            response
+                .bytes()
+                .await
+                .expect("Failed to convert the client.jar to bytes :("),
         );
-
-        let mut client_jar_version_path = env::current_exe()
-            .expect("Failed to get current executable path")
-            .parent()
-            .expect("Failed to get executable directory")
-            .to_path_buf();
-        client_jar_version_path.push("assets");
-        client_jar_version_path.push("version.txt");
-
-        let mut version_valid = false;
-
-        match tokio::fs::read_to_string(&client_jar_version_path).await {
-            Ok(version) => {
-                if version.as_bytes() == latest_version.as_bytes() {
-                    println!(
-                        "Skipping fetching client.jar as it already exists and is the latest version."
-                    );
-                    version_valid = true;
-                } else {
-                    println!("Initiated step 2 of fetching items (client.jar url)");
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "An error occurred when reading the version.txt for client.jar. *This error may be expected*. On the first run an error is expected as no version.txt exists. Error: {e}"
-                )
-            }
-        }
-
-        let mut client_jar_path = env::current_exe()
-            .expect("Failed to get current executable path")
-            .parent()
-            .expect("Failed to get executable directory")
-            .to_path_buf();
-
-        client_jar_path.push("assets");
-        client_jar_path.push("client.jar");
-
-        let client_jar_bytes;
-
-        if version_valid {
-            client_jar_bytes = tokio::fs::read(&client_jar_path)
-                .await
-                .expect("Unable to convert client.jar to bytes or to read it??")
-        } else {
-            let response = client.get(package_url).send().await.expect(
-                "An error occurred when fetching the package url (Step 2 of item fetching)",
-            );
-            let json_data = response
-                .json::<serde_json::Value>()
-                .await
-                .expect("Package url returned incorrect json :pensive_face:");
-            let client_jar_url = &json_data["downloads"]["client"]["url"]
-                .as_str()
-                .expect("Client jar url not a string???");
-
-            println!("Step 2 complete, client.jar url successfully fetched");
-            println!("Initiated step 3 of fetching items (client.jar itself)");
-
-            let response = client
-                .get(*client_jar_url)
-                .send()
-                .await
-                .expect("An error occurred fetching the client jar (Step 3 of item fetching)");
-            client_jar_bytes = Vec::from(
-                response
-                    .bytes()
-                    .await
-                    .expect("Failed to convert the client.jar to bytes :("),
-            );
-        }
-
-        let client_jar_cursor = Cursor::new(&client_jar_bytes);
-
-        if let Some(parent) = client_jar_path.parent() {
-            match tokio::fs::create_dir_all(parent).await {
-                Ok(..) => println!("Created parent directory"),
-                Err(e) => {
-                    eprintln!(
-                        "An error occurred creating the assets directory. The items will now only be in memory and will need to be redownloaded on restart. Error: {e}"
-                    )
-                }
-            }
-        }
-
-        match tokio::fs::write(&client_jar_path, &client_jar_bytes).await {
-            Ok(..) => {
-                println!("Saved client.jar to disk");
-                match tokio::fs::write(client_jar_version_path, latest_version.as_bytes()).await {
-                    Ok(..) => println!("Successfully saved client.jar's version in a txt file"),
-                    Err(e) => eprintln!(
-                        "An error occurred when saving the version file for client.jar. This will result in it being redownloaded on restart. Error: {e}"
-                    ),
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "An error occurred saving the client.jar to the local disk. The items will now only be in memory and will need to be redownloaded on restart. Error: {e}"
-                )
-            }
-        };
-
-        let mut client_jar_zip =
-            async_zip::tokio::read::seek::ZipFileReader::with_tokio(client_jar_cursor)
-                .await
-                .expect("Failed to read the cursor?? (Step 4 of item fetching / reading now)");
-        let mut temp_items_map = HashMap::new();
-
-        for (i, file) in client_jar_zip.file().entries().iter().enumerate() {
-            let filename = file
-                .filename()
-                .as_str()
-                .expect("Invalid UTF-8 Filename (Step 5 of item reading)");
-            if filename.eq("assets/minecraft/textures/gui/container/crafting_table.png") {
-                let item_name = filename
-                    .strip_prefix("assets/minecraft/textures/")
-                    .unwrap()
-                    .strip_suffix(".png")
-                    .unwrap()
-                    .to_string();
-                temp_items_map.insert(item_name, i);
-            } else if filename.starts_with("assets/minecraft/textures/")
-                && filename.ends_with(".png")
-            {
-                let mut filename_parts = filename.split('/');
-                let item_name = filename_parts
-                    .next_back()
-                    .unwrap()
-                    .strip_suffix(".png")
-                    .unwrap()
-                    .to_string();
-                temp_items_map.insert(item_name, i);
-            }
-        }
-
-        for item in temp_items_map {
-            let mut item_png = client_jar_zip.reader_with_entry(item.1).await.unwrap();
-            let mut item_png_bytes = Vec::new();
-
-            match item_png.read_to_end_checked(&mut item_png_bytes).await {
-                Ok(..) => (),
-                Err(e) => panic!("Failed to convert image {}: {}", item.0, e),
-            }
-            items.insert(item.0, item_png_bytes);
-        }
-
-        println!("Saved items to the item map");
     }
 
-    let shared_recipes = std::sync::Arc::new(valid_recipes);
+    let client_jar_cursor = Cursor::new(client_jar_bytes.clone());
+
+    if let Some(parent) = client_jar_path.parent() {
+        match tokio::fs::create_dir_all(parent).await {
+            Ok(..) => println!("Created parent directory"),
+            Err(e) => {
+                eprintln!(
+                    "An error occurred creating the assets directory. The items will now only be in memory and will need to be redownloaded on restart. Error: {e}"
+                )
+            }
+        }
+    }
+
+    match tokio::fs::write(&client_jar_path, &client_jar_bytes).await {
+        Ok(..) => {
+            println!("Saved client.jar to disk");
+            match tokio::fs::write(client_jar_version_path, latest_version.as_bytes()).await {
+                Ok(..) => println!("Successfully saved client.jar's version in a txt file"),
+                Err(e) => eprintln!(
+                    "An error occurred when saving the version file for client.jar. This will result in it being redownloaded on restart. Error: {e}"
+                ),
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "An error occurred saving the client.jar to the local disk. The items will now only be in memory and will need to be redownloaded on restart. Error: {e}"
+            )
+        }
+    };
+
+    let mut client_jar_zip =
+        async_zip::tokio::read::seek::ZipFileReader::with_tokio(client_jar_cursor)
+            .await
+            .expect("Failed to read the cursor?? (Step 4 of item fetching / reading now)");
+    let mut temp_items_map = HashMap::new();
+
+    println!("Now adding recipes/items to memory");
+
+    for (i, file) in client_jar_zip.file().entries().iter().enumerate() {
+        let filename = file
+            .filename()
+            .as_str()
+            .expect("Invalid UTF-8 Filename (Step 5 of item reading)");
+        if filename.starts_with("data/minecraft/recipe") && filename.ends_with(".json") {
+            let mut filename_parts = filename.split('/');
+            let recipe_name = filename_parts
+                .next_back()
+                .unwrap()
+                .strip_suffix(".json")
+                .unwrap()
+                .to_string();
+
+            valid_recipes.insert(recipe_name, i);
+        } else if filename.eq("assets/minecraft/textures/gui/container/crafting_table.png") {
+            let item_name = filename
+                .strip_prefix("assets/minecraft/textures/")
+                .unwrap()
+                .strip_suffix(".png")
+                .unwrap()
+                .to_string();
+            temp_items_map.insert(item_name, i);
+        } else if filename.starts_with("assets/minecraft/textures/")
+            && filename.ends_with(".png")
+            && !filename.contains("gui")
+        {
+            let mut filename_parts = filename.split('/');
+            let item_name = filename_parts
+                .next_back()
+                .unwrap()
+                .strip_suffix(".png")
+                .unwrap()
+                .to_string();
+
+            temp_items_map.insert(item_name, i);
+        }
+    }
+
+    for item in temp_items_map {
+        let mut item_png = client_jar_zip.reader_with_entry(item.1).await.unwrap();
+        let mut item_png_bytes = Vec::new();
+
+        match item_png.read_to_end_checked(&mut item_png_bytes).await {
+            Ok(..) => (),
+            Err(e) => panic!("Failed to convert image {}: {}", item.0, e),
+        }
+        items.insert(item.0, item_png_bytes);
+    }
+
+    println!("Saved recipes to recipe map");
+    println!("Saved items to the item map");
+
+    let shared_recipes = std::sync::Arc::new(valid_recipes.clone());
 
     let state = AppState {
         client: Client::new(),
@@ -303,8 +289,8 @@ async fn main() {
     };
 
     tokio::spawn(async move {
-        let client = Client::new();
         let bot_token = env::var("SLACK_BOT_TOKEN").expect("Bot Token NOT FOUND");
+
         while let Some(task) = queue_output.recv().await {
             match task {
                 Recipe {
@@ -312,22 +298,21 @@ async fn main() {
                     response_url,
                     channel_id,
                 } => {
-                    let url = format!(
-                        "https://raw.githubusercontent.com/misode/mcmeta/refs/heads/data-json/data/minecraft/recipe/{item_name}.json"
-                    );
-                    let response = match client.get(url).send().await {
-                        Ok(response) => response,
-                        Err(e) => {
-                            panic!(
-                                "An error occurred while fetching the recipe for {item_name}. Error: {e}"
-                            );
-                            // TODO: Tell user that it failed and not crash
-                        }
-                    };
-                    let recipe_json: MCRecipe = response
-                        .json()
+                    let recipe_index = valid_recipes
+                        .get(&item_name)
+                        .expect("How on earth did this happen (2)");
+                    let mut recipe = client_jar_zip
+                        .reader_with_entry(*recipe_index)
                         .await
-                        .expect("Unable to convert... json file to json??");
+                        .expect("Unable to find recipe");
+                    let mut recipe_string = String::new();
+                    recipe
+                        .read_to_string_checked(&mut recipe_string)
+                        .await
+                        .expect("Unable to read the recipe file");
+
+                    let recipe_json: MCRecipe = serde_json::from_str(&recipe_string)
+                        .expect("Unable to convert the json to MCRecipe type");
 
                     let mut items_placement = Vec::new();
                     if let MCRecipe::Shaped {
@@ -353,6 +338,8 @@ async fn main() {
                         /* Delete this later but
                         TODO: Don't crash for tags / implement them, you need to fetch the stuff from somewhere.
                         TODO: Implement for stuff for shapeless recipes and search if any other recipes exist / test and handle them
+                        TODO: Fix the issue with result type issue where the count field is integer but we expect string.
+                        For that one ^ i think i should have a different type altogether for result, like I do for SlackEvent vs SlackPayload
                          */
 
                         let crafting_table_gui_bytes = items
@@ -501,7 +488,7 @@ async fn handle_command(
 ) -> Json<serde_json::Value> {
     match payload.command.as_str() {
         "/recipe" => {
-            if state.valid_recipes.contains(&payload.text) {
+            if state.valid_recipes.contains_key(&payload.text) {
                 match state
                     .mpsc
                     .send(Recipe {
