@@ -31,13 +31,25 @@ enum MCRecipe {
     Shaped {
         key: HashMap<String, String>,
         pattern: Vec<String>,
-        result: HashMap<String, String>,
+        result: RecipeResult,
     },
     #[serde(rename = "minecraft:crafting_shapeless")]
     Shapeless {
         ingredients: Vec<String>,
-        result: HashMap<String, String>,
+        result: RecipeResult,
     },
+}
+
+#[derive(Deserialize)]
+struct RecipeTag {
+    values: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RecipeResult {
+    #[serde(default)]
+    count: u8,
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -79,9 +91,6 @@ async fn main() {
 
     let bot_token = env::var("SLACK_BOT_TOKEN").expect("Bot Token NOT FOUND");
     let (queue_input, mut queue_output) = mpsc::channel::<Task>(2000);
-
-    let mut valid_recipes = HashMap::new();
-    let mut items: HashMap<String, Vec<u8>> = HashMap::new();
 
     let client = Client::new();
 
@@ -222,9 +231,15 @@ async fn main() {
         async_zip::tokio::read::seek::ZipFileReader::with_tokio(client_jar_cursor)
             .await
             .expect("Failed to read the cursor?? (Step 4 of item fetching / reading now)");
-    let mut temp_items_map = HashMap::new();
 
-    println!("Now adding recipes/items to memory");
+    let mut temp_items_map = HashMap::new();
+    let mut temp_recipe_tags = HashMap::new();
+
+    let mut valid_recipes = HashMap::new();
+
+    println!("Now adding recipes, items & tags to memory");
+
+    // Oh no I'm not a pro dev :( I added comments. Soz but with 3 different if statements with such similar branch code i gotta do it
 
     for (i, file) in client_jar_zip.file().entries().iter().enumerate() {
         let filename = file
@@ -232,6 +247,7 @@ async fn main() {
             .as_str()
             .expect("Invalid UTF-8 Filename (Step 5 of item reading)");
         if filename.starts_with("data/minecraft/recipe") && filename.ends_with(".json") {
+            // Fetch recipes from the jar
             let mut filename_parts = filename.split('/');
             let recipe_name = filename_parts
                 .next_back()
@@ -242,6 +258,7 @@ async fn main() {
 
             valid_recipes.insert(recipe_name, i);
         } else if filename.eq("assets/minecraft/textures/gui/container/crafting_table.png") {
+            // Get the crafting table GUI image from the jar
             let item_name = filename
                 .strip_prefix("assets/minecraft/textures/")
                 .unwrap()
@@ -249,9 +266,8 @@ async fn main() {
                 .unwrap()
                 .to_string();
             temp_items_map.insert(item_name, i);
-        } else if filename.starts_with("assets/minecraft/textures/")
+        } else if (filename.starts_with("assets/minecraft/textures/item") || filename.starts_with("assets/minecraft/textures/block")) // Get the item/block images from the jar
             && filename.ends_with(".png")
-            && !filename.contains("gui")
         {
             let mut filename_parts = filename.split('/');
             let item_name = filename_parts
@@ -262,8 +278,21 @@ async fn main() {
                 .to_string();
 
             temp_items_map.insert(item_name, i);
+        } else if filename.starts_with("data/minecraft/tags/item") && filename.ends_with(".json") {
+            let mut filename_parts = filename.split('/');
+            let tag_name = filename_parts
+                .next_back()
+                .unwrap()
+                .strip_suffix(".json")
+                .unwrap()
+                .to_string();
+
+            temp_recipe_tags.insert(tag_name, i);
         }
     }
+
+    let mut items: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut recipe_tags: HashMap<String, Vec<String>> = HashMap::new();
 
     for item in temp_items_map {
         let mut item_png = client_jar_zip.reader_with_entry(item.1).await.unwrap();
@@ -276,8 +305,27 @@ async fn main() {
         items.insert(item.0, item_png_bytes);
     }
 
+    for tag in temp_recipe_tags {
+        let mut tag_reader = client_jar_zip.reader_with_entry(tag.1).await.unwrap();
+        let mut tag_value_string = String::new();
+
+        match tag_reader
+            .read_to_string_checked(&mut tag_value_string)
+            .await
+        {
+            Ok(..) => (),
+            Err(e) => panic!("Failed to read tag {}: {}", tag.0, e),
+        }
+
+        let tag_values: RecipeTag =
+            serde_json::from_str(&tag_value_string).expect("Unable to convert tag to json");
+
+        recipe_tags.insert(tag.0, tag_values.values);
+    }
+
     println!("Saved recipes to recipe map");
     println!("Saved items to the item map");
+    println!("Saved tags to tags map");
 
     let shared_recipes = std::sync::Arc::new(valid_recipes.clone());
 
@@ -317,29 +365,49 @@ async fn main() {
                     let mut items_placement = Vec::new();
                     if let MCRecipe::Shaped {
                         key,
-                        pattern,
+                        mut pattern,
                         result,
                     } = recipe_json
                     {
-                        for part in pattern {
+                        if pattern.len() < 3 {
+                            while pattern.len() != 3 {
+                                pattern.push("   ".to_string());
+                            }
+                        }
+                        for mut part in pattern {
+                            if part.chars().count() == 1 {
+                                part.insert(0, ' ');
+                                part.push(' ');
+                            } else if part.chars().count() == 2 {
+                                part.push(' ');
+                            }
                             part.chars().for_each(|char| {
-                                let item = if !char.is_whitespace() {
-                                    key.get(char.to_string().as_str())
-                                        .unwrap()
-                                        .strip_prefix("minecraft:")
-                                        .unwrap_or(" ")
+                                let item;
+                                if !char.is_whitespace() {
+                                    let item_or_tag = key.get(char.to_string().as_str()).unwrap();
+                                    if item_or_tag.starts_with("#minecraft:") {
+                                        let tag = item_or_tag.strip_prefix("#minecraft:").unwrap();
+                                        let tag_possible_items = recipe_tags
+                                            .get(tag)
+                                            .expect("Unable to find tag in recipe_tags");
+                                        item = tag_possible_items[0]
+                                            .as_str()
+                                            .strip_prefix("minecraft:")
+                                            .unwrap();
+                                    } else {
+                                        item =
+                                            item_or_tag.strip_prefix("minecraft:").unwrap_or(" ");
+                                    }
                                 } else {
-                                    " "
-                                };
+                                    item = " ";
+                                }
                                 items_placement.push(item);
                             });
                         }
 
                         /* Delete this later but
-                        TODO: Don't crash for tags / implement them, you need to fetch the stuff from somewhere.
-                        TODO: Implement for stuff for shapeless recipes and search if any other recipes exist / test and handle them
-                        TODO: Fix the issue with result type issue where the count field is integer but we expect string.
-                        For that one ^ i think i should have a different type altogether for result, like I do for SlackEvent vs SlackPayload
+                        TODO: Implement for stuff for shapeless recipes & transmute and search if any other recipes exist / test and handle them
+                        TODO: Fix the issue with blocks and their faces
                          */
 
                         let crafting_table_gui_bytes = items
