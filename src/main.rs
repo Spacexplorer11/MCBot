@@ -94,7 +94,7 @@ async fn main() {
 
     let client = Client::new();
 
-    println!("Initiated step 1 of fetching client.jar- (version manifest)");
+    println!("Initiated step 1 of fetching client.jar - (version manifest)");
 
     let response = client
         .get("https://launchermeta.mojang.com/mc/game/version_manifest_v2.json")
@@ -195,37 +195,36 @@ async fn main() {
                 .await
                 .expect("Failed to convert the client.jar to bytes :("),
         );
+        if let Some(parent) = client_jar_path.parent() {
+            match tokio::fs::create_dir_all(parent).await {
+                Ok(..) => println!("Created parent directory"),
+                Err(e) => {
+                    eprintln!(
+                        "An error occurred creating the assets directory. The items will now only be in memory and will need to be redownloaded on restart. Error: {e}"
+                    )
+                }
+            }
+        }
+
+        match tokio::fs::write(&client_jar_path, &client_jar_bytes).await {
+            Ok(..) => {
+                println!("Saved client.jar to disk");
+                match tokio::fs::write(client_jar_version_path, latest_version.as_bytes()).await {
+                    Ok(..) => println!("Successfully saved client.jar's version in a txt file"),
+                    Err(e) => eprintln!(
+                        "An error occurred when saving the version file for client.jar. This will result in it being redownloaded on restart. Error: {e}"
+                    ),
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "An error occurred saving the client.jar to the local disk. The items will now only be in memory and will need to be redownloaded on restart. Error: {e}"
+                )
+            }
+        };
     }
 
     let client_jar_cursor = Cursor::new(client_jar_bytes.clone());
-
-    if let Some(parent) = client_jar_path.parent() {
-        match tokio::fs::create_dir_all(parent).await {
-            Ok(..) => println!("Created parent directory"),
-            Err(e) => {
-                eprintln!(
-                    "An error occurred creating the assets directory. The items will now only be in memory and will need to be redownloaded on restart. Error: {e}"
-                )
-            }
-        }
-    }
-
-    match tokio::fs::write(&client_jar_path, &client_jar_bytes).await {
-        Ok(..) => {
-            println!("Saved client.jar to disk");
-            match tokio::fs::write(client_jar_version_path, latest_version.as_bytes()).await {
-                Ok(..) => println!("Successfully saved client.jar's version in a txt file"),
-                Err(e) => eprintln!(
-                    "An error occurred when saving the version file for client.jar. This will result in it being redownloaded on restart. Error: {e}"
-                ),
-            }
-        }
-        Err(e) => {
-            eprintln!(
-                "An error occurred saving the client.jar to the local disk. The items will now only be in memory and will need to be redownloaded on restart. Error: {e}"
-            )
-        }
-    };
 
     let mut client_jar_zip =
         async_zip::tokio::read::seek::ZipFileReader::with_tokio(client_jar_cursor)
@@ -234,93 +233,127 @@ async fn main() {
 
     let mut temp_items_map = HashMap::new();
     let mut temp_recipe_tags = HashMap::new();
+    let mut language_map_index = 0;
 
     let mut valid_recipes = HashMap::new();
 
     println!("Now adding recipes, items & tags to memory");
 
-    // Oh no I'm not a pro dev :( I added comments. Soz but with 3 different if statements with such similar branch code i gotta do it
-
-    for (i, file) in client_jar_zip.file().entries().iter().enumerate() {
-        let filename = file
-            .filename()
-            .as_str()
-            .expect("Invalid UTF-8 Filename (Step 5 of item reading)");
-        if filename.starts_with("data/minecraft/recipe") && filename.ends_with(".json") {
-            // Fetch recipes from the jar
-            let mut filename_parts = filename.split('/');
-            let recipe_name = filename_parts
-                .next_back()
-                .unwrap()
-                .strip_suffix(".json")
-                .unwrap()
-                .to_string();
-
-            valid_recipes.insert(recipe_name, i);
-        } else if filename.eq("assets/minecraft/textures/gui/container/crafting_table.png") {
-            // Get the crafting table GUI image from the jar
-            let item_name = filename
-                .strip_prefix("assets/minecraft/textures/")
-                .unwrap()
-                .strip_suffix(".png")
-                .unwrap()
-                .to_string();
-            temp_items_map.insert(item_name, i);
-        } else if (filename.starts_with("assets/minecraft/textures/item") || filename.starts_with("assets/minecraft/textures/block")) // Get the item/block images from the jar
-            && filename.ends_with(".png")
-        {
-            let mut filename_parts = filename.split('/');
-            let item_name = filename_parts
-                .next_back()
-                .unwrap()
-                .strip_suffix(".png")
-                .unwrap()
-                .to_string();
-
-            temp_items_map.insert(item_name, i);
-        } else if filename.starts_with("data/minecraft/tags/item") && filename.ends_with(".json") {
-            let mut filename_parts = filename.split('/');
-            let tag_name = filename_parts
-                .next_back()
-                .unwrap()
-                .strip_suffix(".json")
-                .unwrap()
-                .to_string();
-
-            temp_recipe_tags.insert(tag_name, i);
-        }
-    }
-
     let mut items: HashMap<String, Vec<u8>> = HashMap::new();
     let mut recipe_tags: HashMap<String, Vec<String>> = HashMap::new();
+    let mut language_mappings: HashMap<String, String> = HashMap::new();
 
-    for item in temp_items_map {
-        let mut item_png = client_jar_zip.reader_with_entry(item.1).await.unwrap();
-        let mut item_png_bytes = Vec::new();
+    // Oh no I'm not a pro dev :( I added comments. Soz but with 3 different if statements with such similar branch code i gotta do it
+    {
+        for (i, file) in client_jar_zip.file().entries().iter().enumerate() {
+            let filename = file
+                .filename()
+                .as_str()
+                .expect("Invalid UTF-8 Filename (Step 5 of item reading)");
+            if filename.starts_with("data/minecraft/recipe") && filename.ends_with(".json") {
+                // Fetch recipes from the jar
+                let mut filename_parts = filename.split('/');
+                let recipe_name = filename_parts
+                    .next_back()
+                    .unwrap()
+                    .strip_suffix(".json")
+                    .unwrap()
+                    .to_string();
 
-        match item_png.read_to_end_checked(&mut item_png_bytes).await {
-            Ok(..) => (),
-            Err(e) => panic!("Failed to convert image {}: {}", item.0, e),
+                valid_recipes.insert(recipe_name, i);
+            } else if filename.eq("assets/minecraft/textures/gui/container/crafting_table.png") {
+                // Get the crafting table GUI image from the jar
+                let item_name = filename
+                    .strip_prefix("assets/minecraft/textures/")
+                    .unwrap()
+                    .strip_suffix(".png")
+                    .unwrap()
+                    .to_string();
+                temp_items_map.insert(item_name, i);
+            } else if filename.eq("assets/minecraft/lang/en_us.json") {
+                language_map_index = i;
+            } else if filename.starts_with("assets/minecraft/textures/item") // Get the item images from the jar
+                && filename.ends_with(".png")
+            {
+                let mut filename_parts = filename.split('/');
+                let item_name = filename_parts
+                    .next_back()
+                    .unwrap()
+                    .strip_suffix(".png")
+                    .unwrap()
+                    .to_string();
+
+                temp_items_map.insert(item_name, i);
+            } else if filename.starts_with("data/minecraft/tags/item")
+                && filename.ends_with(".json")
+            {
+                let mut filename_parts = filename.split('/');
+                let tag_name = filename_parts
+                    .next_back()
+                    .unwrap()
+                    .strip_suffix(".json")
+                    .unwrap()
+                    .to_string();
+
+                temp_recipe_tags.insert(tag_name, i);
+            }
         }
-        items.insert(item.0, item_png_bytes);
-    }
 
-    for tag in temp_recipe_tags {
-        let mut tag_reader = client_jar_zip.reader_with_entry(tag.1).await.unwrap();
-        let mut tag_value_string = String::new();
+        for item in temp_items_map {
+            let mut item_png = client_jar_zip.reader_with_entry(item.1).await.unwrap();
+            let mut item_png_bytes = Vec::new();
 
-        match tag_reader
-            .read_to_string_checked(&mut tag_value_string)
+            match item_png.read_to_end_checked(&mut item_png_bytes).await {
+                Ok(..) => (),
+                Err(e) => panic!("Failed to convert image {}: {}", item.0, e),
+            }
+            items.insert(item.0, item_png_bytes);
+        }
+
+        for tag in temp_recipe_tags {
+            let mut tag_reader = client_jar_zip.reader_with_entry(tag.1).await.unwrap();
+            let mut tag_value_string = String::new();
+
+            match tag_reader
+                .read_to_string_checked(&mut tag_value_string)
+                .await
+            {
+                Ok(..) => (),
+                Err(e) => panic!("Failed to read tag {}: {}", tag.0, e),
+            }
+
+            let tag_values: RecipeTag =
+                serde_json::from_str(&tag_value_string).expect("Unable to convert tag to json");
+
+            recipe_tags.insert(tag.0, tag_values.values);
+        }
+
+        let mut language_map_reader = client_jar_zip
+            .reader_with_entry(language_map_index)
+            .await
+            .unwrap();
+        let mut language_map_string = String::new();
+
+        match language_map_reader
+            .read_to_string_checked(&mut language_map_string)
             .await
         {
             Ok(..) => (),
-            Err(e) => panic!("Failed to read tag {}: {}", tag.0, e),
+            Err(e) => panic!("Failed to read en-us.json {}", e),
         }
 
-        let tag_values: RecipeTag =
-            serde_json::from_str(&tag_value_string).expect("Unable to convert tag to json");
+        let raw_lang: HashMap<String, String> =
+            serde_json::from_str(&language_map_string).expect("Unable to parse en-us.json");
 
-        recipe_tags.insert(tag.0, tag_values.values);
+        for (key, value) in raw_lang {
+            if key.starts_with("item.minecraft.") {
+                let item_id = key.strip_prefix("item.minecraft.").unwrap().to_string();
+                language_mappings.insert(item_id, value);
+            } else if key.starts_with("block.minecraft.") {
+                let block_id = key.strip_prefix("block.minecraft.").unwrap().to_string();
+                language_mappings.insert(block_id, value);
+            }
+        }
     }
 
     println!("Saved recipes to recipe map");
@@ -348,7 +381,7 @@ async fn main() {
                 } => {
                     let recipe_index = valid_recipes
                         .get(&item_name)
-                        .expect("How on earth did this happen (2)");
+                        .expect("How on earth did this happen (1)");
                     let mut recipe = client_jar_zip
                         .reader_with_entry(*recipe_index)
                         .await
@@ -407,7 +440,7 @@ async fn main() {
 
                         /* Delete this later but
                         TODO: Implement for stuff for shapeless recipes & transmute and search if any other recipes exist / test and handle them
-                        TODO: Fix the issue with blocks and their faces
+                        TODO: Fix torch & smoker and if there's anything like it
                          */
 
                         let crafting_table_gui_bytes = items
@@ -416,11 +449,13 @@ async fn main() {
                         let crafting_table_gui = image::load_from_memory(crafting_table_gui_bytes)
                             .expect("Unable to make an image from the crafting table bytes");
 
-                        let mut crafting_table_gui = crafting_table_gui.crop_imm(0, 0, 170, 80);
+                        let crafting_table_gui = crafting_table_gui.crop_imm(0, 0, 170, 80);
+                        let mut crafting_table_gui =
+                            imageops::resize(&crafting_table_gui, 340, 160, imageops::Nearest);
 
-                        let grid_origin_x = 30;
-                        let grid_origin_y = 16;
-                        let cell_size = 18; // +2 for the border
+                        let grid_origin_x = 60;
+                        let grid_origin_y = 33;
+                        let cell_size = 36; // +2 for the border
 
                         let mut i = 0;
                         for row in 0..3 {
@@ -429,12 +464,36 @@ async fn main() {
                                 let cell_y = grid_origin_y + (row * cell_size);
 
                                 if items_placement[i] != " " {
-                                    let item_bytes = items
-                                        .get(items_placement[i])
-                                        .expect("How on earth did this happen (1)");
-                                    let item_texture_img = image::load_from_memory(item_bytes)
-                                        .expect("Unable to make an image from an item's bytes")
-                                        .to_rgba8();
+                                    let item_bytes = match items.get(items_placement[i]) {
+                                        Some(bytes) => bytes.clone(),
+                                        None => {
+                                            //DEBUG: println!("https://minecraft.wiki/images/Invicon_{}.png", capitalise_words( items_placement[i].to_string() ));
+                                            let response = client
+                                                .get( format!(
+                                                    "https://minecraft.wiki/images/Invicon_{}.png",
+                                                    language_mappings.get(items_placement[i]).expect("Unable to find item/block language mapping").replace(' ', "_")
+                                                ))
+                                                .header("User-Agent", "MCBot")
+                                                .send()
+                                                .await
+                                                .expect("Unable to get image from wiki");
+                                            response.bytes().await.expect("Unable to convert the wiki's response to bytes").to_vec()
+                                        }
+                                    };
+                                    let item_texture_img = image::load_from_memory_with_format(
+                                        &item_bytes,
+                                        ImageFormat::Png,
+                                    )
+                                    .expect("Unable to make an image from an item's bytes")
+                                    .to_rgba8();
+
+                                    let item_texture_img = imageops::resize(
+                                        &item_texture_img,
+                                        32,
+                                        32,
+                                        imageops::FilterType::Nearest,
+                                    );
+
                                     imageops::overlay(
                                         &mut crafting_table_gui,
                                         &item_texture_img,
@@ -446,14 +505,35 @@ async fn main() {
                                 i += 1;
 
                                 if i == 9 {
-                                    let result_x = cell_x + 58; // magic number obtained through trial and error
-                                    let result_y = 35;
-                                    let item_bytes = items
-                                        .get(&item_name)
-                                        .expect("Unable to get result item image");
+                                    let result_x = cell_x + 107; // magic number obtained through trial and error
+                                    let result_y = 62;
+                                    let item_bytes = match items.get(&item_name) {
+                                        Some(bytes) => bytes,
+                                        None => {
+                                            //DEBUG: println!("https://minecraft.wiki/images/Invicon_{}.png", capitalise_words( items_placement[i].to_string() ));
+                                            let response = client
+                                                .get( format!(
+                                                    "https://minecraft.wiki/images/Invicon_{}.png",
+                                                    language_mappings.get(&item_name).expect("Unable to find item/block language mapping").replace(' ', "_")
+                                                ))
+                                                .header("User-Agent", "MCBot")
+                                                .send()
+                                                .await
+                                                .expect("Unable to get image from wiki");
+                                            & response.bytes().await.expect("Unable to convert the wiki's response to bytes").to_vec()
+                                        }
+                                    };
                                     let item_texture_img = image::load_from_memory(item_bytes)
                                         .expect("Unable to make an image from an item's bytes")
                                         .to_rgba8();
+
+                                    let item_texture_img = imageops::resize(
+                                        &item_texture_img,
+                                        48,
+                                        48,
+                                        imageops::FilterType::Nearest,
+                                    );
+
                                     imageops::overlay(
                                         &mut crafting_table_gui,
                                         &item_texture_img,
