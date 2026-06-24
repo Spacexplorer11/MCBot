@@ -420,9 +420,17 @@ async fn main() {
                                     let item_or_tag = key.get(char.to_string().as_str()).unwrap();
                                     if item_or_tag.starts_with("#minecraft:") {
                                         let tag = item_or_tag.strip_prefix("#minecraft:").unwrap();
-                                        let tag_possible_items = recipe_tags
+                                        let mut tag_possible_items = recipe_tags
                                             .get(tag)
                                             .expect("Unable to find tag in recipe_tags");
+                                        while !tag_possible_items[0].starts_with("minecraft:") {
+                                            let tag = tag_possible_items[0]
+                                                .strip_prefix("#minecraft:")
+                                                .unwrap();
+                                            tag_possible_items = recipe_tags
+                                                .get(tag)
+                                                .expect("Unable to find tag in recipe_tags");
+                                        }
                                         item = tag_possible_items[0]
                                             .as_str()
                                             .strip_prefix("minecraft:")
@@ -440,7 +448,7 @@ async fn main() {
 
                         /* Delete this later but
                         TODO: Implement for stuff for shapeless recipes & transmute and search if any other recipes exist / test and handle them
-                        TODO: Fix torch & smoker and if there's anything like it
+                        TODO: Fix torch and if there's anything like it
                          */
 
                         let crafting_table_gui_bytes = items
