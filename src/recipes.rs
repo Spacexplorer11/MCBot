@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use async_zip::tokio::read::seek::ZipFileReader;
 use image::{ImageFormat, imageops};
 use reqwest::Client;
@@ -5,6 +6,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::Cursor;
+use tracing::info;
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
@@ -60,7 +62,7 @@ impl RecipeData {
     pub async fn fetch_recipes_and_more(
         &mut self,
         client_jar_zip: &mut ZipFileReader<Cursor<Vec<u8>>>,
-    ) {
+    ) -> Result<()> {
         let mut temp_items_map = HashMap::new();
         let mut temp_recipe_tags = HashMap::new();
         let mut language_map_index = 0;
@@ -71,7 +73,7 @@ impl RecipeData {
             let filename = file
                 .filename()
                 .as_str()
-                .expect("Invalid UTF-8 Filename (Step 5 of item reading)");
+                .context("Invalid UTF-8 Filename (Step 5 of item reading)")?;
             if filename.starts_with("data/minecraft/recipe") && filename.ends_with(".json") {
                 // Fetch recipes from the jar
                 let mut filename_parts = filename.split('/');
@@ -123,38 +125,32 @@ impl RecipeData {
         }
 
         for item in temp_items_map {
-            let mut item_png = client_jar_zip.reader_with_entry(item.1).await.unwrap();
+            let mut item_png = client_jar_zip.reader_with_entry(item.1).await?;
             let mut item_png_bytes = Vec::new();
 
-            match item_png.read_to_end_checked(&mut item_png_bytes).await {
-                Ok(..) => (),
-                Err(e) => panic!("Failed to convert image {}: {}", item.0, e),
-            }
+            item_png
+                .read_to_end_checked(&mut item_png_bytes)
+                .await
+                .context(format!("Failed to convert image {}", item.0))?;
             self.items.insert(item.0, item_png_bytes);
         }
 
         for tag in temp_recipe_tags {
-            let mut tag_reader = client_jar_zip.reader_with_entry(tag.1).await.unwrap();
+            let mut tag_reader = client_jar_zip.reader_with_entry(tag.1).await?;
             let mut tag_value_string = String::new();
 
-            match tag_reader
+            tag_reader
                 .read_to_string_checked(&mut tag_value_string)
                 .await
-            {
-                Ok(..) => (),
-                Err(e) => panic!("Failed to read tag {}: {}", tag.0, e),
-            }
+                .context(format!("Failed to read tag {}", tag.0))?;
 
             let tag_values: RecipeTag =
-                serde_json::from_str(&tag_value_string).expect("Unable to convert tag to json");
+                serde_json::from_str(&tag_value_string).context("Unable to convert tag to json")?;
 
             self.tags.insert(tag.0, tag_values.values);
         }
 
-        let mut language_map_reader = client_jar_zip
-            .reader_with_entry(language_map_index)
-            .await
-            .unwrap();
+        let mut language_map_reader = client_jar_zip.reader_with_entry(language_map_index).await?;
         let mut language_map_string = String::new();
 
         match language_map_reader
@@ -166,7 +162,7 @@ impl RecipeData {
         }
 
         let raw_lang: HashMap<String, String> =
-            serde_json::from_str(&language_map_string).expect("Unable to parse en-us.json");
+            serde_json::from_str(&language_map_string).context("Unable to parse en-us.json")?;
 
         for (key, value) in raw_lang {
             if key.starts_with("item.minecraft.") {
@@ -177,35 +173,43 @@ impl RecipeData {
                 self.language_mappings.insert(block_id, value);
             }
         }
-        println!("Saved recipes to recipe map");
-        println!("Saved items to the item map");
-        println!("Saved tags to tags map");
+        info!("Saved recipes to recipe map");
+        info!("Saved items to the item map");
+        info!("Saved tags to tags map");
+
+        Ok(())
     }
 
+    #[tracing::instrument(
+        name = "recipe_generation_pipeline",
+        skip(self, client, bot_token, client_jar_zip),
+        fields(item = %item_name, channel = %channel_id)
+    )]
     pub async fn make_and_send_recipe_image(
         &mut self,
         item_name: String,
         client: &Client,
         bot_token: &str,
         channel_id: String,
+        user_id: String,
         client_jar_zip: &mut ZipFileReader<Cursor<Vec<u8>>>,
-    ) {
+    ) -> Result<()> {
         let recipe_index = self
             .valid_recipes
             .get(&item_name)
-            .expect("How on earth did this happen (1)");
+            .context("How on earth did this happen (1)")?;
         let mut recipe = client_jar_zip
             .reader_with_entry(*recipe_index)
             .await
-            .expect("Unable to find recipe");
+            .context("Unable to find recipe")?;
         let mut recipe_string = String::new();
         recipe
             .read_to_string_checked(&mut recipe_string)
             .await
-            .expect("Unable to read the recipe file");
+            .context("Unable to read the recipe file")?;
 
         let recipe_json: MCRecipe = serde_json::from_str(&recipe_string)
-            .expect("Unable to convert the json to MCRecipe type");
+            .context("Unable to convert the json to MCRecipe type")?;
 
         let mut items_placement = Vec::new();
         if let MCRecipe::Shaped {
@@ -226,24 +230,33 @@ impl RecipeData {
                 } else if part.chars().count() == 2 {
                     part.push(' ');
                 }
-                part.chars().for_each(|char| {
+
+                for char in part.chars() {
                     let item;
                     if !char.is_whitespace() {
-                        let item_or_tag = key.get(char.to_string().as_str()).unwrap();
+                        let item_or_tag = key
+                            .get(char.to_string().as_str())
+                            .context("Character key missing from recipe definition")?;
+
                         if item_or_tag.starts_with("#minecraft:") {
                             let tag = item_or_tag.strip_prefix("#minecraft:").unwrap();
+
                             let mut tag_possible_items =
-                                self.tags.get(tag).expect("Unable to find tag in tags");
+                                self.tags.get(tag).context("Unable to find tag in tags")?;
+
                             while !tag_possible_items[0].starts_with("minecraft:") {
-                                let tag =
-                                    tag_possible_items[0].strip_prefix("#minecraft:").unwrap();
-                                tag_possible_items =
-                                    self.tags.get(tag).expect("Unable to find tag in tags");
+                                let tag = tag_possible_items[0]
+                                    .strip_prefix("#minecraft:")
+                                    .context("The tag... didn't start with a #")?;
+                                tag_possible_items = self
+                                    .tags
+                                    .get(tag)
+                                    .context("Unable to find nested tag in tags")?;
                             }
                             item = tag_possible_items[0]
                                 .as_str()
                                 .strip_prefix("minecraft:")
-                                .unwrap();
+                                .context("The loop failed somehow or the item doesn't begin with 'minecraft:'")?;
                         } else {
                             item = item_or_tag.strip_prefix("minecraft:").unwrap_or(" ");
                         }
@@ -251,15 +264,15 @@ impl RecipeData {
                         item = " ";
                     }
                     items_placement.push(item);
-                });
+                }
             }
 
             let crafting_table_gui_bytes = self
                 .items
                 .get("gui/container/crafting_table")
-                .expect("Unable to find crafting table grid in items vector");
+                .context("Unable to find crafting table grid in items vector")?;
             let crafting_table_gui = image::load_from_memory(crafting_table_gui_bytes)
-                .expect("Unable to make an image from the crafting table bytes");
+                .context("Unable to make an image from the crafting table bytes")?;
 
             let crafting_table_gui = crafting_table_gui.crop_imm(0, 0, 170, 80);
             let mut crafting_table_gui =
@@ -279,29 +292,29 @@ impl RecipeData {
                         let item_bytes = match self.items.get(items_placement[i]) {
                             Some(bytes) => bytes.clone(),
                             None => {
-                                //DEBUG: println!("https://minecraft.wiki/images/Invicon_{}.png", capitalise_words( items_placement[i].to_string() ));
+                                //DEBUG: info!("https://minecraft.wiki/images/Invicon_{}.png", capitalise_words( items_placement[i].to_string() ));
                                 let response = client
                                     .get(format!(
                                         "https://minecraft.wiki/images/Invicon_{}.png",
                                         self.language_mappings
                                             .get(items_placement[i])
-                                            .expect("Unable to find item/block language mapping")
+                                            .context("Unable to find item/block language mapping")?
                                             .replace(' ', "_")
                                     ))
                                     .header("User-Agent", "MCBot")
                                     .send()
                                     .await
-                                    .expect("Unable to get image from wiki");
+                                    .context("Unable to get image from wiki")?;
                                 response
                                     .bytes()
                                     .await
-                                    .expect("Unable to convert the wiki's response to bytes")
+                                    .context("Unable to convert the wiki's response to bytes")?
                                     .to_vec()
                             }
                         };
                         let item_texture_img =
                             image::load_from_memory_with_format(&item_bytes, ImageFormat::Png)
-                                .expect("Unable to make an image from an item's bytes")
+                                .context("Unable to make an image from an item's bytes")?
                                 .to_rgba8();
 
                         let item_texture_img = imageops::resize(
@@ -327,28 +340,28 @@ impl RecipeData {
                         let item_bytes = match self.items.get(&item_name) {
                             Some(bytes) => bytes,
                             None => {
-                                //DEBUG: println!("https://minecraft.wiki/images/Invicon_{}.png", capitalise_words( items_placement[i].to_string() ));
+                                //DEBUG: info!("https://minecraft.wiki/images/Invicon_{}.png", capitalise_words( items_placement[i].to_string() ));
                                 let response = client
                                     .get(format!(
                                         "https://minecraft.wiki/images/Invicon_{}.png",
                                         self.language_mappings
                                             .get(&item_name)
-                                            .expect("Unable to find item/block language mapping")
+                                            .context("Unable to find item/block language mapping")?
                                             .replace(' ', "_")
                                     ))
                                     .header("User-Agent", "MCBot")
                                     .send()
                                     .await
-                                    .expect("Unable to get image from wiki");
+                                    .context("Unable to get image from wiki")?;
                                 &response
                                     .bytes()
                                     .await
-                                    .expect("Unable to convert the wiki's response to bytes")
+                                    .context("Unable to convert the wiki's response to bytes")?
                                     .to_vec()
                             }
                         };
                         let item_texture_img = image::load_from_memory(item_bytes)
-                            .expect("Unable to make an image from an item's bytes")
+                            .context("Unable to make an image from an item's bytes")?
                             .to_rgba8();
 
                         let item_texture_img = imageops::resize(
@@ -374,7 +387,7 @@ impl RecipeData {
                     &mut Cursor::new(&mut bytes_to_send_to_slack),
                     ImageFormat::Png,
                 )
-                .expect("Failed to convert the image back into bytes");
+                .context("Failed to convert the image back into bytes")?;
 
             let upload_url_response = client
                 .post("https://slack.com/api/files.getUploadURLExternal")
@@ -385,35 +398,39 @@ impl RecipeData {
                 ])
                 .send()
                 .await
-                .expect("Failed to ask for crafting recipe file upload url from slack");
+                .context("Failed to ask for crafting recipe file upload url from slack")?;
 
             let upload_data: serde_json::Value = upload_url_response
                 .json()
                 .await
-                .expect("Unable to convert the upload url response into json");
-            let upload_url = upload_data["upload_url"].as_str().unwrap();
-            let file_id = upload_data["file_id"].as_str().unwrap();
+                .context("Unable to convert the upload url response into json")?;
+            let upload_url = upload_data["upload_url"]
+                .as_str()
+                .context("Couldn't find the upload url")?;
+            let file_id = upload_data["file_id"]
+                .as_str()
+                .context("Couldn't find the file id")?;
 
             client
                 .post(upload_url)
                 .body(bytes_to_send_to_slack)
                 .send()
                 .await
-                .expect("Failed to upload crafting recipe file bytes to slack");
+                .context("Failed to upload crafting recipe file bytes to slack")?;
 
-            // Step 3: complete it, attach to channel
             client
                 .post("https://slack.com/api/files.completeUploadExternal")
                 .bearer_auth(bot_token)
                 .json(&json!({
                     "files": [{ "id": file_id, "title": "Recipe" }],
-                    "channel_id": channel_id
+                    "channel_id": channel_id,
+                    "initial_comment": format!("<@{}> Here's your {} recipe!", user_id, item_name.clone().replace('_', " "))
                 }))
                 .send()
                 .await
-                .expect("Unable to send the completion request for the file");
-
-            //TODO: Better error handling. If fails just tell user, don't crash.
+                .context("Unable to send the completion request for the file")?;
         }
+
+        Ok(())
     } // Add more later obvs
 }
