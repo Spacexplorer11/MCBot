@@ -98,7 +98,7 @@ async fn main() {
             KeyValue::new("appsignal.config.name", "MCBot"),
             KeyValue::new("appsignal.config.push_api_key", appsignal_api_key),
             KeyValue::new("appsignal.config.language_integration", "rust"),
-            KeyValue::new("appsignal.config.environment", "development"),
+            KeyValue::new("appsignal.config.environment", "development"), // Change when I deploy
         ])
         .build();
 
@@ -149,7 +149,7 @@ async fn main() {
         .expect("Failed to fetch recipes");
 
     /* Delete this later but
-    TODO: Implement for stuff for shapeless recipes & transmute and search if any other recipes exist / test and handle them
+    TODO: Implement for stuff for transmute recipes
      */
 
     let state = AppState {

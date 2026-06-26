@@ -106,7 +106,7 @@ impl RecipeData {
             } else if filename.eq("assets/minecraft/lang/en_us.json") {
                 language_map_index = i; // Get the language mapping file's index
             } else if filename.starts_with("assets/minecraft/textures/item") // Get the item images from the jar
-            && filename.ends_with(".png")
+                && filename.ends_with(".png")
             {
                 let mut filename_parts = filename.split('/');
                 let item_name = filename_parts
@@ -220,230 +220,437 @@ impl RecipeData {
         let recipe_json: MCRecipe = serde_json::from_str(&recipe_string)
             .context("Unable to convert the json to MCRecipe type")?;
 
-        let mut items_placement = Vec::new();
-        if let MCRecipe::Shaped {
-            key,
-            mut pattern,
-            result,
-        } = recipe_json
-        {
-            if pattern.len() < 3 {
-                while pattern.len() != 3 {
-                    pattern.push("   ".to_string());
-                }
-            }
-            for mut part in pattern {
-                if part.chars().count() == 1 {
-                    part.insert(0, ' ');
-                    part.push(' ');
-                } else if part.chars().count() == 2 {
-                    part.push(' ');
-                }
-
-                for char in part.chars() {
-                    let item;
-                    if !char.is_whitespace() {
-                        let item_or_tag: &String = match key
-                            .get(char.to_string().as_str())
-                            .context("Character key missing from recipe definition")?
-                        {
-                            RecipeIngredient::Single(key) => key,
-                            RecipeIngredient::Multiple(key) => &key[0],
-                        };
-
-                        if item_or_tag.starts_with("#minecraft:") {
-                            let tag = item_or_tag.strip_prefix("#minecraft:").unwrap();
-
-                            let mut tag_possible_items =
-                                self.tags.get(tag).context("Unable to find tag in tags")?;
-
-                            while !tag_possible_items[0].starts_with("minecraft:") {
-                                let tag = tag_possible_items[0]
-                                    .strip_prefix("#minecraft:")
-                                    .context("The tag... didn't start with a #")?;
-                                tag_possible_items = self
-                                    .tags
-                                    .get(tag)
-                                    .context("Unable to find nested tag in tags")?;
-                            }
-                            item = tag_possible_items[0]
-                                .as_str()
-                                .strip_prefix("minecraft:")
-                                .context("The loop failed somehow or the item doesn't begin with 'minecraft:'")?;
-                        } else {
-                            item = item_or_tag.strip_prefix("minecraft:").unwrap_or(" ");
-                        }
-                    } else {
-                        item = " ";
+        match recipe_json {
+            MCRecipe::Shaped {
+                key,
+                mut pattern,
+                result,
+            } => {
+                let mut items_placement = Vec::new();
+                if pattern.len() < 3 {
+                    while pattern.len() != 3 {
+                        pattern.push("   ".to_string());
                     }
-                    items_placement.push(item);
                 }
-            }
+                for mut part in pattern {
+                    if part.chars().count() == 1 {
+                        part.insert(0, ' ');
+                        part.push(' ');
+                    } else if part.chars().count() == 2 {
+                        part.push(' ');
+                    }
 
-            let crafting_table_gui_bytes = self
-                .items
-                .get("gui/container/crafting_table")
-                .context("Unable to find crafting table grid in items vector")?;
-            let crafting_table_gui = image::load_from_memory(crafting_table_gui_bytes)
-                .context("Unable to make an image from the crafting table bytes")?;
+                    for char in part.chars() {
+                        let item;
+                        if !char.is_whitespace() {
+                            let item_or_tag: &String = match key
+                                .get(char.to_string().as_str())
+                                .context("Character key missing from recipe definition")?
+                            {
+                                RecipeIngredient::Single(key) => key,
+                                RecipeIngredient::Multiple(key) => &key[0],
+                            };
 
-            let crafting_table_gui = crafting_table_gui.crop_imm(0, 0, 170, 80);
-            let mut crafting_table_gui =
-                imageops::resize(&crafting_table_gui, 340, 160, imageops::Nearest);
+                            if item_or_tag.starts_with("#minecraft:") {
+                                let tag = item_or_tag.strip_prefix("#minecraft:").unwrap();
 
-            let grid_origin_x = 60;
-            let grid_origin_y = 33;
-            let cell_size = 36; // +2 for the border
+                                let mut tag_possible_items =
+                                    self.tags.get(tag).context("Unable to find tag in tags")?;
 
-            let mut i = 0;
-            for row in 0..3 {
-                for col in 0..3 {
-                    let cell_x = grid_origin_x + (col * cell_size);
-                    let cell_y = grid_origin_y + (row * cell_size);
-
-                    if items_placement[i] != " " {
-                        let item_bytes = match self.items.get(items_placement[i]) {
-                            Some(bytes) => bytes.clone(),
-                            None => {
-                                //DEBUG: info!("https://minecraft.wiki/images/Invicon_{}.png", capitalise_words( items_placement[i].to_string() ));
-                                let response = client
-                                    .get(format!(
-                                        "https://minecraft.wiki/images/Invicon_{}.png",
-                                        self.language_mappings
-                                            .get(items_placement[i])
-                                            .context("Unable to find item/block language mapping")?
-                                            .replace(' ', "_")
-                                    ))
-                                    .header("User-Agent", "MCBot")
-                                    .send()
-                                    .await
-                                    .context("Unable to get image from wiki")?;
-                                response
-                                    .bytes()
-                                    .await
-                                    .context("Unable to convert the wiki's response to bytes")?
-                                    .to_vec()
+                                while !tag_possible_items[0].starts_with("minecraft:") {
+                                    let tag = tag_possible_items[0]
+                                        .strip_prefix("#minecraft:")
+                                        .context("The tag... didn't start with a #")?;
+                                    tag_possible_items = self
+                                        .tags
+                                        .get(tag)
+                                        .context("Unable to find nested tag in tags")?;
+                                }
+                                item = tag_possible_items[0]
+                                    .as_str()
+                                    .strip_prefix("minecraft:")
+                                    .context("The loop failed somehow or the item doesn't begin with 'minecraft:'")?;
+                            } else {
+                                item = item_or_tag.strip_prefix("minecraft:").unwrap_or(" ");
                             }
-                        };
-                        let item_texture_img =
-                            image::load_from_memory_with_format(&item_bytes, ImageFormat::Png)
+                        } else {
+                            item = " ";
+                        }
+                        items_placement.push(item);
+                    }
+                }
+
+                let crafting_table_gui_bytes = self
+                    .items
+                    .get("gui/container/crafting_table")
+                    .context("Unable to find crafting table grid in items vector")?;
+                let crafting_table_gui = image::load_from_memory(crafting_table_gui_bytes)
+                    .context("Unable to make an image from the crafting table bytes")?;
+
+                let crafting_table_gui = crafting_table_gui.crop_imm(0, 0, 170, 80);
+                let mut crafting_table_gui =
+                    imageops::resize(&crafting_table_gui, 340, 160, imageops::Nearest);
+
+                let grid_origin_x = 60;
+                let grid_origin_y = 33;
+                let cell_size = 36; // +2 for the border
+
+                let mut i = 0;
+                for row in 0..3 {
+                    for col in 0..3 {
+                        let cell_x = grid_origin_x + (col * cell_size);
+                        let cell_y = grid_origin_y + (row * cell_size);
+
+                        if items_placement[i] != " " {
+                            let item_bytes = match self.items.get(items_placement[i]) {
+                                Some(bytes) => bytes.clone(),
+                                None => {
+                                    //DEBUG: info!("https://minecraft.wiki/images/Invicon_{}.png", capitalise_words( items_placement[i].to_string() ));
+                                    let response = client
+                                        .get(format!(
+                                            "https://minecraft.wiki/images/Invicon_{}.png",
+                                            self.language_mappings
+                                                .get(items_placement[i])
+                                                .context(
+                                                    "Unable to find item/block language mapping"
+                                                )?
+                                                .replace(' ', "_")
+                                        ))
+                                        .header("User-Agent", "MCBot")
+                                        .send()
+                                        .await
+                                        .context("Unable to get image from wiki")?;
+                                    response
+                                        .bytes()
+                                        .await
+                                        .context("Unable to convert the wiki's response to bytes")?
+                                        .to_vec()
+                                }
+                            };
+                            let item_texture_img =
+                                image::load_from_memory_with_format(&item_bytes, ImageFormat::Png)
+                                    .context("Unable to make an image from an item's bytes")?
+                                    .to_rgba8();
+
+                            let item_texture_img = imageops::resize(
+                                &item_texture_img,
+                                32,
+                                32,
+                                imageops::FilterType::Nearest,
+                            );
+
+                            imageops::overlay(
+                                &mut crafting_table_gui,
+                                &item_texture_img,
+                                cell_x,
+                                cell_y,
+                            );
+                        }
+
+                        i += 1;
+
+                        if i == 9 {
+                            let result_x = cell_x + 107; // magic number obtained through trial and error
+                            let result_y = 62;
+                            let item_bytes = match self.items.get(&item_name) {
+                                Some(bytes) => bytes,
+                                None => {
+                                    //DEBUG: info!("https://minecraft.wiki/images/Invicon_{}.png", capitalise_words( items_placement[i].to_string() ));
+                                    let response = client
+                                        .get(format!(
+                                            "https://minecraft.wiki/images/Invicon_{}.png",
+                                            self.language_mappings
+                                                .get(&item_name)
+                                                .context(
+                                                    "Unable to find item/block language mapping"
+                                                )?
+                                                .replace(' ', "_")
+                                        ))
+                                        .header("User-Agent", "MCBot")
+                                        .send()
+                                        .await
+                                        .context("Unable to get image from wiki")?;
+                                    &response
+                                        .bytes()
+                                        .await
+                                        .context("Unable to convert the wiki's response to bytes")?
+                                        .to_vec()
+                                }
+                            };
+                            let item_texture_img = image::load_from_memory(item_bytes)
                                 .context("Unable to make an image from an item's bytes")?
                                 .to_rgba8();
 
-                        let item_texture_img = imageops::resize(
-                            &item_texture_img,
-                            32,
-                            32,
-                            imageops::FilterType::Nearest,
-                        );
+                            let item_texture_img = imageops::resize(
+                                &item_texture_img,
+                                48,
+                                48,
+                                imageops::FilterType::Nearest,
+                            );
 
-                        imageops::overlay(
-                            &mut crafting_table_gui,
-                            &item_texture_img,
-                            cell_x,
-                            cell_y,
-                        );
-                    }
-
-                    i += 1;
-
-                    if i == 9 {
-                        let result_x = cell_x + 107; // magic number obtained through trial and error
-                        let result_y = 62;
-                        let item_bytes = match self.items.get(&item_name) {
-                            Some(bytes) => bytes,
-                            None => {
-                                //DEBUG: info!("https://minecraft.wiki/images/Invicon_{}.png", capitalise_words( items_placement[i].to_string() ));
-                                let response = client
-                                    .get(format!(
-                                        "https://minecraft.wiki/images/Invicon_{}.png",
-                                        self.language_mappings
-                                            .get(&item_name)
-                                            .context("Unable to find item/block language mapping")?
-                                            .replace(' ', "_")
-                                    ))
-                                    .header("User-Agent", "MCBot")
-                                    .send()
-                                    .await
-                                    .context("Unable to get image from wiki")?;
-                                &response
-                                    .bytes()
-                                    .await
-                                    .context("Unable to convert the wiki's response to bytes")?
-                                    .to_vec()
-                            }
-                        };
-                        let item_texture_img = image::load_from_memory(item_bytes)
-                            .context("Unable to make an image from an item's bytes")?
-                            .to_rgba8();
-
-                        let item_texture_img = imageops::resize(
-                            &item_texture_img,
-                            48,
-                            48,
-                            imageops::FilterType::Nearest,
-                        );
-
-                        imageops::overlay(
-                            &mut crafting_table_gui,
-                            &item_texture_img,
-                            result_x,
-                            result_y,
-                        );
+                            imageops::overlay(
+                                &mut crafting_table_gui,
+                                &item_texture_img,
+                                result_x,
+                                result_y,
+                            );
+                        }
                     }
                 }
+
+                let mut bytes_to_send_to_slack = Vec::new(); // lovely name I know thank you
+                crafting_table_gui
+                    .write_to(
+                        &mut Cursor::new(&mut bytes_to_send_to_slack),
+                        ImageFormat::Png,
+                    )
+                    .context("Failed to convert the image back into bytes")?;
+
+                let upload_url_response = client
+                    .post("https://slack.com/api/files.getUploadURLExternal")
+                    .bearer_auth(bot_token)
+                    .form(&[
+                        ("filename", format!("{item_name}_recipe.png")),
+                        ("length", bytes_to_send_to_slack.len().to_string()),
+                    ])
+                    .send()
+                    .await
+                    .context("Failed to ask for crafting recipe file upload url from slack")?;
+
+                let upload_data: serde_json::Value = upload_url_response
+                    .json()
+                    .await
+                    .context("Unable to convert the upload url response into json")?;
+                let upload_url = upload_data["upload_url"]
+                    .as_str()
+                    .context("Couldn't find the upload url")?;
+                let file_id = upload_data["file_id"]
+                    .as_str()
+                    .context("Couldn't find the file id")?;
+
+                client
+                    .post(upload_url)
+                    .body(bytes_to_send_to_slack)
+                    .send()
+                    .await
+                    .context("Failed to upload crafting recipe file bytes to slack")?;
+
+                client
+                    .post("https://slack.com/api/files.completeUploadExternal")
+                    .bearer_auth(bot_token)
+                    .json(&json!({
+                        "files": [{ "id": file_id, "title": "Recipe" }],
+                        "channel_id": channel_id,
+                        "initial_comment": format!("<@{}> Here's your {} recipe!", user_id, item_name.clone().replace('_', " "))
+                    }))
+                    .send()
+                    .await
+                    .context("Unable to send the completion request for the file")?;
             }
+            MCRecipe::Shapeless {
+                ingredients,
+                result,
+            } => {
+                let mut items_to_place = Vec::new();
+                for ingredient in ingredients {
+                    let item: String;
+                    if ingredient.starts_with("#minecraft:") {
+                        let tag = ingredient.strip_prefix("#minecraft:").unwrap();
 
-            let mut bytes_to_send_to_slack = Vec::new(); // lovely name I know thank you
-            crafting_table_gui
-                .write_to(
-                    &mut Cursor::new(&mut bytes_to_send_to_slack),
-                    ImageFormat::Png,
-                )
-                .context("Failed to convert the image back into bytes")?;
+                        let mut tag_possible_items =
+                            self.tags.get(tag).context("Unable to find tag in tags")?;
 
-            let upload_url_response = client
-                .post("https://slack.com/api/files.getUploadURLExternal")
-                .bearer_auth(bot_token)
-                .form(&[
-                    ("filename", format!("{item_name}_recipe.png")),
-                    ("length", bytes_to_send_to_slack.len().to_string()),
-                ])
-                .send()
-                .await
-                .context("Failed to ask for crafting recipe file upload url from slack")?;
+                        while !tag_possible_items[0].starts_with("minecraft:") {
+                            let tag = tag_possible_items[0]
+                                .strip_prefix("#minecraft:")
+                                .context("The tag... didn't start with a #")?;
+                            tag_possible_items = self
+                                .tags
+                                .get(tag)
+                                .context("Unable to find nested tag in tags")?;
+                        }
+                        item = tag_possible_items[0]
+                            .as_str()
+                            .strip_prefix("minecraft:")
+                            .context("The loop failed somehow or the item doesn't begin with 'minecraft:'")?.to_string();
+                    } else {
+                        item = ingredient
+                            .strip_prefix("minecraft:")
+                            .unwrap_or(" ")
+                            .to_string();
+                    }
+                    items_to_place.push(item);
+                }
 
-            let upload_data: serde_json::Value = upload_url_response
-                .json()
-                .await
-                .context("Unable to convert the upload url response into json")?;
-            let upload_url = upload_data["upload_url"]
-                .as_str()
-                .context("Couldn't find the upload url")?;
-            let file_id = upload_data["file_id"]
-                .as_str()
-                .context("Couldn't find the file id")?;
+                let crafting_table_gui_bytes = self
+                    .items
+                    .get("gui/container/crafting_table")
+                    .context("Unable to find crafting table grid in items vector")?;
+                let crafting_table_gui = image::load_from_memory(crafting_table_gui_bytes)
+                    .context("Unable to make an image from the crafting table bytes")?;
 
-            client
-                .post(upload_url)
-                .body(bytes_to_send_to_slack)
-                .send()
-                .await
-                .context("Failed to upload crafting recipe file bytes to slack")?;
+                let crafting_table_gui = crafting_table_gui.crop_imm(0, 0, 170, 80);
+                let mut crafting_table_gui =
+                    imageops::resize(&crafting_table_gui, 340, 160, imageops::Nearest);
 
-            client
-                .post("https://slack.com/api/files.completeUploadExternal")
-                .bearer_auth(bot_token)
-                .json(&json!({
-                    "files": [{ "id": file_id, "title": "Recipe" }],
-                    "channel_id": channel_id,
-                    "initial_comment": format!("<@{}> Here's your {} recipe!", user_id, item_name.clone().replace('_', " "))
-                }))
-                .send()
-                .await
-                .context("Unable to send the completion request for the file")?;
+                let grid_origin_x = 60;
+                let grid_origin_y = 33;
+                let cell_size = 36; // +2 for the border
+
+                let mut i = 0;
+                for row in 0..3 {
+                    for col in 0..3 {
+                        let cell_x = grid_origin_x + (col * cell_size);
+                        let cell_y = grid_origin_y + (row * cell_size);
+
+                        if items_to_place.get(i).is_some() {
+                            let item_bytes = match self.items.get(&items_to_place[i]) {
+                                Some(bytes) => bytes.clone(),
+                                None => {
+                                    //DEBUG: info!("https://minecraft.wiki/images/Invicon_{}.png", capitalise_words( items_placement[i].to_string() ));
+                                    let response = client
+                                        .get(format!(
+                                            "https://minecraft.wiki/images/Invicon_{}.png",
+                                            self.language_mappings
+                                                .get(&items_to_place[i])
+                                                .context(
+                                                    "Unable to find item/block language mapping"
+                                                )?
+                                                .replace(' ', "_")
+                                        ))
+                                        .header("User-Agent", "MCBot")
+                                        .send()
+                                        .await
+                                        .context("Unable to get image from wiki")?;
+                                    response
+                                        .bytes()
+                                        .await
+                                        .context("Unable to convert the wiki's response to bytes")?
+                                        .to_vec()
+                                }
+                            };
+                            let item_texture_img =
+                                image::load_from_memory_with_format(&item_bytes, ImageFormat::Png)
+                                    .context("Unable to make an image from an item's bytes")?
+                                    .to_rgba8();
+
+                            let item_texture_img = imageops::resize(
+                                &item_texture_img,
+                                32,
+                                32,
+                                imageops::FilterType::Nearest,
+                            );
+
+                            imageops::overlay(
+                                &mut crafting_table_gui,
+                                &item_texture_img,
+                                cell_x,
+                                cell_y,
+                            );
+                        }
+
+                        i += 1;
+
+                        if i == 9 {
+                            let result_x = cell_x + 107; // magic number obtained through trial and error
+                            let result_y = 62;
+                            let item_bytes = match self.items.get(&item_name) {
+                                Some(bytes) => bytes,
+                                None => {
+                                    //DEBUG: info!("https://minecraft.wiki/images/Invicon_{}.png", capitalise_words( items_placement[i].to_string() ));
+                                    let response = client
+                                        .get(format!(
+                                            "https://minecraft.wiki/images/Invicon_{}.png",
+                                            self.language_mappings
+                                                .get(&item_name)
+                                                .context(
+                                                    "Unable to find item/block language mapping"
+                                                )?
+                                                .replace(' ', "_")
+                                        ))
+                                        .header("User-Agent", "MCBot")
+                                        .send()
+                                        .await
+                                        .context("Unable to get image from wiki")?;
+                                    &response
+                                        .bytes()
+                                        .await
+                                        .context("Unable to convert the wiki's response to bytes")?
+                                        .to_vec()
+                                }
+                            };
+                            let item_texture_img = image::load_from_memory(item_bytes)
+                                .context("Unable to make an image from an item's bytes")?
+                                .to_rgba8();
+
+                            let item_texture_img = imageops::resize(
+                                &item_texture_img,
+                                48,
+                                48,
+                                imageops::FilterType::Nearest,
+                            );
+
+                            imageops::overlay(
+                                &mut crafting_table_gui,
+                                &item_texture_img,
+                                result_x,
+                                result_y,
+                            );
+                        }
+                    }
+                }
+
+                let mut bytes_to_send_to_slack = Vec::new(); // lovely name I know thank you
+                crafting_table_gui
+                    .write_to(
+                        &mut Cursor::new(&mut bytes_to_send_to_slack),
+                        ImageFormat::Png,
+                    )
+                    .context("Failed to convert the image back into bytes")?;
+
+                let upload_url_response = client
+                    .post("https://slack.com/api/files.getUploadURLExternal")
+                    .bearer_auth(bot_token)
+                    .form(&[
+                        ("filename", format!("{item_name}_recipe.png")),
+                        ("length", bytes_to_send_to_slack.len().to_string()),
+                    ])
+                    .send()
+                    .await
+                    .context("Failed to ask for crafting recipe file upload url from slack")?;
+
+                let upload_data: serde_json::Value = upload_url_response
+                    .json()
+                    .await
+                    .context("Unable to convert the upload url response into json")?;
+                let upload_url = upload_data["upload_url"]
+                    .as_str()
+                    .context("Couldn't find the upload url")?;
+                let file_id = upload_data["file_id"]
+                    .as_str()
+                    .context("Couldn't find the file id")?;
+
+                client
+                    .post(upload_url)
+                    .body(bytes_to_send_to_slack)
+                    .send()
+                    .await
+                    .context("Failed to upload crafting recipe file bytes to slack")?;
+
+                client
+                    .post("https://slack.com/api/files.completeUploadExternal")
+                    .bearer_auth(bot_token)
+                    .json(&json!({
+                        "files": [{ "id": file_id, "title": "Recipe" }],
+                        "channel_id": channel_id,
+                        "initial_comment": format!("<@{}> Here's your {} recipe!", user_id, item_name.clone().replace('_', " "))
+                    }))
+                    .send()
+                    .await
+                    .context("Unable to send the completion request for the file")?;
+            } // Add more later obvs
         }
 
         Ok(())
-    } // Add more later obvs
+    }
 }
