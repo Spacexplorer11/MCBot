@@ -21,3 +21,4 @@ tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"] }
 tokio-util = "0.7.18"
 strsim = "0.11.1"
+regex = "1.12.4"

@@ -3,7 +3,7 @@ pub mod recipes;
 
 use crate::Task::Recipe;
 use crate::data::fetch_client_jar;
-use crate::recipes::{RecipeData, fix_recipe_typo};
+use crate::recipes::{RecipeData, fix_recipe, fix_recipe_typo};
 use axum::{Form, Json, extract::State, routing::post};
 use dotenvy::dotenv;
 use opentelemetry::{KeyValue, global};
@@ -252,7 +252,7 @@ async fn handle_command(
 ) -> Json<serde_json::Value> {
     match payload.command.as_str() {
         "/mcrecipe" => {
-            let requested_recipe = payload.text;
+            let requested_recipe = fix_recipe(&payload.text);
             if state.valid_recipes.contains_key(&requested_recipe) {
                 match state
                     .mpsc

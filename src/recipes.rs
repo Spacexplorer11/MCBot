@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use async_zip::tokio::read::seek::ZipFileReader;
 use image::{ImageFormat, imageops};
+use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -904,4 +905,11 @@ pub fn fix_recipe_typo(
         }
     }
     closest_recipe
+}
+
+pub fn fix_recipe(recipe: &str) -> String {
+    // Matches any whitespace (\s), dashes (\-), forward slashes (/), or backslashes (\\)
+    let re = Regex::new(r"[\s\-/\\]+").unwrap();
+
+    re.replace_all(recipe, "_").into_owned()
 }
