@@ -13,7 +13,6 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
-use std::io::Write;
 use std::{collections::HashMap, env};
 use tokio::{net::TcpListener, sync::mpsc};
 use tracing::{error, info, warn};
@@ -136,7 +135,6 @@ async fn main() {
 
     /* Delete this later but
     TODO: Implement for stuff for shapeless recipes & transmute and search if any other recipes exist / test and handle them
-    TODO: Fix torch and if there's anything like it
      */
 
     let state = AppState {

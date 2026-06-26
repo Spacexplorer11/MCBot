@@ -15,7 +15,7 @@ use tracing::info;
 enum MCRecipe {
     #[serde(rename = "minecraft:crafting_shaped")]
     Shaped {
-        key: HashMap<String, String>,
+        key: HashMap<String, RecipeIngredient>,
         pattern: Vec<String>,
         result: RecipeResult,
     },
@@ -29,6 +29,13 @@ enum MCRecipe {
 #[derive(Deserialize)]
 struct RecipeTag {
     values: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RecipeIngredient {
+    Single(String),
+    Multiple(Vec<String>),
 }
 
 #[derive(Deserialize)]
@@ -236,9 +243,13 @@ impl RecipeData {
                 for char in part.chars() {
                     let item;
                     if !char.is_whitespace() {
-                        let item_or_tag = key
+                        let item_or_tag: &String = match key
                             .get(char.to_string().as_str())
-                            .context("Character key missing from recipe definition")?;
+                            .context("Character key missing from recipe definition")?
+                        {
+                            RecipeIngredient::Single(key) => key,
+                            RecipeIngredient::Multiple(key) => &key[0],
+                        };
 
                         if item_or_tag.starts_with("#minecraft:") {
                             let tag = item_or_tag.strip_prefix("#minecraft:").unwrap();
