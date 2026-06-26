@@ -15,8 +15,10 @@ use serde::Deserialize;
 use serde_json::json;
 use std::{collections::HashMap, env};
 use tokio::{net::TcpListener, sync::mpsc};
-use tracing::{error, info, warn};
+use tracing::{Level, error, info, warn};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -114,8 +116,21 @@ async fn main() {
         EnvFilter::new("info,mcbot=debug,opentelemetry_sdk=off,opentelemetry-otlp=off")
     });
 
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stdout)
+        .with_filter(filter_fn(|metadata| {
+            matches!(*metadata.level(), Level::INFO | Level::WARN)
+        }));
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(filter_fn(|metadata| {
+            matches!(*metadata.level(), Level::ERROR)
+        }));
+
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
+        .with(stdout_layer)
+        .with(stderr_layer)
         .with(telemetry_layer)
         .with(filter)
         .init();
@@ -234,16 +249,22 @@ async fn handle_command(
                 match state
                     .mpsc
                     .send(Recipe {
-                        item_name: payload.text,
+                        item_name: payload.text.clone(),
                         response_url: payload.response_url,
                         channel_id: payload.channel_id,
-                        user_id: payload.user_id,
+                        user_id: payload.user_id.clone(),
                     })
                     .await
                 {
-                    Ok(..) => Json(
-                        json!({"response_type": "ephemeral", "text": "Gathering images and sewing 'em up, hang on a second!"}),
-                    ),
+                    Ok(..) => {
+                        info!(
+                            "Started processing recipe for {} from {}",
+                            payload.text, payload.user_id
+                        );
+                        Json(
+                            json!({"response_type": "ephemeral", "text": "Gathering images and sewing 'em up, hang on a second!"}),
+                        )
+                    }
                     Err(e) => {
                         error!("Error occurred sending task to generate image: {e}");
                         Json(
