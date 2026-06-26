@@ -1,0 +1,62 @@
+name: Cross-Compile and Deploy to Pi Zero 2W
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 1. Install standard Rust toolchain + target
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu # Switched to 64-bit ARM target
+
+      # 2. Cache dependencies so subsequent builds don't take 20 minutes
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      # 3. Use Cross to build the ARM binary without linker headaches
+      - name: Install Cross
+        run: |
+          curl -LsSf https://github.com/cargo-bins/cargo-binstall/releases/latest/download/cargo-binstall-x86_64-unknown-linux-musl.tgz | tar xz -C ~/.cargo/bin
+          cargo binstall cross -y
+
+      # 4. Run Cross Build directly as a standard bash command
+      - name: Run Cross Build
+        run: cross build --release --target aarch64-unknown-linux-gnu
+
+      # 5. Securely punch into your Tailnet
+      - name: Connect to Tailscale Network
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      # 6. Securely load the SSH key without any custom echo/piping
+      - name: Install SSH Key
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.PI_SSH_KEY }}
+          known_hosts: unnecessary_because_of_tailscale
+          if_key_exists: replace
+
+      # 7. Now just run your SCP and SSH commands cleanly
+      - name: Deploy Binary and Restart
+        run: |
+          scp -o StrictHostKeyChecking=no ./target/aarch64-unknown-linux-gnu/release/mcbot akaalroopsingh@100.x.y.z:/home/akaalroopsingh/mcbot/mcbot_new
+          ssh -o StrictHostKeyChecking=no akaalroopsingh@100.x.y.z << 'EOF'
+            chmod +x /home/akaalroopsingh/mcbot/mcbot_new
+            mv -f /home/akaalroopsingh/mcbot/mcbot_new /home/akaalroopsingh/mcbot/mcbot
+            touch /home/akaalroopsingh/mcbot/.env.deploy
+            grep -v '^APP_REVISION=' /home/akaalroopsingh/mcbot/.env.deploy > /home/akaalroopsingh/mcbot/.env.deploy.tmp || true
+            echo "APP_REVISION=${{ github.sha }}" >> /home/akaalroopsingh/mcbot/.env.deploy.tmp
+            mv -f /home/akaalroopsingh/mcbot/.env.deploy.tmp /home/akaalroopsingh/mcbot/.env.deploy
+            sudo systemctl restart mcbot
+          EOF
