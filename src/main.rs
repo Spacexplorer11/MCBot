@@ -13,6 +13,7 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
+use std::io::Write;
 use std::{collections::HashMap, env};
 use tokio::{net::TcpListener, sync::mpsc};
 use tracing::{error, info, warn};
@@ -193,7 +194,7 @@ async fn main() {
         .with_state(state);
     let listener = TcpListener::bind("0.0.0.0:4598")
         .await
-        .expect("Unable to bind the TcpList");
+        .expect("Unable to bind the TcpListener");
 
     axum::serve(listener, router)
         .await
@@ -256,8 +257,14 @@ async fn handle_command(
                 Json(json!({"response_type": "ephemeral", "text": "Your recipe was invalid."}))
             }
         }
-        _ => Json(
-            json!({"response_type": "ephemeral", "text": "Sorry that command isn't supported as of right now. (If you got this, let @<U08D22QNUVD> know)"}),
-        ), // only registered slash commands should even come, this shouldn't trigger anyway
+        _ => {
+            warn!(
+                "User {} ran an unsupported command {}",
+                payload.user_id, payload.command
+            );
+            Json(
+                json!({"response_type": "ephemeral", "text": "Sorry that command isn't supported as of right now."}),
+            )
+        } // only registered slash commands should even come, this shouldn't trigger anyway
     }
 }

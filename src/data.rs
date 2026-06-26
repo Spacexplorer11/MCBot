@@ -1,11 +1,13 @@
 use async_zip::tokio::read::seek::ZipFileReader;
 use reqwest::Client;
 use std::env;
-use std::io::Cursor;
+use tokio::fs::File;
+use tokio::io::BufReader;
+use tokio_util::compat::TokioAsyncWriteCompatExt;
 use tracing::{info, warn};
 
 #[tracing::instrument(name = "client_jar_fetching_pipeline", skip(client))]
-pub async fn fetch_client_jar(client: &Client) -> ZipFileReader<Cursor<Vec<u8>>> {
+pub async fn fetch_client_jar(client: &Client) -> ZipFileReader<BufReader<File>> {
     info!("Initiated step 1 of fetching client.jar - (version manifest)");
 
     let response = client
@@ -76,11 +78,7 @@ pub async fn fetch_client_jar(client: &Client) -> ZipFileReader<Cursor<Vec<u8>>>
 
     let client_jar_bytes;
 
-    if version_valid {
-        client_jar_bytes = tokio::fs::read(&client_jar_path)
-            .await
-            .expect("Unable to convert client.jar to bytes or to read it??")
-    } else {
+    if !version_valid {
         let response =
             client.get(package_url).send().await.expect(
                 "An error occurred when fetching the package url (Step 2 of item fetching)",
@@ -136,9 +134,14 @@ pub async fn fetch_client_jar(client: &Client) -> ZipFileReader<Cursor<Vec<u8>>>
         };
     }
 
-    let client_jar_cursor = Cursor::new(client_jar_bytes.clone());
+    let client_jar_bufreader = BufReader::new(
+        File::open(client_jar_path)
+            .await
+            .expect("Unable to read client.jar"),
+    )
+    .compat_write();
 
-    ZipFileReader::with_tokio(client_jar_cursor)
+    ZipFileReader::new(client_jar_bufreader)
         .await
         .expect("Failed to read the cursor?? (Step 4 of item fetching / reading now)")
 }

@@ -6,6 +6,8 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::Cursor;
+use tokio::fs::File;
+use tokio::io::BufReader;
 use tracing::info;
 
 #[derive(Deserialize)]
@@ -61,7 +63,7 @@ impl RecipeData {
 
     pub async fn fetch_recipes_and_more(
         &mut self,
-        client_jar_zip: &mut ZipFileReader<Cursor<Vec<u8>>>,
+        client_jar_zip: &mut ZipFileReader<BufReader<File>>,
     ) -> Result<()> {
         let mut temp_items_map = HashMap::new();
         let mut temp_recipe_tags = HashMap::new();
@@ -192,7 +194,7 @@ impl RecipeData {
         bot_token: &str,
         channel_id: String,
         user_id: String,
-        client_jar_zip: &mut ZipFileReader<Cursor<Vec<u8>>>,
+        client_jar_zip: &mut ZipFileReader<BufReader<File>>,
     ) -> Result<()> {
         let recipe_index = self
             .valid_recipes
