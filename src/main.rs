@@ -183,10 +183,20 @@ async fn main() {
                         Err(e) => {
                             error!(error = ?e, "Failed to fulfill recipe task processing pipeline");
 
-                            let polite_msg = json!({
-                                "response_type": "ephemeral",
-                                "text": "Uh oh, something went wrong! If this persists, please contact me."
-                            });
+                            let polite_msg;
+                            if e.to_string()
+                                .eq("Unable to convert the json to MCRecipe type")
+                            {
+                                polite_msg = json!({
+                                    "response_type": "ephemeral",
+                                    "text": "Uh oh, that type of recipe isn't supported! This bot currently only supports crafting recipes. If that was supposed to work, please contact @Akaalroop or email akaal@akaalroop.com"
+                                });
+                            } else {
+                                polite_msg = json!({
+                                    "response_type": "ephemeral",
+                                    "text": format!("Uh oh, something went wrong! If this persists, please contact @Akaalroop on slack or email akaal@akaalroop.com. Error: {e}")
+                                });
+                            }
                             let mut response =
                                 client.post(&response_url).json(&polite_msg).send().await;
                             while response.is_err() {
