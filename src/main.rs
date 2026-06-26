@@ -5,19 +5,18 @@ use crate::Task::Recipe;
 use crate::data::fetch_client_jar;
 use crate::recipes::{RecipeData, fix_recipe, fix_recipe_typo};
 use axum::{Form, Json, extract::State, routing::post};
+use chrono::Utc;
 use dotenvy::dotenv;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{collections::HashMap, env};
 use tokio::{net::TcpListener, sync::mpsc};
 use tracing::{Level, error, info, warn};
-use tracing_subscriber::{
-    EnvFilter, Layer, filter::filter_fn, layer::SubscriberExt, util::SubscriberInitExt,
-};
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 enum Task {
     Recipe {
@@ -67,6 +66,70 @@ struct SlackSlashCommand {
     team_id: String,
 }
 
+#[derive(serde::Serialize)]
+struct LogPayload {
+    timestamp: String,
+    group: String,
+    severity: String,
+    message: String,
+    hostname: String,
+}
+
+struct LogVisitor {
+    message: String,
+}
+
+impl tracing::field::Visit for LogVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{:?}", value);
+        }
+    }
+}
+
+struct HttpLogger {
+    client: Client,
+    url: String,
+}
+
+impl<S: tracing::Subscriber> Layer<S> for HttpLogger {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = LogVisitor {
+            message: String::new(),
+        };
+        event.record(&mut visitor);
+
+        let severity = match *event.metadata().level() {
+            Level::ERROR => "error",
+            Level::WARN => "warn",
+            Level::INFO => "info",
+            Level::DEBUG => "debug",
+            Level::TRACE => "trace",
+        };
+
+        let payload = LogPayload {
+            timestamp: Utc::now().to_rfc3339(),
+            group: "MCBot".to_string(),
+            severity: severity.to_string(),
+            message: visitor.message,
+            hostname: hostname::get()
+                .ok()
+                .and_then(|h| h.into_string().ok())
+                .unwrap_or_else(|| "unknown".to_string()),
+        };
+
+        let client = self.client.clone();
+        let url = self.url.clone();
+        tokio::spawn(async move {
+            let _ = client.post(url).json(&payload).send().await;
+        });
+    }
+}
+
 #[tokio::main]
 async fn main() {
     if dotenv().is_err() {
@@ -83,9 +146,9 @@ async fn main() {
 
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
-        .with_protocol(Protocol::HttpBinary)
+        .with_protocol(Protocol::HttpJson)
         .with_endpoint(appsignal_url)
-        .with_headers(headers)
+        .with_headers(headers.clone())
         .build()
         .expect("Failed to create OpenTelemetry span exporter");
 
@@ -93,7 +156,6 @@ async fn main() {
         .with_attributes(vec![
             KeyValue::new("service.name", "MCBot"),
             KeyValue::new("appsignal.config.name", "MCBot"),
-            KeyValue::new("appsignal.config.push_api_key", appsignal_api_key),
             KeyValue::new("appsignal.config.language_integration", "rust"),
             KeyValue::new("appsignal.config.environment", "development"), // Change when I deploy
         ])
@@ -101,7 +163,7 @@ async fn main() {
 
     let tracer_provider = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
-        .with_resource(resource)
+        .with_resource(resource.clone())
         .build();
 
     global::set_tracer_provider(tracer_provider.clone());
@@ -113,29 +175,21 @@ async fn main() {
         EnvFilter::new("info,mcbot=debug,opentelemetry_sdk=off,opentelemetry-otlp=off")
     });
 
-    let stdout_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stdout)
-        .with_filter(filter_fn(|metadata| {
-            matches!(*metadata.level(), Level::INFO | Level::WARN)
-        }));
+    let logs_url = env::var("APPSIGNAL_LOGS_URL").expect("No appsignal logs url found");
 
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_filter(filter_fn(|metadata| {
-            matches!(*metadata.level(), Level::ERROR)
-        }));
+    let client = Client::new();
 
     tracing_subscriber::registry()
-        .with(stdout_layer)
-        .with(stderr_layer)
         .with(telemetry_layer)
         .with(filter)
+        .with(HttpLogger {
+            client: client.clone(),
+            url: logs_url,
+        })
         .init();
 
     let bot_token = env::var("SLACK_BOT_TOKEN").expect("Bot Token NOT FOUND");
     let (queue_input, mut queue_output) = mpsc::channel::<Task>(2000);
-
-    let client = Client::new();
 
     let mut client_jar_zip = fetch_client_jar(&client).await;
     let mut recipe_data = RecipeData::default();
@@ -166,7 +220,7 @@ async fn main() {
                     user_id,
                 } => {
                     match recipe_data
-                        .make_and_send_recipe_image(
+                        .process_recipe(
                             item_name,
                             &client,
                             &bot_token,
@@ -281,7 +335,7 @@ async fn handle_command(
                     }
                 }
             } else {
-                match fix_recipe_typo(&*state.valid_recipes, &requested_recipe) {
+                match fix_recipe_typo(&state.valid_recipes, &requested_recipe) {
                     Some(fixed_requested_recipe) => {
                         match state
                             .mpsc
