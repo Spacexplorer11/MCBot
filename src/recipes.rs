@@ -4,10 +4,9 @@ use image::{ImageFormat, imageops};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
-use std::io::Cursor;
-use tokio::fs::File;
-use tokio::io::BufReader;
+use std::{collections::HashMap, io::Cursor};
+use strsim::levenshtein;
+use tokio::{fs::File, io::BufReader};
 use tracing::info;
 
 #[derive(Deserialize)]
@@ -233,10 +232,11 @@ impl RecipeData {
                 result,
             } => {
                 let mut items_placement = Vec::new();
-                if pattern.len() < 3 {
-                    while pattern.len() != 3 {
-                        pattern.push("   ".to_string());
-                    }
+                if pattern.len() == 1 {
+                    pattern.insert(0, "   ".to_string());
+                    pattern.push("   ".to_string());
+                } else if pattern.len() == 2 {
+                    pattern.push("   ".to_string());
                 }
                 for mut part in pattern {
                     if part.chars().count() == 1 {
@@ -886,4 +886,22 @@ impl RecipeData {
 
         Ok(())
     }
+}
+
+pub fn fix_recipe_typo(
+    valid_recipes: &HashMap<String, usize>,
+    recipe_to_fix: &str,
+) -> Option<String> {
+    let mut lowest_distance = usize::MAX;
+    let mut closest_recipe: Option<String> = None;
+    for recipe in valid_recipes.keys() {
+        let distance = levenshtein(recipe, recipe_to_fix);
+
+        if distance < lowest_distance && distance <= 3 {
+            // Max edits
+            closest_recipe = Some(recipe.clone());
+            lowest_distance = distance;
+        }
+    }
+    closest_recipe
 }

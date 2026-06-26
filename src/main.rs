@@ -3,24 +3,21 @@ pub mod recipes;
 
 use crate::Task::Recipe;
 use crate::data::fetch_client_jar;
-use crate::recipes::RecipeData;
+use crate::recipes::{RecipeData, fix_recipe_typo};
 use axum::{Form, Json, extract::State, routing::post};
 use dotenvy::dotenv;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use std::{collections::HashMap, env};
 use tokio::{net::TcpListener, sync::mpsc};
 use tracing::{Level, error, info, warn};
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::Layer;
-use tracing_subscriber::filter::filter_fn;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{
+    EnvFilter, Layer, filter::filter_fn, layer::SubscriberExt, util::SubscriberInitExt,
+};
 
 enum Task {
     Recipe {
@@ -255,11 +252,12 @@ async fn handle_command(
 ) -> Json<serde_json::Value> {
     match payload.command.as_str() {
         "/mcrecipe" => {
-            if state.valid_recipes.contains_key(&payload.text) {
+            let requested_recipe = payload.text;
+            if state.valid_recipes.contains_key(&requested_recipe) {
                 match state
                     .mpsc
                     .send(Recipe {
-                        item_name: payload.text.clone(),
+                        item_name: requested_recipe.clone(),
                         response_url: payload.response_url,
                         channel_id: payload.channel_id,
                         user_id: payload.user_id.clone(),
@@ -269,7 +267,7 @@ async fn handle_command(
                     Ok(..) => {
                         info!(
                             "Started processing recipe for {} from {}",
-                            payload.text, payload.user_id
+                            requested_recipe, payload.user_id
                         );
                         Json(
                             json!({"response_type": "ephemeral", "text": "Gathering images and sewing 'em up, hang on a second!"}),
@@ -283,7 +281,45 @@ async fn handle_command(
                     }
                 }
             } else {
-                Json(json!({"response_type": "ephemeral", "text": "Your recipe was invalid."}))
+                match fix_recipe_typo(&*state.valid_recipes, &requested_recipe) {
+                    Some(fixed_requested_recipe) => {
+                        match state
+                            .mpsc
+                            .send(Recipe {
+                                item_name: fixed_requested_recipe.clone(),
+                                response_url: payload.response_url,
+                                channel_id: payload.channel_id,
+                                user_id: payload.user_id.clone(),
+                            })
+                            .await
+                        {
+                            Ok(..) => {
+                                info!(
+                                    "Started processing recipe for {} from {}",
+                                    fixed_requested_recipe, payload.user_id
+                                );
+                                Json(
+                                    json!({"response_type": "ephemeral", "text": format!("Gathering images and sewing 'em up, hang on a second! (Assumed you meant {})", fixed_requested_recipe.replace('_', " "))}),
+                                )
+                            }
+                            Err(e) => {
+                                error!("Error occurred sending task to generate image: {e}");
+                                Json(
+                                    json!({"response_type": "ephemeral", "text": "I wasn't able to start generating your image. Please try again."}),
+                                )
+                            }
+                        }
+                    }
+                    None => {
+                        info!(
+                            "User {} tried to get recipe {} but it was invalid",
+                            payload.user_id, requested_recipe
+                        );
+                        Json(
+                            json!({"response_type": "ephemeral", "text": "Sorry your recipe was invalid."}),
+                        )
+                    }
+                }
             }
         }
         _ => {
