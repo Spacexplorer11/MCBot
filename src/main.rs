@@ -11,9 +11,10 @@ use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use std::{collections::HashMap, env};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::{net::TcpListener, sync::mpsc};
 use tracing::{Level, error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
@@ -180,6 +181,7 @@ async fn main() {
     let client = Client::new();
 
     tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
         .with(telemetry_layer)
         .with(filter)
         .with(HttpLogger {
@@ -250,10 +252,13 @@ async fn main() {
                             };
                             let mut response =
                                 client.post(&response_url).json(&polite_msg).send().await;
-                            while response.is_err() {
+                            for _ in 0..=3 {
                                 error!(error = ?response.err().unwrap(), "The generic error message failed to send to the user");
                                 response =
                                     client.post(&response_url).json(&polite_msg).send().await;
+                                if response.is_ok() {
+                                    break;
+                                }
                             }
                         }
                     };
@@ -295,7 +300,7 @@ async fn handle_event(
                 },
                 Err(e) => error!("Something went wrong with sending a message, {e}")
             };
-            Json(json!({"ok":"true"}))
+            Json(json!({"ok":true}))
         }
     }
 }
@@ -308,16 +313,12 @@ async fn handle_command(
         "/mcrecipe" => {
             let requested_recipe = fix_recipe(&payload.text);
             if state.valid_recipes.contains_key(&requested_recipe) {
-                match state
-                    .mpsc
-                    .send(Recipe {
-                        item_name: requested_recipe.clone(),
-                        response_url: payload.response_url,
-                        channel_id: payload.channel_id,
-                        user_id: payload.user_id.clone(),
-                    })
-                    .await
-                {
+                match state.mpsc.try_send(Recipe {
+                    item_name: requested_recipe.clone(),
+                    response_url: payload.response_url,
+                    channel_id: payload.channel_id,
+                    user_id: payload.user_id.clone(),
+                }) {
                     Ok(..) => {
                         info!(
                             "Started processing recipe for {} from {}",
@@ -329,24 +330,25 @@ async fn handle_command(
                     }
                     Err(e) => {
                         error!("Error occurred sending task to generate image: {e}");
-                        Json(
-                            json!({"response_type": "ephemeral", "text": "I wasn't able to start generating your image. Please try again."}),
-                        )
+                        match e {
+                            TrySendError::Full(..) => Json(
+                                json!({"response_type": "ephemeral", "text": "Too many people have requested recipes at the moment. Please try again later."}),
+                            ),
+                            _ => Json(
+                                json!({"response_type": "ephemeral", "text": "I wasn't able to start generating your image. Please try again."}),
+                            ),
+                        }
                     }
                 }
             } else {
                 match fix_recipe_typo(&state.valid_recipes, &requested_recipe) {
                     Some(fixed_requested_recipe) => {
-                        match state
-                            .mpsc
-                            .send(Recipe {
-                                item_name: fixed_requested_recipe.clone(),
-                                response_url: payload.response_url,
-                                channel_id: payload.channel_id,
-                                user_id: payload.user_id.clone(),
-                            })
-                            .await
-                        {
+                        match state.mpsc.try_send(Recipe {
+                            item_name: fixed_requested_recipe.clone(),
+                            response_url: payload.response_url,
+                            channel_id: payload.channel_id,
+                            user_id: payload.user_id.clone(),
+                        }) {
                             Ok(..) => {
                                 info!(
                                     "Started processing recipe for {} from {}",
@@ -365,7 +367,7 @@ async fn handle_command(
                         }
                     }
                     None => {
-                        info!(
+                        warn!(
                             "User {} tried to get recipe {} but it was invalid",
                             payload.user_id, requested_recipe
                         );

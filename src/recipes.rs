@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use async_zip::tokio::read::seek::ZipFileReader;
 use image::{ImageFormat, imageops};
-use opentelemetry::trace::TraceContextExt;
 use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
@@ -10,7 +9,6 @@ use std::{collections::HashMap, io::Cursor};
 use strsim::levenshtein;
 use tokio::{fs::File, io::BufReader};
 use tracing::info;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
@@ -82,7 +80,7 @@ impl RecipeData {
     ) -> Result<()> {
         let mut temp_items_map = HashMap::new();
         let mut temp_recipe_tags = HashMap::new();
-        let mut language_map_index = 0;
+        let mut language_map_index: Option<usize> = None;
 
         // Oh no I'm not a pro dev :( I added comments. Soz but with 4 different if statements with such similar branch code i gotta do it
 
@@ -112,7 +110,7 @@ impl RecipeData {
                     .to_string();
                 temp_items_map.insert(item_name, i);
             } else if filename.eq("assets/minecraft/lang/en_us.json") {
-                language_map_index = i; // Get the language mapping file's index
+                language_map_index = Some(i); // Get the language mapping file's index
             } else if filename.starts_with("assets/minecraft/textures/item") // Get the item images from the jar
                 && filename.ends_with(".png")
             {
@@ -167,7 +165,12 @@ impl RecipeData {
             self.tags.insert(tag.0, tag_values.values);
         }
 
-        let mut language_map_reader = client_jar_zip.reader_with_entry(language_map_index).await?;
+        let mut language_map_reader = client_jar_zip
+            .reader_with_entry(
+                language_map_index.context("Failed to find language mappings index")?,
+            )
+            .await
+            .context("Failed to read language mappings")?;
         let mut language_map_string = String::new();
 
         match language_map_reader
@@ -211,8 +214,6 @@ impl RecipeData {
         user_id: String,
         client_jar_zip: &mut ZipFileReader<BufReader<File>>,
     ) -> Result<()> {
-        let context = tracing::Span::current().context();
-        let trace_id = context.span().span_context().trace_id();
         let recipe_index = self
             .valid_recipes
             .get(&item_name)
@@ -295,9 +296,13 @@ impl RecipeData {
                     self,
                     client,
                     bot_token,
-                    user_id,
-                    item_name,
                     channel_id,
+                    user_id,
+                    result
+                        .id
+                        .strip_prefix("minecraft:")
+                        .context("Result item's ID doesn't begin with 'minecraft:'")?
+                        .to_string(),
                     items_placement,
                 )
                 .await?
@@ -343,7 +348,11 @@ impl RecipeData {
                     bot_token,
                     channel_id,
                     user_id,
-                    item_name,
+                    result
+                        .id
+                        .strip_prefix("minecraft:")
+                        .context("Result item's ID doesn't begin with 'minecraft:'")?
+                        .to_string(),
                     items_to_place,
                 )
                 .await?
@@ -414,7 +423,11 @@ impl RecipeData {
                     bot_token,
                     channel_id,
                     user_id,
-                    item_name,
+                    result
+                        .id
+                        .strip_prefix("minecraft:")
+                        .context("Result item's ID doesn't begin with 'minecraft:'")?
+                        .to_string(),
                     items_to_place,
                 )
                 .await?
@@ -430,7 +443,7 @@ impl RecipeData {
         bot_token: &str,
         channel_id: String,
         user_id: String,
-        item_name: String,
+        result_item_name: String,
         recipe_ingredients: Vec<String>,
     ) -> Result<()> {
         let crafting_table_gui_bytes = self
@@ -496,7 +509,7 @@ impl RecipeData {
                 if i == 9 {
                     let result_x = cell_x + 107; // magic number obtained through trial and error
                     let result_y = 62;
-                    let item_bytes = match self.items.get(&item_name) {
+                    let item_bytes = match self.items.get(&result_item_name) {
                         Some(bytes) => bytes,
                         None => {
                             //DEBUG: info!("https://minecraft.wiki/images/Invicon_{}.png", capitalise_words( items_placement[i].to_string() ));
@@ -504,7 +517,7 @@ impl RecipeData {
                                 .get(format!(
                                     "https://minecraft.wiki/images/Invicon_{}.png",
                                     self.language_mappings
-                                        .get(&item_name)
+                                        .get(&result_item_name)
                                         .context("Unable to find item/block language mapping")?
                                         .replace(' ', "_")
                                 ))
@@ -548,12 +561,14 @@ impl RecipeData {
             .post("https://slack.com/api/files.getUploadURLExternal")
             .bearer_auth(bot_token)
             .form(&[
-                ("filename", format!("{item_name}_recipe.png")),
+                ("filename", format!("{result_item_name}_recipe.png")),
                 ("length", bytes_to_send_to_slack.len().to_string()),
             ])
             .send()
             .await
-            .context("Failed to ask for crafting recipe file upload url from slack")?;
+            .context("Failed to ask for crafting recipe file upload url from slack")?
+            .error_for_status()
+            .context("Slack returned an error when asking for the response url (Step 1)")?;
 
         let upload_data: serde_json::Value = upload_url_response
             .json()
@@ -571,7 +586,9 @@ impl RecipeData {
             .body(bytes_to_send_to_slack)
             .send()
             .await
-            .context("Failed to upload crafting recipe file bytes to slack")?;
+            .context("Failed to upload crafting recipe file bytes to slack")?
+            .error_for_status()
+            .context("Slack returned an error when uploading the file (Step 2)")?;
 
         client
             .post("https://slack.com/api/files.completeUploadExternal")
@@ -579,11 +596,12 @@ impl RecipeData {
             .json(&json!({
                         "files": [{ "id": file_id, "title": "Recipe" }],
                         "channel_id": channel_id,
-                        "initial_comment": format!("<@{}> Here's your {} recipe!", user_id, item_name.clone().replace('_', " "))
+                        "initial_comment": format!("<@{}> Here's your {} recipe!", user_id, result_item_name.clone().replace('_', " "))
                     }))
             .send()
             .await
-            .context("Unable to send the completion request for the file")?;
+            .context("Unable to send the completion request for the file")?
+            .error_for_status().context("Slack returned an error when completing the upload (Step 3)")?;
         Ok(())
     }
 }
@@ -610,5 +628,6 @@ pub fn fix_recipe(recipe: &str) -> String {
     // Matches any whitespace (\s), dashes (\-), forward slashes (/), or backslashes (\\)
     let re = Regex::new(r"[\s\-/\\]+").unwrap();
 
-    re.replace_all(recipe, "_").into_owned()
+    re.replace_all(recipe.to_lowercase().as_str(), "_")
+        .into_owned()
 }

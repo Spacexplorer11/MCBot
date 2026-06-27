@@ -4,12 +4,17 @@ on:
   push:
     branches: [ main ]
 
+permissions:
+  contents: read
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+         persist-credentials: false
 
       # 1. Install standard Rust toolchain + target
       - name: Install Rust

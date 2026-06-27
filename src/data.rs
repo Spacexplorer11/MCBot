@@ -49,9 +49,20 @@ pub async fn fetch_client_jar(client: &Client) -> ZipFileReader<BufReader<File>>
 
     let mut version_valid = false;
 
+    let mut client_jar_path = env::current_exe()
+        .expect("Failed to get current executable path")
+        .parent()
+        .expect("Failed to get executable directory")
+        .to_path_buf();
+
+    client_jar_path.push("assets");
+    client_jar_path.push("client.jar");
+
     match tokio::fs::read_to_string(&client_jar_version_path).await {
         Ok(version) => {
-            if version.as_bytes() == latest_version.as_bytes() {
+            if version.trim() == *latest_version
+                && tokio::fs::metadata(&client_jar_path).await.is_ok()
+            {
                 info!(
                     "Skipping fetching client.jar as it already exists and is the latest version."
                 );
@@ -66,15 +77,6 @@ pub async fn fetch_client_jar(client: &Client) -> ZipFileReader<BufReader<File>>
             )
         }
     }
-
-    let mut client_jar_path = env::current_exe()
-        .expect("Failed to get current executable path")
-        .parent()
-        .expect("Failed to get executable directory")
-        .to_path_buf();
-
-    client_jar_path.push("assets");
-    client_jar_path.push("client.jar");
 
     let client_jar_bytes;
 
@@ -143,5 +145,5 @@ pub async fn fetch_client_jar(client: &Client) -> ZipFileReader<BufReader<File>>
 
     ZipFileReader::new(client_jar_bufreader)
         .await
-        .expect("Failed to read the cursor?? (Step 4 of item fetching / reading now)")
+        .expect("Failed to read the bufreader?? (Step 4 of item fetching / reading now)")
 }
