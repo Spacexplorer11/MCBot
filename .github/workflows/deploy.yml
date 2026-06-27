@@ -2,66 +2,112 @@ name: Cross-Compile and Deploy to Pi Zero 2W
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
 
 permissions:
   contents: read
 
+concurrency:
+  group: deploy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TARGET: aarch64-unknown-linux-gnu
+      DEPLOY_USER: akaalroopsingh
+      DEPLOY_HOST: 100.x.y.z
+      REMOTE_DIR: /home/akaalroopsingh/mcbot
+      REMOTE_BIN: /home/akaalroopsingh/mcbot/mcbot
+      REMOTE_TMP_BIN: /home/akaalroopsingh/mcbot/mcbot_new
+      ENV_FILE: /home/akaalroopsingh/mcbot/.env.deploy
+      APP_REVISION: ${{ github.sha }}
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-         persist-credentials: false
+          persist-credentials: false
 
-      # 1. Install standard Rust toolchain + target
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
         with:
-          targets: aarch64-unknown-linux-gnu # Switched to 64-bit ARM target
+          toolchain: 1.88.0
+          targets: aarch64-unknown-linux-gnu
 
-      # 2. Cache dependencies so subsequent builds don't take 20 minutes
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
 
-      # 3. Use Cross to build the ARM binary without linker headaches
       - name: Install Cross
+        shell: bash
         run: |
-          curl -LsSf https://github.com/cargo-bins/cargo-binstall/releases/latest/download/cargo-binstall-x86_64-unknown-linux-musl.tgz | tar xz -C ~/.cargo/bin
-          cargo binstall cross -y
+          set -euo pipefail
 
-      # 4. Run Cross Build directly as a standard bash command
+          BINSTALL_VERSION="1.10.9"
+          BINSTALL_ARCHIVE="cargo-binstall-x86_64-unknown-linux-musl.tgz"
+          BINSTALL_SHA256="4ccfcd8e0ac8518790e5a49d640a7044448c7925622aa53f98101f4d1e449607"
+
+          curl -LsSf \
+            "https://github.com/cargo-bins/cargo-binstall/releases/download/v${BINSTALL_VERSION}/${BINSTALL_ARCHIVE}" \
+            -o "/tmp/${BINSTALL_ARCHIVE}"
+
+          echo "${BINSTALL_SHA256}  /tmp/${BINSTALL_ARCHIVE}" | sha256sum --check --status
+
+          tar -xzf "/tmp/${BINSTALL_ARCHIVE}" -C "${HOME}/.cargo/bin" cargo-binstall
+          rm -f "/tmp/${BINSTALL_ARCHIVE}"
+
+          cargo binstall cross@0.2.5 --locked --no-confirm
+
       - name: Run Cross Build
-        run: cross build --release --target aarch64-unknown-linux-gnu
+        shell: bash
+        run: |
+          set -euo pipefail
+          cross build --release --target "${TARGET}"
 
-      # 5. Securely punch into your Tailnet
       - name: Connect to Tailscale Network
-        uses: tailscale/github-action@v3
+        uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:ci
+          tags: github_actions
 
-      # 6. Securely load the SSH key without any custom echo/piping
       - name: Install SSH Key
-        uses: shimataro/ssh-key-action@v2
+        uses: shimataro/ssh-key-action@87a8f067114a8ce263df83e9ed5c849953548bc3
         with:
           key: ${{ secrets.PI_SSH_KEY }}
-          known_hosts: unnecessary_because_of_tailscale
+          known_hosts: ${{ secrets.PI_KNOWN_HOSTS }}
           if_key_exists: replace
 
-      # 7. Now just run your SCP and SSH commands cleanly
       - name: Deploy Binary and Restart
+        shell: bash
         run: |
-          scp -o StrictHostKeyChecking=no ./target/aarch64-unknown-linux-gnu/release/mcbot akaalroopsingh@100.x.y.z:/home/akaalroopsingh/mcbot/mcbot_new
-          ssh -o StrictHostKeyChecking=no akaalroopsingh@100.x.y.z << 'EOF'
-            chmod +x /home/akaalroopsingh/mcbot/mcbot_new
-            mv -f /home/akaalroopsingh/mcbot/mcbot_new /home/akaalroopsingh/mcbot/mcbot
-            touch /home/akaalroopsingh/mcbot/.env.deploy
-            grep -v '^APP_REVISION=' /home/akaalroopsingh/mcbot/.env.deploy > /home/akaalroopsingh/mcbot/.env.deploy.tmp || true
-            echo "APP_REVISION=${{ github.sha }}" >> /home/akaalroopsingh/mcbot/.env.deploy.tmp
-            mv -f /home/akaalroopsingh/mcbot/.env.deploy.tmp /home/akaalroopsingh/mcbot/.env.deploy
-            sudo systemctl restart mcbot
+          set -euo pipefail
+
+          scp "./target/${TARGET}/release/mcbot" "${DEPLOY_USER}@${DEPLOY_HOST}:${REMOTE_TMP_BIN}"
+
+          ssh "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -seuo pipefail' <<EOF
+          REMOTE_BIN='${REMOTE_BIN}'
+          REMOTE_TMP_BIN='${REMOTE_TMP_BIN}'
+          ENV_FILE='${ENV_FILE}'
+          APP_REVISION='${APP_REVISION}'
+
+          chmod +x "\$REMOTE_TMP_BIN"
+          mv -f "\$REMOTE_TMP_BIN" "\$REMOTE_BIN"
+
+          touch "\$ENV_FILE"
+          chmod 600 "\$ENV_FILE"
+
+          TMP_ENV=\$(mktemp "\${ENV_FILE}.XXXXXX")
+          trap 'rm -f "\$TMP_ENV"' EXIT
+
+          awk '!/^APP_REVISION=/' "\$ENV_FILE" > "\$TMP_ENV"
+          printf 'APP_REVISION=%s\n' "\$APP_REVISION" >> "\$TMP_ENV"
+
+          chmod 600 "\$TMP_ENV"
+          mv -f "\$TMP_ENV" "\$ENV_FILE"
+          trap - EXIT
+
+          sudo systemctl restart mcbot
           EOF
