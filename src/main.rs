@@ -10,7 +10,6 @@ use axum::response::Response;
 use axum::{Form, Json, body::Body, extract::State, middleware, routing::post};
 use chrono::Utc;
 use dotenvy::dotenv;
-use image::EncodableLayout;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
@@ -162,12 +161,15 @@ async fn main() {
         .build()
         .expect("Failed to create OpenTelemetry span exporter");
 
+    let appsignal_environment =
+        env::var("APPSIGNAL_ENVIRONMENT").unwrap_or_else(|_| "development".to_string());
+
     let resource = Resource::builder()
         .with_attributes(vec![
             KeyValue::new("service.name", "MCBot"),
             KeyValue::new("appsignal.config.name", "MCBot"),
             KeyValue::new("appsignal.config.language_integration", "rust"),
-            KeyValue::new("appsignal.config.environment", "development"), // Change when I deploy
+            KeyValue::new("appsignal.config.environment", appsignal_environment),
         ])
         .build();
 
@@ -445,7 +447,9 @@ async fn verify_slack_signature(
                         .unwrap();
                 }
             };
-            if (Utc::now().timestamp() - ts) > (60 * 5) {
+            let now = Utc::now().timestamp();
+            let allowed_skew = 60 * 5;
+            if ts < now - allowed_skew || ts > now + allowed_skew {
                 error!("Slack request timestamp is too old");
                 return Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
@@ -482,7 +486,7 @@ async fn verify_slack_signature(
         }
     };
 
-    let request_string = match str::from_utf8(request_bytes.as_bytes()) {
+    let request_string = match str::from_utf8(request_bytes.as_ref()) {
         Ok(s) => s,
         Err(e) => {
             error!("Slack request body not valid utf-8: {e}");
