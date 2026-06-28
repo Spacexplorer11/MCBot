@@ -4,13 +4,17 @@ pub mod recipes;
 use crate::Task::Recipe;
 use crate::data::fetch_client_jar;
 use crate::recipes::{RecipeData, fix_recipe, fix_recipe_typo};
-use axum::{Form, Json, extract::State, routing::post};
+use axum::extract::Request;
+use axum::middleware::Next;
+use axum::response::Response;
+use axum::{Form, Json, body::Body, extract::State, middleware, routing::post};
 use chrono::Utc;
 use dotenvy::dotenv;
+use image::EncodableLayout;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 use std::{collections::HashMap, env};
@@ -34,6 +38,11 @@ struct AppState {
     bot_token: String,
     mpsc: mpsc::Sender<Task>,
     valid_recipes: std::sync::Arc<HashMap<String, usize>>,
+}
+
+#[derive(Clone)]
+struct SlackSignatureVerifierState {
+    verifier: slack_http_verifier::SlackVerifier,
 }
 
 #[derive(Deserialize)]
@@ -191,6 +200,11 @@ async fn main() {
         .init();
 
     let bot_token = env::var("SLACK_BOT_TOKEN").expect("Bot Token NOT FOUND");
+    let signing_secret = env::var("SLACK_SIGNING_SECRET").expect("Signing Secret NOT FOUND");
+
+    let verifier = slack_http_verifier::SlackVerifier::new(signing_secret)
+        .expect("Unable to make a slack http verifier instance using signing secret");
+
     let (queue_input, mut queue_output) = mpsc::channel::<Task>(2000);
 
     let mut client_jar_zip = fetch_client_jar(&client).await;
@@ -201,16 +215,14 @@ async fn main() {
         .await
         .expect("Failed to fetch recipes");
 
-    /* Delete this later but
-    TODO: Add typo detection and regex for sanitising input so users dont have to put a strict item_name.
-     */
-
     let state = AppState {
         client: Client::new(),
         bot_token: bot_token.clone(),
         mpsc: queue_input,
         valid_recipes: std::sync::Arc::new(recipe_data.valid_recipes.clone()),
     };
+
+    let slack_signature_verifier_state = SlackSignatureVerifierState { verifier };
 
     tokio::spawn(async move {
         while let Some(task) = queue_output.recv().await {
@@ -270,6 +282,10 @@ async fn main() {
     let router = axum::Router::new()
         .route("/slack/events", post(handle_event))
         .route("/slack/commands", post(handle_command))
+        .route_layer(middleware::from_fn_with_state(
+            slack_signature_verifier_state,
+            verify_slack_signature,
+        ))
         .with_state(state);
     let listener = TcpListener::bind("0.0.0.0:4598")
         .await
@@ -387,5 +403,111 @@ async fn handle_command(
                 json!({"response_type": "ephemeral", "text": "Sorry that command isn't supported as of right now."}),
             )
         } // only registered slash commands should even come, this shouldn't trigger anyway
+    }
+}
+
+async fn verify_slack_signature(
+    State(slack_signature_verifier_state): State<SlackSignatureVerifierState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let (parts, body) = request.into_parts();
+
+    let request_bytes = match axum::body::to_bytes(body, 1024 * 16).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("Failed to read request body: {e}");
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body("Failed to read request body".into())
+                .unwrap();
+        }
+    };
+    let timestamp = match parts.headers.get("x-slack-request-timestamp") {
+        Some(ts) => {
+            let ts = match ts.to_str() {
+                Ok(s) => s,
+                Err(..) => {
+                    error!("Slack request timestamp header not a string");
+                    return Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .body("Slack request timestamp header not a string".into())
+                        .unwrap();
+                }
+            };
+            let ts = match ts.parse::<i64>() {
+                Ok(s) => s,
+                Err(..) => {
+                    error!("Slack request timestamp header not a number");
+                    return Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .body("Slack request timestamp is not a number".into())
+                        .unwrap();
+                }
+            };
+            if (Utc::now().timestamp() - ts) > (60 * 5) {
+                error!("Slack request timestamp is too old");
+                return Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .body("Slack request timestamp is too old".into())
+                    .unwrap();
+            }
+            ts.to_string()
+        }
+        None => {
+            error!("Slack request timestamp header not found");
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body("Slack request timestamp header not found".into())
+                .unwrap();
+        }
+    };
+    let signature = match parts.headers.get("x-slack-signature") {
+        Some(sig) => match sig.to_str() {
+            Ok(s) => s,
+            Err(..) => {
+                error!("Slack signature header not a string");
+                return Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .body("Slack signature header not a string".into())
+                    .unwrap();
+            }
+        },
+        None => {
+            error!("Slack signature header not found");
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body("Slack signature header not found".into())
+                .unwrap();
+        }
+    };
+
+    let request_string = match str::from_utf8(request_bytes.as_bytes()) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Slack request body not valid utf-8: {e}");
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body("Slack request body not valid utf-8".into())
+                .unwrap();
+        }
+    };
+
+    match slack_signature_verifier_state.verifier.verify(
+        timestamp.as_str(),
+        request_string,
+        signature,
+    ) {
+        Ok(..) => {
+            next.run(Request::from_parts(parts, Body::from(request_bytes)))
+                .await
+        }
+        Err(e) => {
+            error!("Slack signature verification failed: {e}");
+            Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body("Slack signature verification failed".into())
+                .unwrap()
+        }
     }
 }
