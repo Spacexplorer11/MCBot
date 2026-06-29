@@ -1,4 +1,5 @@
 pub mod data;
+pub mod font;
 pub mod recipes;
 
 use crate::Task::Recipe;

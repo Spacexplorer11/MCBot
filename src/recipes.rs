@@ -1,3 +1,4 @@
+use crate::font::MinecraftFont;
 use anyhow::{Context, Result};
 use async_zip::tokio::read::seek::ZipFileReader;
 use image::{ImageFormat, imageops};
@@ -51,11 +52,21 @@ struct RecipeResult {
     id: String,
 }
 
+impl RecipeResult {
+    pub fn get_item(&self) -> String {
+        self.id
+            .strip_prefix("minecraft:")
+            .expect("Result doesn't start with 'minecraft:'")
+            .to_string()
+    }
+}
+
 pub struct RecipeData {
     items: HashMap<String, Vec<u8>>,
     tags: HashMap<String, Vec<String>>,
     language_mappings: HashMap<String, String>,
     pub valid_recipes: HashMap<String, usize>,
+    font: MinecraftFont,
 }
 
 impl Default for RecipeData {
@@ -71,9 +82,11 @@ impl RecipeData {
             tags: HashMap::new(),
             language_mappings: HashMap::new(),
             valid_recipes: HashMap::new(),
+            font: MinecraftFont::default(),
         }
     }
 
+    #[tracing::instrument(name = "fetching_on_startup_pipeline", skip(self, client_jar_zip))]
     pub async fn fetch_recipes_and_more(
         &mut self,
         client_jar_zip: &mut ZipFileReader<BufReader<File>>,
@@ -81,6 +94,7 @@ impl RecipeData {
         let mut temp_items_map = HashMap::new();
         let mut temp_recipe_tags = HashMap::new();
         let mut language_map_index: Option<usize> = None;
+        let mut font_indexes: Vec<Option<usize>> = Vec::new();
 
         // Oh no I'm not a pro dev :( I added comments. Soz but with 4 different if statements with such similar branch code i gotta do it
 
@@ -111,6 +125,10 @@ impl RecipeData {
                 temp_items_map.insert(item_name, i);
             } else if filename.eq("assets/minecraft/lang/en_us.json") {
                 language_map_index = Some(i); // Get the language mapping file's index
+            } else if filename.eq("assets/minecraft/font/include/default.json") {
+                font_indexes.insert(0, Some(i));
+            } else if filename.eq("assets/minecraft/textures/font/ascii.png") {
+                font_indexes.push(Some(i));
             } else if filename.starts_with("assets/minecraft/textures/item") // Get the item images from the jar
                 && filename.ends_with(".png")
             {
@@ -138,6 +156,7 @@ impl RecipeData {
                 temp_recipe_tags.insert(tag_name, i);
             }
         }
+        info!("Saved recipes to recipe map");
 
         for item in temp_items_map {
             let mut item_png = client_jar_zip.reader_with_entry(item.1).await?;
@@ -149,6 +168,7 @@ impl RecipeData {
                 .context(format!("Failed to convert image {}", item.0))?;
             self.items.insert(item.0, item_png_bytes);
         }
+        info!("Saved items to the item map");
 
         for tag in temp_recipe_tags {
             let mut tag_reader = client_jar_zip.reader_with_entry(tag.1).await?;
@@ -164,6 +184,7 @@ impl RecipeData {
 
             self.tags.insert(tag.0, tag_values.values);
         }
+        info!("Saved tags to tags map");
 
         let mut language_map_reader = client_jar_zip
             .reader_with_entry(
@@ -193,17 +214,22 @@ impl RecipeData {
                 self.language_mappings.insert(block_id, value);
             }
         }
-        info!("Saved recipes to recipe map");
-        info!("Saved items to the item map");
-        info!("Saved tags to tags map");
+        info!("Saved language mappings to language mappings map");
+
+        self.font = match MinecraftFont::initialise(font_indexes, client_jar_zip).await {
+            Ok(mcfont) => {
+                info!("Successfully initialised font (fetched the bitmap + image)");
+                mcfont
+            }
+            Err(e) => panic!("Failed to initialise font {}", e),
+        };
 
         Ok(())
     }
 
     #[tracing::instrument(
         name = "recipe_generation_pipeline",
-        skip(self, client, bot_token, client_jar_zip),
-        fields(item = %item_name, channel = %channel_id)
+        skip(self, client, bot_token, client_jar_zip)
     )]
     pub async fn process_recipe(
         &mut self,
@@ -298,11 +324,7 @@ impl RecipeData {
                     bot_token,
                     channel_id,
                     user_id,
-                    result
-                        .id
-                        .strip_prefix("minecraft:")
-                        .context("Result item's ID doesn't begin with 'minecraft:'")?
-                        .to_string(),
+                    result,
                     items_placement,
                 )
                 .await?
@@ -348,11 +370,7 @@ impl RecipeData {
                     bot_token,
                     channel_id,
                     user_id,
-                    result
-                        .id
-                        .strip_prefix("minecraft:")
-                        .context("Result item's ID doesn't begin with 'minecraft:'")?
-                        .to_string(),
+                    result,
                     items_to_place,
                 )
                 .await?
@@ -423,11 +441,7 @@ impl RecipeData {
                     bot_token,
                     channel_id,
                     user_id,
-                    result
-                        .id
-                        .strip_prefix("minecraft:")
-                        .context("Result item's ID doesn't begin with 'minecraft:'")?
-                        .to_string(),
+                    result,
                     items_to_place,
                 )
                 .await?
@@ -443,7 +457,7 @@ impl RecipeData {
         bot_token: &str,
         channel_id: String,
         user_id: String,
-        result_item_name: String,
+        result: RecipeResult,
         recipe_ingredients: Vec<String>,
     ) -> Result<()> {
         let crafting_table_gui_bytes = self
@@ -509,15 +523,14 @@ impl RecipeData {
                 if i == 9 {
                     let result_x = cell_x + 107; // magic number obtained through trial and error
                     let result_y = 62;
-                    let item_bytes = match self.items.get(&result_item_name) {
+                    let item_bytes = match self.items.get(&result.get_item()) {
                         Some(bytes) => bytes,
                         None => {
-                            //DEBUG: info!("https://minecraft.wiki/images/Invicon_{}.png", capitalise_words( items_placement[i].to_string() ));
                             let response = client
                                 .get(format!(
                                     "https://minecraft.wiki/images/Invicon_{}.png",
                                     self.language_mappings
-                                        .get(&result_item_name)
+                                        .get(&result.get_item())
                                         .context("Unable to find item/block language mapping")?
                                         .replace(' ', "_")
                                 ))
@@ -536,8 +549,39 @@ impl RecipeData {
                         .context("Unable to make an image from an item's bytes")?
                         .to_rgba8();
 
-                    let item_texture_img =
+                    let mut item_texture_img =
                         imageops::resize(&item_texture_img, 48, 48, imageops::FilterType::Nearest);
+
+                    let mut count_image = None;
+                    if result.count > 1 {
+                        tracing::debug!("Result count is greater than 1, adding count to image");
+                        if result.count > 9 {
+                            todo!(
+                                "Add support for more than 9 items as result for crafting recipes"
+                            )
+                        } else {
+                            for (i, line) in self.font.bitmap.iter().enumerate() {
+                                if line.contains(result.count.to_string().as_str()) {
+                                    tracing::debug!("Found the count in the font bitmap");
+                                    count_image = Some(
+                                        self.font
+                                            .get_character_image(i, result.count.to_string())
+                                            .await?,
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    if count_image.is_some() {
+                        let count_image = imageops::resize(
+                            count_image.as_mut().unwrap(),
+                            18,
+                            18,
+                            imageops::FilterType::Nearest,
+                        );
+                        imageops::overlay(&mut item_texture_img, &count_image, 34, 33)
+                    }
 
                     imageops::overlay(
                         &mut crafting_table_gui,
@@ -561,7 +605,7 @@ impl RecipeData {
             .post("https://slack.com/api/files.getUploadURLExternal")
             .bearer_auth(bot_token)
             .form(&[
-                ("filename", format!("{result_item_name}_recipe.png")),
+                ("filename", format!("{}_recipe.png", result.get_item())),
                 ("length", bytes_to_send_to_slack.len().to_string()),
             ])
             .send()
@@ -596,7 +640,7 @@ impl RecipeData {
             .json(&json!({
                         "files": [{ "id": file_id, "title": "Recipe" }],
                         "channel_id": channel_id,
-                        "initial_comment": format!("<@{}> Here's your {} recipe!", user_id, result_item_name.clone().replace('_', " "))
+                        "initial_comment": format!("<@{}> Here's your {} recipe!", user_id, result.get_item().replace('_', " "))
                     }))
             .send()
             .await
