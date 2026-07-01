@@ -1,7 +1,7 @@
 use crate::font::MinecraftFont;
 use anyhow::{Context, Result};
 use async_zip::tokio::read::seek::ZipFileReader;
-use image::{ImageFormat, imageops};
+use image::{DynamicImage, ImageFormat, imageops};
 use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
@@ -552,35 +552,63 @@ impl RecipeData {
                     let mut item_texture_img =
                         imageops::resize(&item_texture_img, 48, 48, imageops::FilterType::Nearest);
 
-                    let mut count_image = None;
+                    let mut count_images: Vec<Option<DynamicImage>> = Vec::new();
                     if result.count > 1 {
                         tracing::debug!("Result count is greater than 1, adding count to image");
                         if result.count > 9 {
-                            todo!(
-                                "Add support for more than 9 items as result for crafting recipes"
-                            )
+                            let result_count_as_string = result.count.to_string();
+                            for char in result_count_as_string.chars() {
+                                for (i, line) in self.font.bitmap.iter().enumerate() {
+                                    if line.contains(char.to_string().as_str()) {
+                                        tracing::debug!("Found the count in the font bitmap");
+                                        let count_image = self
+                                            .font
+                                            .get_character_image(i, char.to_string())
+                                            .await?;
+                                        let count_image = imageops::resize(
+                                            &count_image,
+                                            18,
+                                            18,
+                                            imageops::FilterType::Nearest,
+                                        );
+                                        count_images.push(Some(count_image.into()));
+                                    }
+                                }
+                            }
                         } else {
                             for (i, line) in self.font.bitmap.iter().enumerate() {
                                 if line.contains(result.count.to_string().as_str()) {
                                     tracing::debug!("Found the count in the font bitmap");
-                                    count_image = Some(
-                                        self.font
-                                            .get_character_image(i, result.count.to_string())
-                                            .await?,
-                                    )
+                                    let count_image = self
+                                        .font
+                                        .get_character_image(i, result.count.to_string())
+                                        .await?;
+                                    let count_image = imageops::resize(
+                                        &count_image,
+                                        18,
+                                        18,
+                                        imageops::FilterType::Nearest,
+                                    );
+                                    count_images.push(Some(count_image.into()));
                                 }
                             }
                         }
                     }
 
-                    if count_image.is_some() {
-                        let count_image = imageops::resize(
-                            count_image.as_mut().unwrap(),
-                            18,
-                            18,
-                            imageops::FilterType::Nearest,
-                        );
-                        imageops::overlay(&mut item_texture_img, &count_image, 34, 33)
+                    let mut i = 0;
+                    for count_image in count_images.iter().rev() {
+                        if count_image.is_some() {
+                            let x = 34_i64.checked_sub((i * 14) as i64).context("How the hell did this happen? The x position for the count image exceeded the bounds of I64. HOW?!?")?;
+                            let y = 33;
+
+                            imageops::overlay(
+                                &mut item_texture_img,
+                                count_image.as_ref().unwrap(),
+                                x,
+                                y,
+                            );
+                            i += 1;
+                        }
                     }
 
                     imageops::overlay(
