@@ -24,7 +24,7 @@ impl MinecraftFont {
 
         font_bitmap_reader
             .read_to_string_checked(&mut font_bitmap_string)
-            .await.context("Failed to read font/default.json.")?:
+            .await.context("Failed to read font/default.json.")?;
             
         let font_bitmap_json: Value = serde_json::from_str(&font_bitmap_string)
             .context("Unable to parse font/default.json")?;
