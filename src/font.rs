@@ -22,13 +22,10 @@ impl MinecraftFont {
             .context("Unable to get the font bitmap reader")?;
         let mut font_bitmap_string = String::new();
 
-        match font_bitmap_reader
+        font_bitmap_reader
             .read_to_string_checked(&mut font_bitmap_string)
-            .await
-        {
-            Ok(..) => (),
-            Err(e) => panic!("Failed to read font/default.json. Error: {}", e),
-        }
+            .await.context("Failed to read font/default.json.")?:
+            
         let font_bitmap_json: Value = serde_json::from_str(&font_bitmap_string)
             .context("Unable to parse font/default.json")?;
         let font_bitmap: Vec<String> = font_bitmap_json["providers"][2]["chars"]
@@ -47,13 +44,10 @@ impl MinecraftFont {
             .await
             .context("Unable to get the font image reader")?;
         let mut font_image_bytes = Vec::new();
-        match font_image_reader
+        font_image_reader
             .read_to_end_checked(&mut font_image_bytes)
-            .await
-        {
-            Ok(..) => (),
-            Err(e) => panic!("Failed to read font/ascii.png. Error: {}", e),
-        }
+            .await.context("Failed to read font/ascii.png.")?;
+        
         let font_image =
             load_from_memory(&font_image_bytes).context("Unable to load font/ascii.png")?;
 
