@@ -157,7 +157,7 @@ impl RecipeData {
             item_png
                 .read_to_end_checked(&mut item_png_bytes)
                 .await
-                .context(format!("Failed to convert image {}", item))?;
+                .context(format!("Failed to convert image {item}"))?;
             self.items.insert(item, item_png_bytes);
         }
         info!("Saved items to the item map");
@@ -169,7 +169,7 @@ impl RecipeData {
             tag_reader
                 .read_to_string_checked(&mut tag_value_string)
                 .await
-                .context(format!("Failed to read tag {}", tag))?;
+                .context(format!("Failed to read tag {tag}"))?;
 
             let tag_values: RecipeTag =
                 serde_json::from_str(&tag_value_string).context("Unable to convert tag to json")?;
@@ -191,7 +191,7 @@ impl RecipeData {
             .await
         {
             Ok(..) => drop(language_map_reader),
-            Err(e) => panic!("Failed to read en-us.json {}", e),
+            Err(e) => panic!("Failed to read en-us.json {e}"),
         }
 
         let raw_lang: HashMap<String, String> =
@@ -213,7 +213,7 @@ impl RecipeData {
                 info!("Successfully initialised font (fetched the bitmap + image)");
                 mcfont
             }
-            Err(e) => panic!("Failed to initialise font {}", e),
+            Err(e) => panic!("Failed to initialise font {e}"),
         };
 
         Ok(())
