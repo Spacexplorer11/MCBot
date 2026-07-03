@@ -1,0 +1,12 @@
+[profile.dev]
+incremental = false
+
+[profile.release]
+incremental = false
+
+[build]
+rustc-wrapper = "/opt/homebrew/bin/sccache"
+target-dir = "/Users/akaalroopsingh/dev-cache/mcbot-target"
+
+[env]
+SCCACHE_DIR = "$HOME/dev-cache/sccache"

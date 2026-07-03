@@ -1,27 +1,34 @@
 pub mod data;
 pub mod font;
+pub mod logging;
 pub mod recipes;
 
-use crate::Task::Recipe;
-use crate::data::fetch_client_jar;
-use crate::recipes::{RecipeData, fix_recipe, fix_recipe_typo};
-use axum::extract::Request;
-use axum::middleware::Next;
-use axum::response::Response;
-use axum::{Form, Json, body::Body, extract::State, middleware, routing::post};
+use crate::logging::initialise_logging;
+use crate::{
+    Task::Recipe,
+    data::fetch_client_jar,
+    recipes::{RecipeData, fix_recipe, fix_recipe_typo},
+};
+use axum::{
+    Form, Json,
+    body::Body,
+    extract::{Request, State},
+    middleware,
+    middleware::Next,
+    response::Response,
+    routing::post,
+};
 use chrono::Utc;
 use dotenvy::dotenv;
-use opentelemetry::{KeyValue, global};
-use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
-use std::{collections::HashMap, env};
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::{net::TcpListener, sync::mpsc};
-use tracing::{Level, error, info, warn};
-use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
+use std::{collections::HashMap, env, sync::Arc};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, mpsc::error::TrySendError},
+};
+use tracing::{debug, error, info, trace, warn};
 
 enum Task {
     Recipe {
@@ -37,7 +44,7 @@ struct AppState {
     client: Client,
     bot_token: String,
     mpsc: mpsc::Sender<Task>,
-    valid_recipes: std::sync::Arc<HashMap<String, usize>>,
+    valid_recipes: HashMap<String, usize>,
 }
 
 #[derive(Clone)]
@@ -76,131 +83,17 @@ struct SlackSlashCommand {
     team_id: String,
 }
 
-#[derive(serde::Serialize)]
-struct LogPayload {
-    timestamp: String,
-    group: String,
-    severity: String,
-    message: String,
-    hostname: String,
-}
-
-struct LogVisitor {
-    message: String,
-}
-
-impl tracing::field::Visit for LogVisitor {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.message = format!("{:?}", value);
-        }
-    }
-}
-
-struct HttpLogger {
-    client: Client,
-    url: String,
-}
-
-impl<S: tracing::Subscriber> Layer<S> for HttpLogger {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut visitor = LogVisitor {
-            message: String::new(),
-        };
-        event.record(&mut visitor);
-
-        let severity = match *event.metadata().level() {
-            Level::ERROR => "error",
-            Level::WARN => "warn",
-            Level::INFO => "info",
-            Level::DEBUG => "debug",
-            Level::TRACE => "trace",
-        };
-
-        let payload = LogPayload {
-            timestamp: Utc::now().to_rfc3339(),
-            group: "MCBot".to_string(),
-            severity: severity.to_string(),
-            message: visitor.message,
-            hostname: hostname::get()
-                .ok()
-                .and_then(|h| h.into_string().ok())
-                .unwrap_or_else(|| "unknown".to_string()),
-        };
-
-        let client = self.client.clone();
-        let url = self.url.clone();
-        tokio::spawn(async move {
-            let _ = client.post(url).json(&payload).send().await;
-        });
-    }
-}
-
 #[tokio::main]
 async fn main() {
+    trace!("Loading .env");
     if dotenv().is_err() {
-        warn!(".env file NOT LOADED")
+        warn!(".env file NOT LOADED");
     }
 
-    let appsignal_api_key =
-        env::var("APPSIGNAL_PUSH_API_KEY").expect("APPSIGNAL_PUSH_API_KEY must be set in .env");
-
-    let appsignal_url = "https://m1lxp90w.eu-central.appsignal-collector.net/v1/traces";
-
-    let mut headers = HashMap::new();
-    headers.insert("X-AppSignal-ApiKey".to_string(), appsignal_api_key.clone());
-
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpJson)
-        .with_endpoint(appsignal_url)
-        .with_headers(headers.clone())
-        .build()
-        .expect("Failed to create OpenTelemetry span exporter");
-
-    let appsignal_environment =
-        env::var("APPSIGNAL_ENVIRONMENT").unwrap_or_else(|_| "development".to_string());
-
-    let resource = Resource::builder()
-        .with_attributes(vec![
-            KeyValue::new("service.name", "MCBot"),
-            KeyValue::new("appsignal.config.name", "MCBot"),
-            KeyValue::new("appsignal.config.language_integration", "rust"),
-            KeyValue::new("appsignal.config.environment", appsignal_environment),
-        ])
-        .build();
-
-    let tracer_provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(resource.clone())
-        .build();
-
-    global::set_tracer_provider(tracer_provider.clone());
-
-    let tracer = global::tracer("mc-bot-tracer");
-    let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("info,mcbot=debug,opentelemetry_sdk=off,opentelemetry-otlp=off")
-    });
-
-    let logs_url = env::var("APPSIGNAL_LOGS_URL").expect("No appsignal logs url found");
+    debug!("Initialising logging");
+    initialise_logging();
 
     let client = Client::new();
-
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
-        .with(telemetry_layer)
-        .with(filter)
-        .with(HttpLogger {
-            client: client.clone(),
-            url: logs_url,
-        })
-        .init();
 
     let bot_token = env::var("SLACK_BOT_TOKEN").expect("Bot Token NOT FOUND");
     let signing_secret = env::var("SLACK_SIGNING_SECRET").expect("Signing Secret NOT FOUND");
@@ -208,7 +101,7 @@ async fn main() {
     let verifier = slack_http_verifier::SlackVerifier::new(signing_secret)
         .expect("Unable to make a slack http verifier instance using signing secret");
 
-    let (queue_input, mut queue_output) = mpsc::channel::<Task>(2000);
+    let (queue_input, mut queue_output) = mpsc::channel::<Task>(128);
 
     let mut client_jar_zip = fetch_client_jar(&client).await;
     let mut recipe_data = RecipeData::default();
@@ -218,17 +111,18 @@ async fn main() {
         .await
         .expect("Failed to fetch recipes");
 
-    let state = AppState {
+    let state = Arc::new(AppState {
         client: Client::new(),
         bot_token: bot_token.clone(),
         mpsc: queue_input,
-        valid_recipes: std::sync::Arc::new(recipe_data.valid_recipes.clone()),
-    };
+        valid_recipes: recipe_data.valid_recipes.clone(),
+    });
 
     let slack_signature_verifier_state = SlackSignatureVerifierState { verifier };
 
     tokio::spawn(async move {
         while let Some(task) = queue_output.recv().await {
+            trace!("Received task in async thread");
             match task {
                 Recipe {
                     item_name,
@@ -238,16 +132,16 @@ async fn main() {
                 } => {
                     match recipe_data
                         .process_recipe(
-                            item_name,
+                            item_name.as_str(),
                             &client,
                             &bot_token,
-                            channel_id,
-                            user_id,
+                            channel_id.as_str(),
+                            user_id.as_str(),
                             &mut client_jar_zip,
                         )
                         .await
                     {
-                        Ok(..) => (),
+                        Ok(..) => debug!("Recipe successfully processed"),
                         Err(e) => {
                             error!(error = ?e, "Failed to fulfill recipe task processing pipeline");
 
@@ -262,17 +156,19 @@ async fn main() {
                             } else {
                                 json!({
                                     "response_type": "ephemeral",
-                                    "text": format!("Uh oh, something went wrong! If this persists, please contact @Akaalroop on slack or email akaal@akaalroop.com. Error: {e}")
+                                    "text": format!("Uh oh, something went wrong! Please try again! If this persists, please contact @Akaalroop on slack or email akaal@akaalroop.com. Error: {e}")
                                 })
                             };
                             let mut response =
                                 client.post(&response_url).json(&polite_msg).send().await;
-                            for _ in 0..=3 {
-                                error!(error = ?response.err().unwrap(), "The generic error message failed to send to the user");
-                                response =
-                                    client.post(&response_url).json(&polite_msg).send().await;
-                                if response.is_ok() {
-                                    break;
+                            if response.is_err() {
+                                for _ in 0..=3 {
+                                    error!(error = ?response.err().unwrap(), "The generic error message failed to send to the user");
+                                    response =
+                                        client.post(&response_url).json(&polite_msg).send().await;
+                                    if response.is_ok() {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -300,9 +196,10 @@ async fn main() {
 }
 
 async fn handle_event(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     Json(payload): Json<SlackPayload>,
 ) -> Json<serde_json::Value> {
+    trace!("Received an event at /slack/events");
     match payload {
         SlackPayload::UrlVerification { challenge } => {
             info!("Url Verification challenge received");
@@ -310,12 +207,11 @@ async fn handle_event(
         }
 
         SlackPayload::EventCallback { event } => {
-            #[cfg(debug_assertions)]
-            info!("Received event");
-            match state.client.post("https://slack.com/api/chat.postMessage").bearer_auth(state.bot_token).json(&json!({"channel": format!("{}", event.channel), "text": "if this works, you deserve to proud of yourself :)"})).send().await {
+            trace!(event_type = event.event_type, "Received event");
+            match state.client.post("https://slack.com/api/chat.postMessage").bearer_auth(state.bot_token.clone()).json(&json!({"channel": format!("{}", event.channel), "text": "if this works, you deserve to proud of yourself :)"})).send().await {
                 Ok(response) => {
                     #[cfg(debug_assertions)]
-                    info!("{:#?}", response)
+                    debug!("{:#?}", response)
                 },
                 Err(e) => error!("Something went wrong with sending a message, {e}")
             };
@@ -325,11 +221,16 @@ async fn handle_event(
 }
 
 async fn handle_command(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     Form(payload): Form<SlackSlashCommand>,
 ) -> Json<serde_json::Value> {
+    trace!("Received command at /slack/commands");
     match payload.command.as_str() {
         "/mcrecipe" => {
+            trace!(
+                "Received /mcrecipe command for {recipe}",
+                recipe = &payload.text
+            );
             let requested_recipe = fix_recipe(&payload.text);
             if state.valid_recipes.contains_key(&requested_recipe) {
                 match state.mpsc.try_send(Recipe {
@@ -379,9 +280,14 @@ async fn handle_command(
                             }
                             Err(e) => {
                                 error!("Error occurred sending task to generate image: {e}");
-                                Json(
-                                    json!({"response_type": "ephemeral", "text": "I wasn't able to start generating your image. Please try again."}),
-                                )
+                                match e {
+                                    TrySendError::Full(..) => Json(
+                                        json!({"response_type": "ephemeral", "text": "Too many people have requested recipes at the moment. Please try again later."}),
+                                    ),
+                                    _ => Json(
+                                        json!({"response_type": "ephemeral", "text": "I wasn't able to start generating your image. Please try again."}),
+                                    ),
+                                }
                             }
                         }
                     }
@@ -414,6 +320,7 @@ async fn verify_slack_signature(
     request: Request,
     next: Next,
 ) -> Response {
+    trace!("Received request to verify signature");
     let (parts, body) = request.into_parts();
 
     let request_bytes = match axum::body::to_bytes(body, 1024 * 16).await {
@@ -504,11 +411,12 @@ async fn verify_slack_signature(
         signature,
     ) {
         Ok(..) => {
+            trace!("Slack signature verification successful");
             next.run(Request::from_parts(parts, Body::from(request_bytes)))
                 .await
         }
         Err(e) => {
-            error!("Slack signature verification failed: {e}");
+            warn!("Slack signature verification failed: {e}");
             Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body("Slack signature verification failed".into())

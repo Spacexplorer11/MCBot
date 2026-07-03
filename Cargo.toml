@@ -25,3 +25,6 @@ regex = "1.12.4"
 chrono = "0.4.39"
 hostname = "0.4"
 slack-http-verifier = "0.1.2"
+
+[profile.dev.package."*"]
+opt-level = 0

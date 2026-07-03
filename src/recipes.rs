@@ -9,7 +9,7 @@ use serde_json::json;
 use std::{collections::HashMap, io::Cursor};
 use strsim::levenshtein;
 use tokio::{fs::File, io::BufReader};
-use tracing::info;
+use tracing::{info, trace};
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
@@ -53,11 +53,18 @@ struct RecipeResult {
 }
 
 impl RecipeResult {
-    pub fn get_item(&self) -> String {
+    fn get_item(&self) -> &str {
         self.id
             .strip_prefix("minecraft:")
             .expect("Result doesn't start with 'minecraft:'")
-            .to_string()
+    }
+
+    fn get_pretty_item(&self) -> &str {
+        self.id
+            .strip_prefix("minecraft:")
+            .expect("Result doesn't start with 'minecraft:'")
+            .replace("_", " ")
+            .as_str()
     }
 }
 
@@ -71,12 +78,6 @@ pub struct RecipeData {
 
 impl Default for RecipeData {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RecipeData {
-    fn new() -> RecipeData {
         RecipeData {
             items: HashMap::new(),
             tags: HashMap::new(),
@@ -85,7 +86,9 @@ impl RecipeData {
             font: MinecraftFont::default(),
         }
     }
+}
 
+impl RecipeData {
     #[tracing::instrument(name = "fetching_on_startup_pipeline", skip(self, client_jar_zip))]
     pub async fn fetch_recipes_and_more(
         &mut self,
@@ -126,9 +129,9 @@ impl RecipeData {
             } else if filename.eq("assets/minecraft/lang/en_us.json") {
                 language_map_index = Some(i); // Get the language mapping file's index
             } else if filename.eq("assets/minecraft/font/include/default.json") {
-                font_indexes.insert(0, Some(i));
+                font_indexes.insert(0, Some(i)); // Get the font json's index
             } else if filename.eq("assets/minecraft/textures/font/ascii.png") {
-                font_indexes.push(Some(i));
+                font_indexes.push(Some(i)); // Get the font image's index
             } else if filename.starts_with("assets/minecraft/textures/item") // Get the item images from the jar
                 && filename.ends_with(".png")
             {
@@ -157,32 +160,33 @@ impl RecipeData {
             }
         }
         info!("Saved recipes to recipe map");
+        trace!("Saved the relevant things to their temporary maps");
 
-        for item in temp_items_map {
-            let mut item_png = client_jar_zip.reader_with_entry(item.1).await?;
+        for (item, index) in temp_items_map {
+            let mut item_png = client_jar_zip.reader_with_entry(index).await?;
             let mut item_png_bytes = Vec::new();
 
             item_png
                 .read_to_end_checked(&mut item_png_bytes)
                 .await
-                .context(format!("Failed to convert image {}", item.0))?;
-            self.items.insert(item.0, item_png_bytes);
+                .context(format!("Failed to convert image {}", item))?;
+            self.items.insert(item, item_png_bytes);
         }
         info!("Saved items to the item map");
 
-        for tag in temp_recipe_tags {
-            let mut tag_reader = client_jar_zip.reader_with_entry(tag.1).await?;
+        for (tag, index) in temp_recipe_tags {
+            let mut tag_reader = client_jar_zip.reader_with_entry(index).await?;
             let mut tag_value_string = String::new();
 
             tag_reader
                 .read_to_string_checked(&mut tag_value_string)
                 .await
-                .context(format!("Failed to read tag {}", tag.0))?;
+                .context(format!("Failed to read tag {}", tag))?;
 
             let tag_values: RecipeTag =
                 serde_json::from_str(&tag_value_string).context("Unable to convert tag to json")?;
 
-            self.tags.insert(tag.0, tag_values.values);
+            self.tags.insert(tag, tag_values.values);
         }
         info!("Saved tags to tags map");
 
@@ -198,7 +202,7 @@ impl RecipeData {
             .read_to_string_checked(&mut language_map_string)
             .await
         {
-            Ok(..) => (),
+            Ok(..) => drop(language_map_reader),
             Err(e) => panic!("Failed to read en-us.json {}", e),
         }
 
@@ -233,17 +237,17 @@ impl RecipeData {
     )]
     pub async fn process_recipe(
         &mut self,
-        item_name: String,
+        item_name: &str,
         client: &Client,
         bot_token: &str,
-        channel_id: String,
-        user_id: String,
+        channel_id: &str,
+        user_id: &str,
         client_jar_zip: &mut ZipFileReader<BufReader<File>>,
     ) -> Result<()> {
         let recipe_index = self
             .valid_recipes
-            .get(&item_name)
-            .context("How on earth did this happen (1)")?;
+            .get(item_name)
+            .context("Somehow the recipe doesn't exist in the valid recipes map even tho it was previously validated")?;
         let mut recipe = client_jar_zip
             .reader_with_entry(*recipe_index)
             .await
@@ -256,6 +260,9 @@ impl RecipeData {
 
         let recipe_json: MCRecipe = serde_json::from_str(&recipe_string)
             .context("Unable to convert the json to MCRecipe type")?;
+
+        drop(recipe);
+        drop(recipe_string);
 
         match recipe_json {
             MCRecipe::Shaped {
@@ -335,7 +342,7 @@ impl RecipeData {
             } => {
                 let mut items_to_place = Vec::new();
                 for ingredient in ingredients {
-                    let item: String;
+                    let item: &str;
                     if ingredient.starts_with("#minecraft:") {
                         let tag = ingredient.strip_prefix("#minecraft:").unwrap();
 
@@ -354,14 +361,11 @@ impl RecipeData {
                         item = tag_possible_items[0]
                             .as_str()
                             .strip_prefix("minecraft:")
-                            .context("The loop failed somehow or the item doesn't begin with 'minecraft:'")?.to_string();
+                            .context("The loop failed somehow or the item doesn't begin with 'minecraft:'")?;
                     } else {
-                        item = ingredient
-                            .strip_prefix("minecraft:")
-                            .unwrap_or(" ")
-                            .to_string();
+                        item = ingredient.strip_prefix("minecraft:").unwrap_or(" ");
                     }
-                    items_to_place.push(item);
+                    items_to_place.push(item.to_string());
                 }
 
                 Self::make_and_send_image_to_slack(
@@ -381,7 +385,7 @@ impl RecipeData {
                 result,
             } => {
                 let mut items_to_place = Vec::new();
-                let mut item;
+                let mut item: &str;
                 if input.starts_with("#minecraft:") {
                     let tag = input.strip_prefix("#minecraft:").unwrap();
 
@@ -400,12 +404,11 @@ impl RecipeData {
                     item = tag_possible_items[0]
                         .as_str()
                         .strip_prefix("minecraft:")
-                        .context("The item doesn't begin with 'minecraft:'")?
-                        .to_string();
+                        .context("The item doesn't begin with 'minecraft:'")?;
                 } else {
-                    item = input.strip_prefix("minecraft:").unwrap_or(" ").to_string();
+                    item = input.strip_prefix("minecraft:").unwrap_or(" ");
                 }
-                items_to_place.push(item);
+                items_to_place.push(item.to_string());
 
                 if material.starts_with("#minecraft:") {
                     let tag = material.strip_prefix("#minecraft:").unwrap();
@@ -425,15 +428,11 @@ impl RecipeData {
                     item = tag_possible_items[0]
                         .as_str()
                         .strip_prefix("minecraft:")
-                        .context("The item doesn't begin with 'minecraft:'")?
-                        .to_string();
+                        .context("The item doesn't begin with 'minecraft:'")?;
                 } else {
-                    item = material
-                        .strip_prefix("minecraft:")
-                        .unwrap_or(" ")
-                        .to_string();
+                    item = material.strip_prefix("minecraft:").unwrap_or(" ");
                 }
-                items_to_place.push(item);
+                items_to_place.push(item.to_string());
 
                 Self::make_and_send_image_to_slack(
                     self,
@@ -455,8 +454,8 @@ impl RecipeData {
         &self,
         client: &Client,
         bot_token: &str,
-        channel_id: String,
-        user_id: String,
+        channel_id: &str,
+        user_id: &str,
         result: RecipeResult,
         recipe_ingredients: Vec<String>,
     ) -> Result<()> {
@@ -485,7 +484,7 @@ impl RecipeData {
                     && !recipe_ingredients.get(i).unwrap().eq(" ")
                 {
                     let item_bytes = match self.items.get(&recipe_ingredients[i]) {
-                        Some(bytes) => bytes.clone(),
+                        Some(bytes) => bytes.to_owned(),
                         None => {
                             let response = client
                                 .get(format!(
@@ -523,14 +522,14 @@ impl RecipeData {
                 if i == 9 {
                     let result_x = cell_x + 107; // magic number obtained through trial and error
                     let result_y = 62;
-                    let item_bytes = match self.items.get(&result.get_item()) {
+                    let item_bytes = match self.items.get(result.get_item()) {
                         Some(bytes) => bytes,
                         None => {
                             let response = client
                                 .get(format!(
                                     "https://minecraft.wiki/images/Invicon_{}.png",
                                     self.language_mappings
-                                        .get(&result.get_item())
+                                        .get(result.get_item())
                                         .context("Unable to find item/block language mapping")?
                                         .replace(' ', "_")
                                 ))
@@ -554,13 +553,12 @@ impl RecipeData {
 
                     let mut count_images: Vec<Option<DynamicImage>> = Vec::new();
                     if result.count > 1 {
-                        tracing::debug!("Result count is greater than 1, adding count to image");
+                        trace!("Result count is greater than 1, adding count to image");
                         if result.count > 9 {
                             let result_count_as_string = result.count.to_string();
                             for char in result_count_as_string.chars() {
                                 for (i, line) in self.font.bitmap.iter().enumerate() {
                                     if line.contains(char.to_string().as_str()) {
-                                        tracing::debug!("Found the count in the font bitmap");
                                         let count_image = self
                                             .font
                                             .get_character_image(i, char.to_string())
@@ -578,7 +576,6 @@ impl RecipeData {
                         } else {
                             for (i, line) in self.font.bitmap.iter().enumerate() {
                                 if line.contains(result.count.to_string().as_str()) {
-                                    tracing::debug!("Found the count in the font bitmap");
                                     let count_image = self
                                         .font
                                         .get_character_image(i, result.count.to_string())
@@ -625,15 +622,16 @@ impl RecipeData {
         crafting_table_gui
             .write_to(
                 &mut Cursor::new(&mut bytes_to_send_to_slack),
-                ImageFormat::Png,
+                ImageFormat::WebP,
             )
             .context("Failed to convert the image back into bytes")?;
 
+        trace!("Fetching upload URL from Slack (Step 1 of file upload)");
         let upload_url_response = client
             .post("https://slack.com/api/files.getUploadURLExternal")
             .bearer_auth(bot_token)
             .form(&[
-                ("filename", format!("{}_recipe.png", result.get_item())),
+                ("filename", format!("{}_recipe.webp", result.get_item())),
                 ("length", bytes_to_send_to_slack.len().to_string()),
             ])
             .send()
@@ -653,6 +651,7 @@ impl RecipeData {
             .as_str()
             .context("Couldn't find the file id")?;
 
+        trace!("Uploading crafting recipe file bytes to Slack (Step 2 of file upload)");
         client
             .post(upload_url)
             .body(bytes_to_send_to_slack)
@@ -662,13 +661,14 @@ impl RecipeData {
             .error_for_status()
             .context("Slack returned an error when uploading the file (Step 2)")?;
 
+        trace!("Completing the file upload (Step 3 of file upload)");
         client
             .post("https://slack.com/api/files.completeUploadExternal")
             .bearer_auth(bot_token)
             .json(&json!({
-                        "files": [{ "id": file_id, "title": "Recipe" }],
+                        "files": [{ "id": file_id, "title": format!("{} recipe", result.get_pretty_item()) }],
                         "channel_id": channel_id,
-                        "initial_comment": format!("<@{}> Here's your {} recipe!", user_id, result.get_item().replace('_', " "))
+                        "initial_comment": format!("<@{}> Here's your {} recipe!", user_id, result.get_pretty_item())
                     }))
             .send()
             .await
