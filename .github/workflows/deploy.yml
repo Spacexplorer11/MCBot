@@ -66,15 +66,22 @@ jobs:
       - name: Run Cross Build
         shell: bash
         run: |
-          set -euo pipefail
-          cross build --release --target "${TARGET}"
+            set -euo pipefail
+            # Tell cross to share the host's cargo home directory inside the container
+            export CROSS_CONTAINER_VOLUME_CACHEDIR="$HOME/.cargo"
+            cross build --release --target "${TARGET}"
+
+      - name: Fix target directory permissions for caching
+        if: always()
+        run: |
+            sudo chown -R $(id -u):$(id -g) target/ "$HOME/.cargo"
 
       - name: Connect to Tailscale Network
         uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:github_actions
+          tags: tag:github-actions
 
       - name: Install SSH Key
         uses: shimataro/ssh-key-action@87a8f067114a8ce263df83e9ed5c849953548bc3
