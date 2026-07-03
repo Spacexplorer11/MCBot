@@ -74,7 +74,7 @@ jobs:
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: github_actions
+          tags: tag:github_actions
 
       - name: Install SSH Key
         uses: shimataro/ssh-key-action@87a8f067114a8ce263df83e9ed5c849953548bc3
