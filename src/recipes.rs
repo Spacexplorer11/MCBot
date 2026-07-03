@@ -59,12 +59,11 @@ impl RecipeResult {
             .expect("Result doesn't start with 'minecraft:'")
     }
 
-    fn get_pretty_item(&self) -> &str {
+    fn get_pretty_item(&self) -> String {
         self.id
             .strip_prefix("minecraft:")
             .expect("Result doesn't start with 'minecraft:'")
             .replace("_", " ")
-            .as_str()
     }
 }
 
