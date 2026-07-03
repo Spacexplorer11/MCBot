@@ -62,6 +62,7 @@ enum SlackPayload {
     EventCallback { event: SlackEvent },
 }
 
+#[expect(dead_code)]
 #[derive(Deserialize)]
 struct SlackEvent {
     #[serde(rename = "type")]
@@ -72,6 +73,7 @@ struct SlackEvent {
     ts: String,
 }
 
+#[expect(dead_code)]
 #[derive(Deserialize)]
 struct SlackSlashCommand {
     command: String,

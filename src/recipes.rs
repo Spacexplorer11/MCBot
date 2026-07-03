@@ -67,24 +67,13 @@ impl RecipeResult {
     }
 }
 
+#[derive(Default)]
 pub struct RecipeData {
     items: HashMap<String, Vec<u8>>,
     tags: HashMap<String, Vec<String>>,
     language_mappings: HashMap<String, String>,
     pub valid_recipes: HashMap<String, usize>,
     font: MinecraftFont,
-}
-
-impl Default for RecipeData {
-    fn default() -> Self {
-        RecipeData {
-            items: HashMap::new(),
-            tags: HashMap::new(),
-            language_mappings: HashMap::new(),
-            valid_recipes: HashMap::new(),
-            font: MinecraftFont::default(),
-        }
-    }
 }
 
 impl RecipeData {
