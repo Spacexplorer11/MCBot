@@ -69,9 +69,11 @@ impl<S: tracing::Subscriber> Layer<S> for HttpLogger {
 
         let client = self.client.clone();
         let url = self.url.clone();
-        tokio::spawn(async move {
-            let _ = client.post(url).json(&payload).send().await;
-        });
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = client.post(url).json(&payload).send().await;
+            });
+        }
     }
 }
 

@@ -180,7 +180,7 @@ async fn main() {
         }
     });
 
-    let router = axum::Router::new()
+    let mcbot_router = axum::Router::new()
         .route("/slack/events", post(handle_event))
         .route("/slack/commands", post(handle_command))
         .route_layer(middleware::from_fn_with_state(
@@ -188,9 +188,16 @@ async fn main() {
             verify_slack_signature,
         ))
         .with_state(state);
+
+    let mcrecipes_router = axum::Router::new().route("/slack/mcrecipes", post(handle_mcrecipes));
+
     let listener = TcpListener::bind("0.0.0.0:4598")
         .await
         .expect("Unable to bind the TcpListener");
+
+    let router = axum::Router::new()
+        .merge(mcbot_router)
+        .merge(mcrecipes_router);
 
     axum::serve(listener, router)
         .await
@@ -210,11 +217,11 @@ async fn handle_event(
 
         SlackPayload::EventCallback { event } => {
             trace!(event_type = event.event_type, "Received event");
-            match state.client.post("https://slack.com/api/chat.postMessage").bearer_auth(state.bot_token.clone()).json(&json!({"channel": format!("{}", event.channel), "text": "if this works, you deserve to proud of yourself :)"})).send().await {
-                Ok(response) => {
-                    #[cfg(debug_assertions)]
-                    debug!("{:#?}", response)
-                },
+            match state.client.post("https://slack.com/api/chat.postMessage")
+                .bearer_auth(state.bot_token.clone())
+                .json(&json!({"channel": event.channel, "text": "Hi! I'm MCBot! :) \nUse /mcrecipe to get crafting recipes!"}))
+                .send().await {
+                Ok(..) => (),
                 Err(e) => error!("Something went wrong with sending a message, {e}")
             };
             Json(json!({"ok":true}))
@@ -314,6 +321,30 @@ async fn handle_command(
                 json!({"response_type": "ephemeral", "text": "Sorry that command isn't supported as of right now."}),
             )
         } // only registered slash commands should even come, this shouldn't trigger anyway
+    }
+}
+
+// YES this function is horribly inefficient, but its ok because this function will rarely get used
+async fn handle_mcrecipes(Json(payload): Json<SlackPayload>) -> Json<serde_json::Value> {
+    let bot_token = env::var("SLACK_BOT_TOKEN_MCRECIPES").expect("MCRecipes Bot Token NOT FOUND");
+    let client = Client::new();
+    trace!("Received an event at /slack/mcrecipes");
+    match payload {
+        SlackPayload::UrlVerification { challenge } => {
+            info!("Url Verification challenge received for MCRecipes");
+            Json(json!({"challenge": challenge}))
+        }
+
+        SlackPayload::EventCallback { event } => {
+            match client.post("https://slack.com/api/chat.postMessage")
+                .bearer_auth(bot_token.clone())
+                .json(&json!({"channel": event.channel, "text": "Unfortunately now MCRecipes is retired. Please use <@U0B8ER7U1S5> (/mcrecipe for recipe functionality, other functions are retired)"}))
+                .send().await {
+                Ok(..) => (),
+                Err(e) => error!("Something went wrong with sending a message, {e}")
+            };
+            Json(json!({"ok":true}))
+        }
     }
 }
 
