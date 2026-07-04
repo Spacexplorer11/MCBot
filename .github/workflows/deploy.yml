@@ -44,20 +44,28 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          BINSTALL_VERSION="1.10.9"
-          BINSTALL_ARCHIVE="cargo-binstall-x86_64-unknown-linux-musl.tgz"
-          BINSTALL_SHA256="4ccfcd8e0ac8518790e5a49d640a7044448c7925622aa53f98101f4d1e449607"
 
-          curl -LsSf \
-            "https://github.com/cargo-bins/cargo-binstall/releases/download/v${BINSTALL_VERSION}/${BINSTALL_ARCHIVE}" \
-            -o "/tmp/${BINSTALL_ARCHIVE}"
+          if ! command -v cross &>/dev/null; then
+            if ! command -v cargo-binstall &>/dev/null; then
+              BINSTALL_VERSION="1.10.9"
+              BINSTALL_ARCHIVE="cargo-binstall-x86_64-unknown-linux-musl.tgz"
+              BINSTALL_SHA256="4ccfcd8e0ac8518790e5a49d640a7044448c7925622aa53f98101f4d1e449607"
 
-          echo "${BINSTALL_SHA256}  /tmp/${BINSTALL_ARCHIVE}" | sha256sum --check --status
+              curl -LsSf \
+                "https://github.com/cargo-bins/cargo-binstall/releases/download/v${BINSTALL_VERSION}/${BINSTALL_ARCHIVE}" \
+                -o "/tmp/${BINSTALL_ARCHIVE}"
 
-          tar -xzf "/tmp/${BINSTALL_ARCHIVE}" -C "${HOME}/.cargo/bin" cargo-binstall
-          rm -f "/tmp/${BINSTALL_ARCHIVE}"
+              echo "${BINSTALL_SHA256}  /tmp/${BINSTALL_ARCHIVE}" | sha256sum --check --status
 
-          cargo binstall cross@0.2.5 --locked --no-confirm
+              tar -xzf "/tmp/${BINSTALL_ARCHIVE}" -C "${HOME}/.cargo/bin" cargo-binstall
+              rm -f "/tmp/${BINSTALL_ARCHIVE}"
+            fi
+
+            cargo binstall cross@0.2.5 --locked --no-confirm --force
+          fi
+
+          echo "cross resolved to: $(command -v cross)"
+          cross --version
 
       - name: Run Cross Build
         shell: bash
