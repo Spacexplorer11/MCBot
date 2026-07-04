@@ -12,20 +12,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-deploy:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     env:
-      CARGO_INCREMENTAL: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
       TARGET: aarch64-unknown-linux-gnu
-      DEPLOY_USER: akaalroopsingh
-      DEPLOY_HOST: 100.66.120.48
-      REMOTE_DIR: /home/akaalroopsingh/mcbot
-      REMOTE_BIN: /home/akaalroopsingh/mcbot/mcbot
-      REMOTE_TMP_BIN: /home/akaalroopsingh/mcbot/mcbot_new
-      ENV_FILE: /home/akaalroopsingh/mcbot/.env.deploy
-      APP_REVISION: ${{ github.sha }}
-
     steps:
       - name: Checkout code
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -40,6 +33,10 @@ jobs:
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          shared-key: cross-${{ env.TARGET }}
+          cache-on-failure: true
+          cache-all-crates: true
 
       - name: Install Cross
         shell: bash
@@ -47,7 +44,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-
           BINSTALL_VERSION="1.10.9"
           BINSTALL_ARCHIVE="cargo-binstall-x86_64-unknown-linux-musl.tgz"
           BINSTALL_SHA256="4ccfcd8e0ac8518790e5a49d640a7044448c7925622aa53f98101f4d1e449607"
@@ -66,15 +62,41 @@ jobs:
       - name: Run Cross Build
         shell: bash
         run: |
-            set -euo pipefail
-            # Tell cross to share the host's cargo home directory inside the container
-            export CROSS_CONTAINER_VOLUME_CACHEDIR="$HOME/.cargo"
-            cross build --release --target "${TARGET}"
+          set -euo pipefail
+          export CROSS_CONTAINER_VOLUME_CACHEDIR="$HOME/.cargo"
+          cross build --release --target "${TARGET}"
 
       - name: Fix target directory permissions for caching
         if: always()
         run: |
-            sudo chown -R $(id -u):$(id -g) target/ "$HOME/.cargo"
+          sudo chown -R "$(id -u):$(id -g)" target/ "$HOME/.cargo"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mcbot-binary
+          path: target/${{ env.TARGET }}/release/mcbot
+          retention-days: 1
+          if-no-files-found: error
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DEPLOY_USER: akaalroopsingh
+      DEPLOY_HOST: 100.66.120.48
+      REMOTE_DIR: /home/akaalroopsingh/mcbot
+      REMOTE_BIN: /home/akaalroopsingh/mcbot/mcbot
+      REMOTE_TMP_BIN: /home/akaalroopsingh/mcbot/mcbot_new
+      ENV_FILE: /home/akaalroopsingh/mcbot/.env.deploy
+      APP_REVISION: ${{ github.sha }}
+    steps:
+      - name: Download binary artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: mcbot-binary
+          path: ./bin
 
       - name: Connect to Tailscale Network
         uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade
@@ -94,8 +116,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          scp "./target/${TARGET}/release/mcbot" "${DEPLOY_USER}@${DEPLOY_HOST}:${REMOTE_TMP_BIN}"
+          chmod +x ./bin/mcbot
+          scp ./bin/mcbot "${DEPLOY_USER}@${DEPLOY_HOST}:${REMOTE_TMP_BIN}"
 
           ssh "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -seuo pipefail' <<EOF
           REMOTE_BIN='${REMOTE_BIN}'
