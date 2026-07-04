@@ -98,7 +98,7 @@ jobs:
       REMOTE_BIN: /home/akaalroopsingh/mcbot/mcbot
       REMOTE_TMP_BIN: /home/akaalroopsingh/mcbot/mcbot_new
       ENV_FILE: /home/akaalroopsingh/mcbot/.env.deploy
-      APP_REVISION: ${{ github.sha }}
+      APPSIGNAL_REVISION: ${{ github.sha }}
     steps:
       - name: Download binary artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -137,7 +137,7 @@ jobs:
           REMOTE_BIN='${REMOTE_BIN}'
           REMOTE_TMP_BIN='${REMOTE_TMP_BIN}'
           ENV_FILE='${ENV_FILE}'
-          APP_REVISION='${APP_REVISION}'
+          APPSIGNAL_REVISION='${APPSIGNAL_REVISION}'
 
           chmod +x "\$REMOTE_TMP_BIN"
           mv -f "\$REMOTE_TMP_BIN" "\$REMOTE_BIN"
@@ -148,8 +148,8 @@ jobs:
           TMP_ENV=\$(mktemp "\${ENV_FILE}.XXXXXX")
           trap 'rm -f "\$TMP_ENV"' EXIT
 
-          awk '!/^APP_REVISION=/' "\$ENV_FILE" > "\$TMP_ENV"
-          printf 'APP_REVISION=%s\n' "\$APP_REVISION" >> "\$TMP_ENV"
+          awk '!/^APPSIGNAL_REVISION=/' "\$ENV_FILE" > "\$TMP_ENV"
+          printf 'APPSIGNAL_REVISION=%s\n' "\$APP_REVISION" >> "\$TMP_ENV"
 
           chmod 600 "\$TMP_ENV"
           mv -f "\$TMP_ENV" "\$ENV_FILE"

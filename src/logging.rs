@@ -1,10 +1,9 @@
 use chrono::Utc;
 use opentelemetry::{KeyValue, global};
-use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
+use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use reqwest::Client;
-use std::collections::HashMap;
 use std::env;
 use tracing::Level;
 use tracing_subscriber::layer::SubscriberExt;
@@ -83,19 +82,20 @@ pub fn initialise_logging() {
 
     let appsignal_url = "https://m1lxp90w.eu-central.appsignal-collector.net/v1/traces";
 
-    let mut headers = HashMap::new();
-    headers.insert("X-AppSignal-ApiKey".to_string(), appsignal_api_key.clone());
-
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
-        .with_protocol(Protocol::HttpJson)
+        .with_protocol(Protocol::HttpBinary) // NEVER TOUCH THIS AGAIN. ONLY BINARY WORKS - WASTED HOURS ON THIS
         .with_endpoint(appsignal_url)
-        .with_headers(headers.clone())
         .build()
         .expect("Failed to create OpenTelemetry span exporter");
 
-    let appsignal_environment =
-        env::var("APPSIGNAL_ENVIRONMENT").unwrap_or_else(|_| "development".to_string());
+    let appsignal_environment = env::var("APPSIGNAL_ENVIRONMENT").unwrap_or_else(|_| {
+        tracing::warn!("No appsignal environment env variable found, defaulting to development");
+        "development".to_string()
+    });
+
+    let appsignal_revision =
+        env::var("APPSIGNAL_REVISION").unwrap_or_else(|_| "unknown".to_string());
 
     let resource = Resource::builder()
         .with_attributes(vec![
@@ -103,6 +103,8 @@ pub fn initialise_logging() {
             KeyValue::new("appsignal.config.name", "MCBot"),
             KeyValue::new("appsignal.config.language_integration", "rust"),
             KeyValue::new("appsignal.config.environment", appsignal_environment),
+            KeyValue::new("appsignal.config.push_api_key", appsignal_api_key),
+            KeyValue::new("appsignal.config.revision", appsignal_revision),
         ])
         .build();
 
