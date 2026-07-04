@@ -149,7 +149,7 @@ jobs:
           trap 'rm -f "\$TMP_ENV"' EXIT
 
           awk '!/^APPSIGNAL_REVISION=/' "\$ENV_FILE" > "\$TMP_ENV"
-          printf 'APPSIGNAL_REVISION=%s\n' "\$APP_REVISION" >> "\$TMP_ENV"
+          printf 'APPSIGNAL_REVISION=%s\n' "\$APPSIGNAL_REVISION" >> "\$TMP_ENV"
 
           chmod 600 "\$TMP_ENV"
           mv -f "\$TMP_ENV" "\$ENV_FILE"
