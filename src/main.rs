@@ -16,7 +16,7 @@ use axum::{
     middleware,
     middleware::Next,
     response::Response,
-    routing::post,
+    routing::{get, post},
 };
 use chrono::Utc;
 use dotenvy::dotenv;
@@ -191,13 +191,16 @@ async fn main() {
 
     let mcrecipes_router = axum::Router::new().route("/slack/mcrecipes", post(handle_mcrecipes));
 
+    let uptime_router = axum::Router::new().route("/status/uptime", get(uptime));
+
     let listener = TcpListener::bind("0.0.0.0:4598")
         .await
         .expect("Unable to bind the TcpListener");
 
     let router = axum::Router::new()
         .merge(mcbot_router)
-        .merge(mcrecipes_router);
+        .merge(mcrecipes_router)
+        .merge(uptime_router);
 
     axum::serve(listener, router)
         .await
@@ -346,6 +349,10 @@ async fn handle_mcrecipes(Json(payload): Json<SlackPayload>) -> Json<serde_json:
             Json(json!({"ok":true}))
         }
     }
+}
+
+async fn uptime() -> Json<serde_json::Value> {
+    Json(json!({"ok": true}))
 }
 
 async fn verify_slack_signature(
