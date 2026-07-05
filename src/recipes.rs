@@ -6,9 +6,11 @@ use regex::Regex;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::{collections::HashMap, io::Cursor};
 use strsim::levenshtein;
-use tokio::{fs::File, io::BufReader};
+use tokio::{fs::File, io::BufReader, task::JoinSet};
 use tracing::{debug, info, trace};
 
 #[derive(Deserialize)]
@@ -449,7 +451,6 @@ impl RecipeData {
         recipe_ingredients: Vec<String>,
     ) -> Result<()> {
         let recipe_link = self.recipe_links.get(result.get_item());
-        let mut cache_hit = false;
         if let Some(recipe_link) = recipe_link {
             if !client
                 .get(recipe_link)
@@ -466,13 +467,11 @@ impl RecipeData {
                 .json(&json!({"channel": channel_id, "text": format!("<@{}> Here's your {} recipe!\n {}", user_id, result.get_pretty_item(), recipe_link), "unfurl_links": true, "unfurl_media": true}))
                 .send()
                 .await?;
-                cache_hit = true;
-                trace!("Successfully sent the file link, saving precious compute time!")
+                trace!("Successfully sent the file link, saving precious compute time!");
+                return Ok(());
             }
         }
-        if cache_hit {
-            return Ok(());
-        }
+
         let crafting_table_gui_bytes = self
             .items
             .get("gui/container/crafting_table")
@@ -488,6 +487,37 @@ impl RecipeData {
         let grid_origin_y = 33;
         let cell_size = 36; // +2 for the border
 
+        let mut missing_items = HashSet::new();
+        for item in &recipe_ingredients {
+            if self.items.get(item).is_none() && !item.eq(" ") {
+                missing_items.insert(item.to_string());
+            }
+        }
+        if self.items.get(result.get_item()).is_none() {
+            missing_items.insert(result.get_item().to_string());
+        }
+
+        let language_mappings = Arc::new(self.language_mappings.clone());
+
+        let mut set = JoinSet::new();
+        for item in missing_items {
+            let lang_mappings = language_mappings.clone();
+            let client = client.clone();
+            set.spawn(async move {
+                let lang_mapped_item = lang_mappings
+                    .get(item.as_str())
+                    .unwrap_or(&item)
+                    .replace(' ', "_");
+                fallback_fetch_from_wiki(client, item.clone(), lang_mapped_item.clone()).await
+            });
+        }
+
+        while let Some(result) = set.join_next().await {
+            let item_result = result?;
+            let (item, bytes) = item_result?;
+            self.items.insert(item, bytes);
+        }
+
         let mut i = 0;
         for row in 0..3 {
             for col in 0..3 {
@@ -500,9 +530,10 @@ impl RecipeData {
                     let item_bytes = match self.items.get(&recipe_ingredients[i]) {
                         Some(bytes) => bytes,
                         None => {
-                            &self
-                                .fallback_fetch_from_wiki(client, &recipe_ingredients[i])
-                                .await?
+                            return Err(anyhow!(
+                                "Couldn't find item {} in items somehow?",
+                                recipe_ingredients[i]
+                            ));
                         }
                     };
                     let item_texture_img =
@@ -524,9 +555,10 @@ impl RecipeData {
                     let item_bytes = match self.items.get(result.get_item()) {
                         Some(bytes) => bytes,
                         None => {
-                            &self
-                                .fallback_fetch_from_wiki(client, result.get_item())
-                                .await?
+                            return Err(anyhow!(
+                                "Couldn't find item {} in items somehow?",
+                                result.get_item()
+                            ));
                         }
                     };
                     let item_texture_img = image::load_from_memory(item_bytes)
@@ -686,31 +718,6 @@ impl RecipeData {
 
         Ok(())
     }
-
-    async fn fallback_fetch_from_wiki(&mut self, client: &Client, item: &str) -> Result<Vec<u8>> {
-        let response = client
-            .get(format!(
-                "https://minecraft.wiki/images/Invicon_{}.png",
-                self.language_mappings
-                    .get(item)
-                    .context("Unable to find item/block language mapping")?
-                    .replace(' ', "_")
-            ))
-            .header("User-Agent", "MCBot")
-            .send()
-            .await
-            .context("Unable to get image from wiki")?;
-        if !response.status().eq(&StatusCode::OK) {
-            return Err(anyhow!("Failed to get image from wiki"));
-        }
-        let item_bytes = response
-            .bytes()
-            .await
-            .context("Unable to convert the wiki's response to bytes")?
-            .to_vec();
-        self.items.insert(item.to_string(), item_bytes.clone());
-        Ok(item_bytes)
-    }
 }
 
 pub fn fix_recipe_typo(
@@ -737,4 +744,32 @@ pub fn fix_recipe(recipe: &str) -> String {
 
     re.replace_all(recipe.to_lowercase().as_str(), "_")
         .into_owned()
+}
+
+async fn fallback_fetch_from_wiki(
+    client: Client,
+    item: String,
+    lang_mapped_item: String,
+) -> Result<(String, Vec<u8>)> {
+    let response = client
+        .get(format!(
+            "https://minecraft.wiki/images/Invicon_{}.png",
+            lang_mapped_item
+        ))
+        .header("User-Agent", "MCBot")
+        .send()
+        .await
+        .context("Unable to get image from wiki")?;
+    if !response.status().eq(&StatusCode::OK) {
+        return Err(anyhow!(
+            "Failed to get image from wiki: {}",
+            response.status().as_u16()
+        ));
+    }
+    let item_bytes = response
+        .bytes()
+        .await
+        .context("Unable to convert the wiki's response to bytes")?
+        .to_vec();
+    Ok((item, item_bytes))
 }
