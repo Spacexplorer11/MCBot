@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::{collections::HashMap, io::Cursor};
 use strsim::levenshtein;
 use tokio::{fs::File, io::BufReader, task::JoinSet};
-use tracing::{debug, info, trace};
+use tracing::{info, trace};
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
@@ -452,24 +452,45 @@ impl RecipeData {
     ) -> Result<()> {
         let recipe_link = self.recipe_links.get(result.get_item());
         if let Some(recipe_link) = recipe_link {
-            if !client
-                .get(recipe_link)
-                .send()
-                .await?
-                .status()
-                .eq(&StatusCode::OK)
-            {
-                self.recipe_links.remove(result.get_item());
-                debug!("The link was no longer valid and was removed from the array")
-            } else {
-                client.post("https://slack.com/api/chat.postMessage")
+            let response = client.post("https://slack.com/api/chat.postMessage")
                 .bearer_auth(bot_token)
                 .json(&json!({"channel": channel_id, "text": format!("<@{}> Here's your {} recipe!\n {}", user_id, result.get_pretty_item(), recipe_link), "unfurl_links": true, "unfurl_media": true}))
                 .send()
                 .await?;
-                trace!("Successfully sent the file link, saving precious compute time!");
-                return Ok(());
+            trace!("Successfully sent the file link, saving precious compute time!");
+
+            let response_json: Value = response.json().await?;
+            let message_ts = response_json
+                .get("ts")
+                .context("Missing ts in postMessage response")?
+                .as_str()
+                .context("Unable to convert ts to string")?
+                .to_string();
+
+            let is_valid = client
+                .head(recipe_link)
+                .send()
+                .await?
+                .status()
+                .eq(&StatusCode::OK);
+
+            if !is_valid {
+                trace!("Oh no invalid link detected!");
+                self.recipe_links.remove(result.get_item());
+
+                client
+                    .post("https://slack.com/api/chat.update")
+                    .bearer_auth(bot_token)
+                    .json(&json!({
+            "channel": channel_id,
+            "ts": message_ts,
+            "text": "Whoops, looks like that link is invalid! Please run the command again to get a fresh image!"
+        }))
+                    .send()
+                    .await?;
             }
+
+            return Ok(());
         }
 
         let crafting_table_gui_bytes = self
