@@ -1,9 +1,9 @@
 use crate::font::MinecraftFont;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_zip::tokio::read::seek::ZipFileReader;
 use image::{DynamicImage, ImageFormat, imageops};
 use regex::Regex;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 use std::{collections::HashMap, io::Cursor};
@@ -439,7 +439,7 @@ impl RecipeData {
     }
 
     async fn make_and_send_image_to_slack(
-        &self,
+        &mut self,
         client: &Client,
         bot_token: &str,
         channel_id: &str,
@@ -472,30 +472,15 @@ impl RecipeData {
                     && !recipe_ingredients.get(i).unwrap().eq(" ")
                 {
                     let item_bytes = match self.items.get(&recipe_ingredients[i]) {
-                        Some(bytes) => bytes.to_owned(),
+                        Some(bytes) => bytes,
                         None => {
-                            let response = client
-                                .get(format!(
-                                    "https://minecraft.wiki/images/Invicon_{}.png",
-                                    self.language_mappings
-                                        .get(&recipe_ingredients[i])
-                                        .context("Unable to find item/block language mapping")?
-                                        .replace(' ', "_")
-                                ))
-                                .header("User-Agent", "MCBot")
-                                .send()
-                                .await
-                                .context("Unable to get image from wiki")?;
-                            response
-                                .bytes()
-                                .await
-                                .context("Unable to convert the wiki's response to bytes")?
-                                .to_vec()
-                                .to_owned()
+                            &self
+                                .fallback_fetch_from_wiki(client, result.get_item())
+                                .await?
                         }
                     };
                     let item_texture_img =
-                        image::load_from_memory_with_format(&item_bytes, ImageFormat::Png)
+                        image::load_from_memory_with_format(item_bytes, ImageFormat::Png)
                             .context("Unable to make an image from an item's bytes")?
                             .to_rgba8();
 
@@ -513,23 +498,9 @@ impl RecipeData {
                     let item_bytes = match self.items.get(result.get_item()) {
                         Some(bytes) => bytes,
                         None => {
-                            let response = client
-                                .get(format!(
-                                    "https://minecraft.wiki/images/Invicon_{}.png",
-                                    self.language_mappings
-                                        .get(result.get_item())
-                                        .context("Unable to find item/block language mapping")?
-                                        .replace(' ', "_")
-                                ))
-                                .header("User-Agent", "MCBot")
-                                .send()
-                                .await
-                                .context("Unable to get image from wiki")?;
-                            &response
-                                .bytes()
-                                .await
-                                .context("Unable to convert the wiki's response to bytes")?
-                                .to_vec()
+                            &self
+                                .fallback_fetch_from_wiki(client, result.get_item())
+                                .await?
                         }
                     };
                     let item_texture_img = image::load_from_memory(item_bytes)
@@ -663,6 +634,31 @@ impl RecipeData {
             .context("Unable to send the completion request for the file")?
             .error_for_status().context("Slack returned an error when completing the upload (Step 3)")?;
         Ok(())
+    }
+
+    async fn fallback_fetch_from_wiki(&mut self, client: &Client, item: &str) -> Result<Vec<u8>> {
+        let response = client
+            .get(format!(
+                "https://minecraft.wiki/images/Invicon_{}.png",
+                self.language_mappings
+                    .get(item)
+                    .context("Unable to find item/block language mapping")?
+                    .replace(' ', "_")
+            ))
+            .header("User-Agent", "MCBot")
+            .send()
+            .await
+            .context("Unable to get image from wiki")?;
+        if !response.status().eq(&StatusCode::OK) {
+            return Err(anyhow!("Failed to get image from wiki"));
+        }
+        let item_bytes = response
+            .bytes()
+            .await
+            .context("Unable to convert the wiki's response to bytes")?
+            .to_vec();
+        self.items.insert(item.to_string(), item_bytes.clone());
+        Ok(item_bytes)
     }
 }
 
