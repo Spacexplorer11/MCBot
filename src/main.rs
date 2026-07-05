@@ -222,7 +222,7 @@ async fn handle_event(
             trace!(event_type = event.event_type, "Received event");
             match state.client.post("https://slack.com/api/chat.postMessage")
                 .bearer_auth(state.bot_token.clone())
-                .json(&json!({"channel": event.channel, "text": "Hi! I'm MCBot! :) \nUse /mcrecipe to get crafting recipes!"}))
+                .json(&json!({"channel": event.channel, "text": "Hi! I'm MCBot! :) \nUse /mcrecipe to get crafting recipes!", "thread_ts": event.ts}))
                 .send().await {
                 Ok(..) => (),
                 Err(e) => error!("Something went wrong with sending a message, {e}")
@@ -341,7 +341,7 @@ async fn handle_mcrecipes(Json(payload): Json<SlackPayload>) -> Json<serde_json:
         SlackPayload::EventCallback { event } => {
             match client.post("https://slack.com/api/chat.postMessage")
                 .bearer_auth(bot_token.clone())
-                .json(&json!({"channel": event.channel, "text": "Unfortunately now MCRecipes is retired. Please use <@U0B8ER7U1S5> (/mcrecipe for recipe functionality, other functions are retired)"}))
+                .json(&json!({"channel": event.channel, "text": "Unfortunately now MCRecipes is retired. Please use <@U0B8ER7U1S5> (/mcrecipe for recipe functionality, other functions are retired)", "thread_ts": event.ts}))
                 .send().await {
                 Ok(..) => (),
                 Err(e) => error!("Something went wrong with sending a message, {e}")
