@@ -459,10 +459,7 @@ impl RecipeData {
                 .eq(&StatusCode::OK)
             {
                 self.recipe_links.remove(result.get_item());
-                debug!(
-                    "The link {} was no longer valid and was removed from the array",
-                    recipe_link
-                )
+                debug!("The link was no longer valid and was removed from the array")
             } else {
                 client.post("https://slack.com/api/chat.postMessage")
                 .bearer_auth(bot_token)
