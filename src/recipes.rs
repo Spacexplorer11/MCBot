@@ -5,11 +5,11 @@ use image::{DynamicImage, ImageFormat, imageops};
 use regex::Regex;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{collections::HashMap, io::Cursor};
 use strsim::levenshtein;
 use tokio::{fs::File, io::BufReader};
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
@@ -74,6 +74,7 @@ pub struct RecipeData {
     language_mappings: HashMap<String, String>,
     pub valid_recipes: HashMap<String, usize>,
     font: MinecraftFont,
+    recipe_links: HashMap<String, String>,
 }
 
 impl RecipeData {
@@ -319,7 +320,7 @@ impl RecipeData {
                     bot_token,
                     channel_id,
                     user_id,
-                    result,
+                    &result,
                     items_placement,
                 )
                 .await?
@@ -362,7 +363,7 @@ impl RecipeData {
                     bot_token,
                     channel_id,
                     user_id,
-                    result,
+                    &result,
                     items_to_place,
                 )
                 .await?
@@ -428,7 +429,7 @@ impl RecipeData {
                     bot_token,
                     channel_id,
                     user_id,
-                    result,
+                    &result,
                     items_to_place,
                 )
                 .await?
@@ -444,9 +445,37 @@ impl RecipeData {
         bot_token: &str,
         channel_id: &str,
         user_id: &str,
-        result: RecipeResult,
+        result: &RecipeResult,
         recipe_ingredients: Vec<String>,
     ) -> Result<()> {
+        let recipe_link = self.recipe_links.get(result.get_item());
+        let mut cache_hit = false;
+        if let Some(recipe_link) = recipe_link {
+            if !client
+                .get(recipe_link)
+                .send()
+                .await?
+                .status()
+                .eq(&StatusCode::OK)
+            {
+                self.recipe_links.remove(result.get_item());
+                debug!(
+                    "The link {} was no longer valid and was removed from the array",
+                    recipe_link
+                )
+            } else {
+                client.post("https://slack.com/api/chat.postMessage")
+                .bearer_auth(bot_token)
+                .json(&json!({"channel": channel_id, "text": format!("<@{}> Here's your {} recipe!\n {}", user_id, result.get_pretty_item(), recipe_link), "unfurl_links": true, "unfurl_media": true}))
+                .send()
+                .await?;
+                cache_hit = true;
+                trace!("Successfully sent the file link, saving precious compute time!")
+            }
+        }
+        if cache_hit {
+            return Ok(());
+        }
         let crafting_table_gui_bytes = self
             .items
             .get("gui/container/crafting_table")
@@ -597,9 +626,9 @@ impl RecipeData {
             .await
             .context("Failed to ask for crafting recipe file upload url from slack")?
             .error_for_status()
-            .context("Slack returned an error when asking for the response url (Step 1)")?;
+            .context("Slack returned an error when asking for the upload url (Step 1)")?;
 
-        let upload_data: serde_json::Value = upload_url_response
+        let upload_data: Value = upload_url_response
             .json()
             .await
             .context("Unable to convert the upload url response into json")?;
@@ -621,7 +650,7 @@ impl RecipeData {
             .context("Slack returned an error when uploading the file (Step 2)")?;
 
         trace!("Completing the file upload (Step 3 of file upload)");
-        client
+        let complete_upload_response = client
             .post("https://slack.com/api/files.completeUploadExternal")
             .bearer_auth(bot_token)
             .json(&json!({
@@ -633,6 +662,31 @@ impl RecipeData {
             .await
             .context("Unable to send the completion request for the file")?
             .error_for_status().context("Slack returned an error when completing the upload (Step 3)")?;
+
+        trace!("Converting the upload completion response to bytes then JSON");
+        let complete_upload_response_bytes = complete_upload_response
+            .bytes()
+            .await
+            .context("Unable to convert the response to json")?;
+        let complete_upload_response_json: Value =
+            serde_json::from_slice(&complete_upload_response_bytes)
+                .context("Unable to convert the response to json")?;
+
+        trace!("Getting the permalink");
+        let files_array = complete_upload_response_json
+            .get("files")
+            .context("Unable to find the 'files' key in the response")?;
+        let permalink = files_array[0]
+            .get("permalink")
+            .context("Unable to find the 'permalink_public' key in the response")?
+            .as_str()
+            .context("Unable to convert the 'permalink' key to a string")?
+            .to_string();
+
+        self.recipe_links
+            .insert(result.get_item().to_string(), permalink);
+        trace!("Added the permalink to the array of recipe links");
+
         Ok(())
     }
 
