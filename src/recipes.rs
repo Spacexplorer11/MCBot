@@ -475,7 +475,7 @@ impl RecipeData {
                         Some(bytes) => bytes,
                         None => {
                             &self
-                                .fallback_fetch_from_wiki(client, result.get_item())
+                                .fallback_fetch_from_wiki(client, &recipe_ingredients[i])
                                 .await?
                         }
                     };
