@@ -3,7 +3,7 @@ use anyhow::{Context, Result, anyhow};
 use async_zip::tokio::read::seek::ZipFileReader;
 use image::{DynamicImage, ImageFormat, imageops};
 use regex::Regex;
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -77,6 +77,7 @@ pub struct RecipeData {
     pub valid_recipes: HashMap<String, usize>,
     font: MinecraftFont,
     recipe_links: HashMap<String, String>,
+    crafting_table_gui: DynamicImage,
 }
 
 impl RecipeData {
@@ -218,6 +219,17 @@ impl RecipeData {
             }
             Err(e) => panic!("Failed to initialise font {e}"),
         };
+
+        let crafting_table_gui_bytes = self
+            .items
+            .get("gui/container/crafting_table")
+            .context("Unable to find crafting table grid in items vector")?;
+        let crafting_table_gui = image::load_from_memory(crafting_table_gui_bytes)
+            .context("Unable to make an image from the crafting table bytes")?;
+
+        let crafting_table_gui = crafting_table_gui.crop_imm(0, 0, 170, 80);
+        self.crafting_table_gui =
+            imageops::resize(&crafting_table_gui, 340, 160, imageops::FilterType::Nearest).into();
 
         Ok(())
     }
@@ -467,12 +479,7 @@ impl RecipeData {
                 .context("Unable to convert ts to string")?
                 .to_string();
 
-            let is_valid = client
-                .head(recipe_link)
-                .send()
-                .await?
-                .status()
-                .eq(&StatusCode::OK);
+            let is_valid = client.head(recipe_link).send().await?.status().is_success();
 
             if !is_valid {
                 trace!("Oh no invalid link detected!");
@@ -493,28 +500,17 @@ impl RecipeData {
             return Ok(());
         }
 
-        let crafting_table_gui_bytes = self
-            .items
-            .get("gui/container/crafting_table")
-            .context("Unable to find crafting table grid in items vector")?;
-        let crafting_table_gui = image::load_from_memory(crafting_table_gui_bytes)
-            .context("Unable to make an image from the crafting table bytes")?;
-
-        let crafting_table_gui = crafting_table_gui.crop_imm(0, 0, 170, 80);
-        let mut crafting_table_gui =
-            imageops::resize(&crafting_table_gui, 340, 160, imageops::FilterType::Nearest);
-
         let grid_origin_x = 60;
         let grid_origin_y = 33;
         let cell_size = 36; // +2 for the border
 
         let mut missing_items = HashSet::new();
         for item in &recipe_ingredients {
-            if self.items.get(item).is_none() && !item.eq(" ") {
+            if self.items.contains_key(item) && !item.eq(" ") {
                 missing_items.insert(item.to_string());
             }
         }
-        if self.items.get(result.get_item()).is_none() {
+        if self.items.contains_key(result.get_item()) {
             missing_items.insert(result.get_item().to_string());
         }
 
@@ -565,7 +561,12 @@ impl RecipeData {
                     let item_texture_img =
                         imageops::resize(&item_texture_img, 32, 32, imageops::FilterType::Nearest);
 
-                    imageops::overlay(&mut crafting_table_gui, &item_texture_img, cell_x, cell_y);
+                    imageops::overlay(
+                        &mut self.crafting_table_gui,
+                        &item_texture_img,
+                        cell_x,
+                        cell_y,
+                    );
                 }
 
                 i += 1;
@@ -597,10 +598,8 @@ impl RecipeData {
                             for char in result_count_as_string.chars() {
                                 for (i, line) in self.font.bitmap.iter().enumerate() {
                                     if line.contains(char.to_string().as_str()) {
-                                        let count_image = self
-                                            .font
-                                            .get_character_image(i, char.to_string())
-                                            .await?;
+                                        let count_image =
+                                            self.font.get_character_image(i, char.to_string())?;
                                         let count_image = imageops::resize(
                                             &count_image,
                                             18,
@@ -616,8 +615,7 @@ impl RecipeData {
                                 if line.contains(result.count.to_string().as_str()) {
                                     let count_image = self
                                         .font
-                                        .get_character_image(i, result.count.to_string())
-                                        .await?;
+                                        .get_character_image(i, result.count.to_string())?;
                                     let count_image = imageops::resize(
                                         &count_image,
                                         18,
@@ -647,7 +645,7 @@ impl RecipeData {
                     }
 
                     imageops::overlay(
-                        &mut crafting_table_gui,
+                        &mut self.crafting_table_gui,
                         &item_texture_img,
                         result_x,
                         result_y,
@@ -657,7 +655,7 @@ impl RecipeData {
         }
 
         let mut bytes_to_send_to_slack = Vec::new(); // lovely name I know thank you
-        crafting_table_gui
+        self.crafting_table_gui
             .write_to(
                 &mut Cursor::new(&mut bytes_to_send_to_slack),
                 ImageFormat::WebP,
@@ -728,7 +726,7 @@ impl RecipeData {
             .context("Unable to find the 'files' key in the response")?;
         let permalink = files_array[0]
             .get("permalink")
-            .context("Unable to find the 'permalink_public' key in the response")?
+            .context("Unable to find the 'permalink' key in the response")?
             .as_str()
             .context("Unable to convert the 'permalink' key to a string")?
             .to_string();
@@ -741,18 +739,18 @@ impl RecipeData {
     }
 }
 
-pub fn fix_recipe_typo(
-    valid_recipes: &HashMap<String, usize>,
+pub fn fix_recipe_typo<'a>(
+    valid_recipes: &'a HashMap<String, usize>,
     recipe_to_fix: &str,
-) -> Option<String> {
+) -> Option<&'a String> {
     let mut lowest_distance = usize::MAX;
-    let mut closest_recipe: Option<String> = None;
+    let mut closest_recipe: Option<&String> = None;
     for recipe in valid_recipes.keys() {
         let distance = levenshtein(recipe, recipe_to_fix);
 
         if distance < lowest_distance && distance <= 3 {
             // Max edits
-            closest_recipe = Some(recipe.clone());
+            closest_recipe = Some(recipe);
             lowest_distance = distance;
         }
     }
@@ -767,6 +765,7 @@ pub fn fix_recipe(recipe: &str) -> String {
         .into_owned()
 }
 
+#[tracing::instrument(name = "fetching_fallback_from_wiki_pipeline", skip(client))]
 async fn fallback_fetch_from_wiki(
     client: Client,
     item: String,
@@ -774,14 +773,13 @@ async fn fallback_fetch_from_wiki(
 ) -> Result<(String, Vec<u8>)> {
     let response = client
         .get(format!(
-            "https://minecraft.wiki/images/Invicon_{}.png",
-            lang_mapped_item
+            "https://minecraft.wiki/images/Invicon_{lang_mapped_item}.png",
         ))
         .header("User-Agent", "MCBot")
         .send()
         .await
         .context("Unable to get image from wiki")?;
-    if !response.status().eq(&StatusCode::OK) {
+    if !response.status().is_success() {
         return Err(anyhow!(
             "Failed to get image from wiki: {}",
             response.status().as_u16()

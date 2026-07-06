@@ -66,11 +66,7 @@ impl MinecraftFont {
     skip(self),
     fields(index = %index, character = %character)
     )]
-    pub async fn get_character_image(
-        &self,
-        index: usize,
-        character: String,
-    ) -> Result<DynamicImage> {
+    pub fn get_character_image(&self, index: usize, character: String) -> Result<DynamicImage> {
         let line = &self.bitmap[index];
         for (i, bit) in line.chars().enumerate() {
             if bit.to_string().eq(&character) {

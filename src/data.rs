@@ -15,8 +15,8 @@ pub async fn fetch_client_jar(client: &Client) -> ZipFileReader<BufReader<File>>
         .send()
         .await
         .expect("An error occurred when fetching the version manifest (Step 1 of item fetching)");
-    let json_data = response
-        .json::<serde_json::Value>()
+    let json_data: serde_json::Value = response
+        .json()
         .await
         .expect("Version manifest returned incorrect json :pensive_face:");
     let latest_version = &json_data["latest"]["release"]
