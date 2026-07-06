@@ -506,11 +506,11 @@ impl RecipeData {
 
         let mut missing_items = HashSet::new();
         for item in &recipe_ingredients {
-            if self.items.contains_key(item) && !item.eq(" ") {
+            if !self.items.contains_key(item) && !item.eq(" ") {
                 missing_items.insert(item.to_string());
             }
         }
-        if self.items.contains_key(result.get_item()) {
+        if !self.items.contains_key(result.get_item()) {
             missing_items.insert(result.get_item().to_string());
         }
 
