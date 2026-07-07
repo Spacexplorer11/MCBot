@@ -243,6 +243,11 @@ async fn handle_command(
                 "Received /mcrecipe command for {recipe}",
                 recipe = &payload.text
             );
+            if payload.text.is_empty() || payload.text.eq(" ") {
+                return Json(
+                    json!({"response_type": "ephemeral", "text": "You didn't enter a recipe!"}),
+                );
+            }
             let requested_recipe = fix_recipe(&payload.text);
             if state.valid_recipes.contains_key(&requested_recipe) {
                 match state.mpsc.try_send(Recipe {
