@@ -503,6 +503,8 @@ impl RecipeData {
         let grid_origin_x = 60;
         let grid_origin_y = 33;
         let cell_size = 36; // +2 for the border
+        
+        let mut crafting_table_gui = self.crafting_table_gui.clone();
 
         let mut missing_items = HashSet::new();
         for item in &recipe_ingredients {
@@ -562,7 +564,7 @@ impl RecipeData {
                         imageops::resize(&item_texture_img, 32, 32, imageops::FilterType::Nearest);
 
                     imageops::overlay(
-                        &mut self.crafting_table_gui,
+                        &mut crafting_table_gui,
                         &item_texture_img,
                         cell_x,
                         cell_y,
@@ -645,7 +647,7 @@ impl RecipeData {
                     }
 
                     imageops::overlay(
-                        &mut self.crafting_table_gui,
+                        &mut crafting_table_gui,
                         &item_texture_img,
                         result_x,
                         result_y,
@@ -655,7 +657,7 @@ impl RecipeData {
         }
 
         let mut bytes_to_send_to_slack = Vec::new(); // lovely name I know thank you
-        self.crafting_table_gui
+        crafting_table_gui
             .write_to(
                 &mut Cursor::new(&mut bytes_to_send_to_slack),
                 ImageFormat::WebP,
