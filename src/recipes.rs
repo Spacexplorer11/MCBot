@@ -7,9 +7,11 @@ use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::{collections::HashMap, io::Cursor};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Cursor,
+    sync::Arc,
+};
 use strsim::levenshtein;
 use tokio::{fs::File, io::BufReader, task::JoinSet};
 use tracing::{info, trace};

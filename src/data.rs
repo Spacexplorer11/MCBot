@@ -1,8 +1,7 @@
 use async_zip::tokio::read::seek::ZipFileReader;
 use reqwest::Client;
 use std::env;
-use tokio::fs::File;
-use tokio::io::BufReader;
+use tokio::{fs::File, io::BufReader};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 use tracing::{info, warn};
 

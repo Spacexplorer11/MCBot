@@ -72,7 +72,6 @@ struct SlackEvent {
     ts: String,
 }
 
-#[expect(dead_code)]
 #[derive(Deserialize)]
 struct SlackSlashCommand {
     command: String,
@@ -80,8 +79,6 @@ struct SlackSlashCommand {
     channel_id: String,
     user_id: String,
     response_url: String,
-    trigger_id: String,
-    team_id: String,
 }
 
 pub struct SlackMessageContext<'a> {
@@ -404,7 +401,13 @@ async fn handle_mcrecipes(
         }
 
         SlackPayload::EventCallback { event } => {
-            let requested_recipe = fix_recipe(event.text.strip_prefix("<@U0A5X0FV9V4>").unwrap());
+            let cleaned_text = event.text.strip_prefix("<@U0A5X0FV9V4>").unwrap();
+            if cleaned_text.is_empty() || cleaned_text.eq(" ") {
+                return Json(
+                    json!({"response_type": "ephemeral", "text": "You didn't enter a recipe!"}),
+                );
+            }
+            let requested_recipe = fix_recipe(cleaned_text);
             if state.valid_recipes.contains_key(&requested_recipe) {
                 match state.mpsc.try_send(Recipe {
                     item_name: requested_recipe.clone(),
@@ -539,6 +542,7 @@ async fn uptime() -> Json<serde_json::Value> {
     Json(json!({"ok": true}))
 }
 
+//noinspection RsUnresolvedPath (RustRover seems to not be able to find the new_from_slice function in scope so supressed)
 async fn verify_slack_signature(
     State(secret): State<Arc<String>>,
     request: Request,
