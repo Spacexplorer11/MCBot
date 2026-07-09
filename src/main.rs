@@ -20,6 +20,7 @@ use axum::{
 };
 use chrono::Utc;
 use dotenvy::dotenv;
+use hmac::{KeyInit, Mac};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
@@ -29,6 +30,8 @@ use tokio::{
     sync::{mpsc, mpsc::error::TrySendError},
 };
 use tracing::{debug, error, info, trace, warn};
+
+type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 
 enum Task {
     Recipe {
@@ -47,11 +50,6 @@ struct AppState {
     bot_token: String,
     mpsc: mpsc::Sender<Task>,
     valid_recipes: HashMap<String, usize>,
-}
-
-#[derive(Clone)]
-struct SlackSignatureVerifierState {
-    verifier: slack_http_verifier::SlackVerifier,
 }
 
 #[derive(Deserialize)]
@@ -110,14 +108,11 @@ async fn main() {
     let mcrecipes_bot_token =
         env::var("SLACK_BOT_TOKEN_MCRECIPES").expect("MCRecipes Bot Token NOT FOUND");
 
-    let signing_secret = env::var("SLACK_SIGNING_SECRET").expect("MCBot Signing Secret NOT FOUND");
-    let mcrecipes_signing_secret =
-        env::var("SLACK_SIGNING_SECRET_MCRECIPES").expect("MCRecipes Bot Token NOT FOUND");
-
-    let verifier = slack_http_verifier::SlackVerifier::new(signing_secret)
-        .expect("Unable to make a slack http verifier instance using MCBOT's signing secret");
-    let mcrecipes_verifier = slack_http_verifier::SlackVerifier::new(mcrecipes_signing_secret)
-        .expect("Unable to make a slack http verifier instance using MCRECIPES' signing secret");
+    let signing_secret =
+        Arc::new(env::var("SLACK_SIGNING_SECRET").expect("MCBot Signing Secret NOT FOUND"));
+    let mcrecipes_signing_secret = Arc::new(
+        env::var("SLACK_SIGNING_SECRET_MCRECIPES").expect("MCRecipes Bot Token NOT FOUND"),
+    );
 
     let (queue_input, mut queue_output) = mpsc::channel::<Task>(128);
 
@@ -142,11 +137,6 @@ async fn main() {
         mpsc: queue_input,
         valid_recipes: recipe_data.valid_recipes.clone(),
     });
-
-    let slack_signature_verifier_state = SlackSignatureVerifierState { verifier };
-    let mcrecipes_slack_signature_verifier_state = SlackSignatureVerifierState {
-        verifier: mcrecipes_verifier,
-    };
 
     tokio::spawn(async move {
         while let Some(task) = queue_output.recv().await {
@@ -244,7 +234,7 @@ async fn main() {
         .route("/slack/events", post(handle_event))
         .route("/slack/commands", post(handle_command))
         .route_layer(middleware::from_fn_with_state(
-            slack_signature_verifier_state,
+            signing_secret,
             verify_slack_signature,
         ))
         .with_state(state);
@@ -252,7 +242,7 @@ async fn main() {
     let mcrecipes_router = axum::Router::new()
         .route("/slack/mcrecipes", post(handle_mcrecipes))
         .route_layer(middleware::from_fn_with_state(
-            mcrecipes_slack_signature_verifier_state,
+            mcrecipes_signing_secret,
             verify_slack_signature,
         ))
         .with_state(mcrecipes_state);
@@ -550,7 +540,7 @@ async fn uptime() -> Json<serde_json::Value> {
 }
 
 async fn verify_slack_signature(
-    State(slack_signature_verifier_state): State<SlackSignatureVerifierState>,
+    State(secret): State<Arc<String>>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -608,7 +598,7 @@ async fn verify_slack_signature(
                 .unwrap();
         }
     };
-    let signature = match parts.headers.get("x-slack-signature") {
+    let slack_signature = match parts.headers.get("x-slack-signature") {
         Some(sig) => match sig.to_str() {
             Ok(s) => s,
             Err(..) => {
@@ -639,11 +629,33 @@ async fn verify_slack_signature(
         }
     };
 
-    match slack_signature_verifier_state.verifier.verify(
-        timestamp.as_str(),
-        request_string,
-        signature,
-    ) {
+    let basestring = format!("v0:{timestamp}:{request_string}");
+
+    let mut my_signature = HmacSha256::new_from_slice(secret.as_bytes())
+        .expect("Whats the point of this error is HMAC can take a key of any size");
+    my_signature.update(basestring.as_bytes());
+
+    let slack_signature = match slack_signature.strip_prefix("v0=") {
+        Some(str) => match hex::decode(str) {
+            Ok(hex) => hex,
+            Err(..) => {
+                error!("Slack request signature not valid hex");
+                return Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .body("Slack request signature not valid hex".into())
+                    .unwrap();
+            }
+        },
+        None => {
+            error!("Slack request signature didn't begin with v0=");
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body("Slack request signature incorrect".into())
+                .unwrap();
+        }
+    };
+
+    match my_signature.verify_slice(&slack_signature) {
         Ok(..) => {
             trace!("Slack signature verification successful");
             next.run(Request::from_parts(parts, Body::from(request_bytes)))
