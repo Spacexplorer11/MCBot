@@ -742,7 +742,8 @@ pub fn validate_recipe(
     recipe: String,
     valid_recipes: &HashMap<String, usize>,
 ) -> (bool, String, String) {
-    if valid_recipes.contains_key(&fix_recipe(&recipe)) {
+    let recipe = fix_recipe(&recipe);
+    if valid_recipes.contains_key(&recipe) {
         (true, "".to_string(), recipe)
     } else if let Some(closest_recipe) = fix_recipe_typo(valid_recipes, &recipe) {
         (
