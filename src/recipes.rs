@@ -1,3 +1,4 @@
+use crate::SlackMessageContext;
 use crate::font::MinecraftFont;
 use anyhow::{Context, Result, anyhow};
 use async_zip::tokio::read::seek::ZipFileReader;
@@ -234,18 +235,11 @@ impl RecipeData {
         Ok(())
     }
 
-    #[tracing::instrument(
-        name = "recipe_generation_pipeline",
-        skip(self, client, bot_token, client_jar_zip)
-    )]
+    #[tracing::instrument(name = "recipe_generation_pipeline", skip(self, ctx, client_jar_zip))]
     pub async fn process_recipe(
         &mut self,
         item_name: &str,
-        client: &Client,
-        bot_token: &str,
-        channel_id: &str,
-        user_id: &str,
-        thread_ts: Option<String>,
+        ctx: SlackMessageContext<'_>,
         client_jar_zip: &mut ZipFileReader<BufReader<File>>,
     ) -> Result<()> {
         let recipe_index = self
@@ -329,17 +323,7 @@ impl RecipeData {
                     }
                 }
 
-                Self::make_and_send_image_to_slack(
-                    self,
-                    client,
-                    bot_token,
-                    channel_id,
-                    user_id,
-                    thread_ts,
-                    &result,
-                    items_placement,
-                )
-                .await?
+                Self::make_and_send_image_to_slack(self, ctx, &result, items_placement).await?
             }
             MCRecipe::Shapeless {
                 ingredients,
@@ -373,17 +357,7 @@ impl RecipeData {
                     items_to_place.push(item.to_string());
                 }
 
-                Self::make_and_send_image_to_slack(
-                    self,
-                    client,
-                    bot_token,
-                    channel_id,
-                    user_id,
-                    thread_ts,
-                    &result,
-                    items_to_place,
-                )
-                .await?
+                Self::make_and_send_image_to_slack(self, ctx, &result, items_to_place).await?
             }
             MCRecipe::Transmute {
                 input,
@@ -440,17 +414,7 @@ impl RecipeData {
                 }
                 items_to_place.push(item.to_string());
 
-                Self::make_and_send_image_to_slack(
-                    self,
-                    client,
-                    bot_token,
-                    channel_id,
-                    user_id,
-                    thread_ts,
-                    &result,
-                    items_to_place,
-                )
-                .await?
+                Self::make_and_send_image_to_slack(self, ctx, &result, items_to_place).await?
             }
         }
 
@@ -459,21 +423,17 @@ impl RecipeData {
 
     async fn make_and_send_image_to_slack(
         &mut self,
-        client: &Client,
-        bot_token: &str,
-        channel_id: &str,
-        user_id: &str,
-        thread_ts: Option<String>,
+        ctx: SlackMessageContext<'_>,
         result: &RecipeResult,
         recipe_ingredients: Vec<String>,
     ) -> Result<()> {
         let recipe_link = self.recipe_links.get(result.get_item());
         if let Some(recipe_link) = recipe_link {
             let mut payload = json!({
-                "channel": channel_id,
+                "channel": ctx.channel_id,
                 "text": format!(
                     "<@{}> Here's your {} recipe!\n{}",
-                    user_id,
+                    ctx.user_id,
                     result.get_pretty_item(),
                     recipe_link
                 ),
@@ -481,13 +441,14 @@ impl RecipeData {
                 "unfurl_media": true
             });
 
-            if let Some(thread_ts) = thread_ts {
+            if let Some(thread_ts) = ctx.thread_ts {
                 payload["thread_ts"] = json!(thread_ts);
             }
 
-            let response = client
+            let response = ctx
+                .client
                 .post("https://slack.com/api/chat.postMessage")
-                .bearer_auth(bot_token)
+                .bearer_auth(ctx.bot_token)
                 .json(&payload)
                 .send()
                 .await?;
@@ -502,17 +463,23 @@ impl RecipeData {
                 .context("Unable to convert ts to string")?
                 .to_string();
 
-            let is_valid = client.head(recipe_link).send().await?.status().is_success();
+            let is_valid = ctx
+                .client
+                .head(recipe_link)
+                .send()
+                .await?
+                .status()
+                .is_success();
 
             if !is_valid {
                 trace!("Oh no invalid link detected!");
                 self.recipe_links.remove(result.get_item());
 
-                client
+                ctx.client
                     .post("https://slack.com/api/chat.update")
-                    .bearer_auth(bot_token)
+                    .bearer_auth(ctx.bot_token)
                     .json(&json!({
-            "channel": channel_id,
+            "channel": ctx.channel_id,
             "ts": message_ts,
             "text": "Whoops, looks like that link is invalid! Please run the command again to get a fresh image!"
         }))
@@ -544,7 +511,7 @@ impl RecipeData {
         let mut set = JoinSet::new();
         for item in missing_items {
             let lang_mappings = language_mappings.clone();
-            let client = client.clone();
+            let client = ctx.client.clone();
             set.spawn(async move {
                 let lang_mapped_item = lang_mappings
                     .get(item.as_str())
@@ -683,9 +650,10 @@ impl RecipeData {
             .context("Failed to convert the image back into bytes")?;
 
         trace!("Fetching upload URL from Slack (Step 1 of file upload)");
-        let upload_url_response = client
+        let upload_url_response = ctx
+            .client
             .post("https://slack.com/api/files.getUploadURLExternal")
-            .bearer_auth(bot_token)
+            .bearer_auth(ctx.bot_token)
             .form(&[
                 ("filename", format!("{}_recipe.webp", result.get_item())),
                 ("length", bytes_to_send_to_slack.len().to_string()),
@@ -708,7 +676,7 @@ impl RecipeData {
             .context("Couldn't find the file id")?;
 
         trace!("Uploading crafting recipe file bytes to Slack (Step 2 of file upload)");
-        client
+        ctx.client
             .post(upload_url)
             .body(bytes_to_send_to_slack)
             .send()
@@ -721,17 +689,18 @@ impl RecipeData {
 
         let mut payload = json!({
             "files": [{ "id": file_id, "title": format!("{} recipe", result.get_pretty_item()) }],
-            "channel_id": channel_id,
-            "initial_comment": format!("<@{}> Here's your {} recipe!", user_id, result.get_pretty_item())
+            "channel_id": ctx.channel_id,
+            "initial_comment": format!("<@{}> Here's your {} recipe!", ctx.user_id, result.get_pretty_item())
         });
 
-        if let Some(thread_ts) = thread_ts {
+        if let Some(thread_ts) = ctx.thread_ts {
             payload["thread_ts"] = json!(thread_ts);
         }
 
-        let complete_upload_response = client
+        let complete_upload_response = ctx
+            .client
             .post("https://slack.com/api/files.completeUploadExternal")
-            .bearer_auth(bot_token)
+            .bearer_auth(ctx.bot_token)
             .json(&payload)
             .send()
             .await

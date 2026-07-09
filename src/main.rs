@@ -86,6 +86,14 @@ struct SlackSlashCommand {
     team_id: String,
 }
 
+pub struct SlackMessageContext<'a> {
+    client: &'a Client,
+    bot_token: &'a str,
+    channel_id: &'a str,
+    user_id: &'a str,
+    thread_ts: Option<&'a str>,
+}
+
 #[tokio::main]
 async fn main() {
     trace!("Loading .env");
@@ -152,16 +160,15 @@ async fn main() {
                     thread_ts,
                     bot_token,
                 } => {
+                    let ctx = SlackMessageContext {
+                        client: &client,
+                        bot_token: &bot_token,
+                        channel_id: &channel_id,
+                        user_id: &user_id,
+                        thread_ts: thread_ts.as_deref(),
+                    };
                     match recipe_data
-                        .process_recipe(
-                            item_name.as_str(),
-                            &client,
-                            &bot_token,
-                            channel_id.as_str(),
-                            user_id.as_str(),
-                            thread_ts.clone(),
-                            &mut client_jar_zip,
-                        )
+                        .process_recipe(item_name.as_str(), ctx, &mut client_jar_zip)
                         .await
                     {
                         Ok(..) => debug!("Recipe successfully processed"),
