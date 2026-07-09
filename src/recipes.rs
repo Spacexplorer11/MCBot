@@ -744,16 +744,14 @@ pub fn validate_recipe(
 ) -> (bool, String, String) {
     if valid_recipes.contains_key(&fix_recipe(&recipe)) {
         (true, "".to_string(), recipe)
+    } else if let Some(closest_recipe) = fix_recipe_typo(valid_recipes, &recipe) {
+        (
+            true,
+            format!("Assumed you meant {closest_recipe}"),
+            closest_recipe.clone(),
+        )
     } else {
-        if let Some(closest_recipe) = fix_recipe_typo(valid_recipes, &recipe) {
-            (
-                true,
-                format!("Assumed you meant {closest_recipe}"),
-                closest_recipe.clone(),
-            )
-        } else {
-            (false, "Invalid recipe".to_string(), recipe)
-        }
+        (false, "Invalid recipe".to_string(), recipe)
     }
 }
 
