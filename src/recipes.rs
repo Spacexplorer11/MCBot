@@ -245,6 +245,7 @@ impl RecipeData {
         bot_token: &str,
         channel_id: &str,
         user_id: &str,
+        thread_ts: Option<String>,
         client_jar_zip: &mut ZipFileReader<BufReader<File>>,
     ) -> Result<()> {
         let recipe_index = self
@@ -334,6 +335,7 @@ impl RecipeData {
                     bot_token,
                     channel_id,
                     user_id,
+                    thread_ts,
                     &result,
                     items_placement,
                 )
@@ -377,6 +379,7 @@ impl RecipeData {
                     bot_token,
                     channel_id,
                     user_id,
+                    thread_ts,
                     &result,
                     items_to_place,
                 )
@@ -443,6 +446,7 @@ impl RecipeData {
                     bot_token,
                     channel_id,
                     user_id,
+                    thread_ts,
                     &result,
                     items_to_place,
                 )
@@ -459,16 +463,35 @@ impl RecipeData {
         bot_token: &str,
         channel_id: &str,
         user_id: &str,
+        thread_ts: Option<String>,
         result: &RecipeResult,
         recipe_ingredients: Vec<String>,
     ) -> Result<()> {
         let recipe_link = self.recipe_links.get(result.get_item());
         if let Some(recipe_link) = recipe_link {
-            let response = client.post("https://slack.com/api/chat.postMessage")
+            let mut payload = json!({
+                "channel": channel_id,
+                "text": format!(
+                    "<@{}> Here's your {} recipe!\n{}",
+                    user_id,
+                    result.get_pretty_item(),
+                    recipe_link
+                ),
+                "unfurl_links": true,
+                "unfurl_media": true
+            });
+
+            if let Some(thread_ts) = thread_ts {
+                payload["thread_ts"] = json!(thread_ts);
+            }
+
+            let response = client
+                .post("https://slack.com/api/chat.postMessage")
                 .bearer_auth(bot_token)
-                .json(&json!({"channel": channel_id, "text": format!("<@{}> Here's your {} recipe!\n {}", user_id, result.get_pretty_item(), recipe_link), "unfurl_links": true, "unfurl_media": true}))
+                .json(&payload)
                 .send()
                 .await?;
+
             trace!("Successfully sent the file link, saving precious compute time!");
 
             let response_json: Value = response.json().await?;
@@ -503,7 +526,7 @@ impl RecipeData {
         let grid_origin_x = 60;
         let grid_origin_y = 33;
         let cell_size = 36; // +2 for the border
-        
+
         let mut crafting_table_gui = self.crafting_table_gui.clone();
 
         let mut missing_items = HashSet::new();
@@ -563,12 +586,7 @@ impl RecipeData {
                     let item_texture_img =
                         imageops::resize(&item_texture_img, 32, 32, imageops::FilterType::Nearest);
 
-                    imageops::overlay(
-                        &mut crafting_table_gui,
-                        &item_texture_img,
-                        cell_x,
-                        cell_y,
-                    );
+                    imageops::overlay(&mut crafting_table_gui, &item_texture_img, cell_x, cell_y);
                 }
 
                 i += 1;
@@ -700,18 +718,26 @@ impl RecipeData {
             .context("Slack returned an error when uploading the file (Step 2)")?;
 
         trace!("Completing the file upload (Step 3 of file upload)");
+
+        let mut payload = json!({
+            "files": [{ "id": file_id, "title": format!("{} recipe", result.get_pretty_item()) }],
+            "channel_id": channel_id,
+            "initial_comment": format!("<@{}> Here's your {} recipe!", user_id, result.get_pretty_item())
+        });
+
+        if let Some(thread_ts) = thread_ts {
+            payload["thread_ts"] = json!(thread_ts);
+        }
+
         let complete_upload_response = client
             .post("https://slack.com/api/files.completeUploadExternal")
             .bearer_auth(bot_token)
-            .json(&json!({
-                        "files": [{ "id": file_id, "title": format!("{} recipe", result.get_pretty_item()) }],
-                        "channel_id": channel_id,
-                        "initial_comment": format!("<@{}> Here's your {} recipe!", user_id, result.get_pretty_item())
-                    }))
+            .json(&payload)
             .send()
             .await
             .context("Unable to send the completion request for the file")?
-            .error_for_status().context("Slack returned an error when completing the upload (Step 3)")?;
+            .error_for_status()
+            .context("Slack returned an error when completing the upload (Step 3)")?;
 
         trace!("Converting the upload completion response to bytes then JSON");
         let complete_upload_response_bytes = complete_upload_response
@@ -760,6 +786,13 @@ pub fn fix_recipe_typo<'a>(
 }
 
 pub fn fix_recipe(recipe: &str) -> String {
+    let mut recipe = recipe;
+    if recipe.starts_with(" ") {
+        recipe = recipe.strip_prefix(" ").unwrap()
+    }
+    if recipe.ends_with(" ") {
+        recipe = recipe.strip_suffix(" ").unwrap()
+    }
     // Matches any whitespace (\s), dashes (\-), forward slashes (/), or backslashes (\\)
     let re = Regex::new(r"[\s\-/\\]+").unwrap();
 
