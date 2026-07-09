@@ -738,7 +738,26 @@ impl RecipeData {
     }
 }
 
-pub fn fix_recipe_typo<'a>(
+pub fn validate_recipe(
+    recipe: String,
+    valid_recipes: &HashMap<String, usize>,
+) -> (bool, String, String) {
+    if valid_recipes.contains_key(&fix_recipe(&recipe)) {
+        (true, "".to_string(), recipe)
+    } else {
+        if let Some(closest_recipe) = fix_recipe_typo(valid_recipes, &recipe) {
+            (
+                true,
+                format!("Assumed you meant {closest_recipe}"),
+                closest_recipe.clone(),
+            )
+        } else {
+            (false, "Invalid recipe".to_string(), recipe)
+        }
+    }
+}
+
+fn fix_recipe_typo<'a>(
     valid_recipes: &'a HashMap<String, usize>,
     recipe_to_fix: &str,
 ) -> Option<&'a String> {
@@ -756,7 +775,7 @@ pub fn fix_recipe_typo<'a>(
     closest_recipe
 }
 
-pub fn fix_recipe(recipe: &str) -> String {
+fn fix_recipe(recipe: &str) -> String {
     let mut recipe = recipe;
     if recipe.starts_with(" ") {
         recipe = recipe.strip_prefix(" ").unwrap()

@@ -3,11 +3,11 @@ pub mod font;
 pub mod logging;
 pub mod recipes;
 
-use crate::logging::initialise_logging;
 use crate::{
     Task::Recipe,
     data::fetch_client_jar,
-    recipes::{RecipeData, fix_recipe, fix_recipe_typo},
+    logging::initialise_logging,
+    recipes::{RecipeData, validate_recipe},
 };
 use axum::{
     Form, Json,
@@ -301,10 +301,11 @@ async fn handle_command(
                     json!({"response_type": "ephemeral", "text": "You didn't enter a recipe!"}),
                 );
             }
-            let requested_recipe = fix_recipe(&payload.text);
-            if state.valid_recipes.contains_key(&requested_recipe) {
+            let (is_recipe_valid, assumption_text, recipe) =
+                validate_recipe(payload.text, &state.valid_recipes);
+            if is_recipe_valid {
                 match state.mpsc.try_send(Recipe {
-                    item_name: requested_recipe.clone(),
+                    item_name: recipe.clone(),
                     response_url: Some(payload.response_url),
                     channel_id: payload.channel_id,
                     user_id: payload.user_id.clone(),
@@ -314,10 +315,10 @@ async fn handle_command(
                     Ok(..) => {
                         info!(
                             "Started processing recipe for {} from {}",
-                            requested_recipe, payload.user_id
+                            recipe, payload.user_id
                         );
                         Json(
-                            json!({"response_type": "ephemeral", "text": "Gathering images and sewing 'em up, hang on a second!"}),
+                            json!({"response_type": "ephemeral", "text": format!("Gathering images and sewing 'em up, hang on a second! {assumption_text}")}),
                         )
                     }
                     Err(e) => {
@@ -333,48 +334,13 @@ async fn handle_command(
                     }
                 }
             } else {
-                match fix_recipe_typo(&state.valid_recipes, &requested_recipe) {
-                    Some(fixed_requested_recipe) => {
-                        match state.mpsc.try_send(Recipe {
-                            item_name: fixed_requested_recipe.clone(),
-                            response_url: Some(payload.response_url),
-                            channel_id: payload.channel_id,
-                            user_id: payload.user_id.clone(),
-                            thread_ts: None,
-                            bot_token: state.bot_token.clone(),
-                        }) {
-                            Ok(..) => {
-                                info!(
-                                    "Started processing recipe for {} from {}",
-                                    fixed_requested_recipe, payload.user_id
-                                );
-                                Json(
-                                    json!({"response_type": "ephemeral", "text": format!("Gathering images and sewing 'em up, hang on a second! (Assumed you meant {})", fixed_requested_recipe.replace('_', " "))}),
-                                )
-                            }
-                            Err(e) => {
-                                error!("Error occurred sending task to generate image: {e}");
-                                match e {
-                                    TrySendError::Full(..) => Json(
-                                        json!({"response_type": "ephemeral", "text": "Too many people have requested recipes at the moment. Please try again later."}),
-                                    ),
-                                    _ => Json(
-                                        json!({"response_type": "ephemeral", "text": "I wasn't able to start generating your image. Please try again."}),
-                                    ),
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        warn!(
-                            "User {} tried to get recipe {} but it was invalid",
-                            payload.user_id, requested_recipe
-                        );
-                        Json(
-                            json!({"response_type": "ephemeral", "text": "Sorry your recipe was invalid."}),
-                        )
-                    }
-                }
+                warn!(
+                    "User {} tried to get recipe {recipe} but it was invalid",
+                    payload.user_id
+                );
+                Json(
+                    json!({"response_type": "ephemeral", "text": format!("Sorry your recipe {recipe} was invalid.")}),
+                )
             }
         }
         _ => {
@@ -401,16 +367,21 @@ async fn handle_mcrecipes(
         }
 
         SlackPayload::EventCallback { event } => {
-            let cleaned_text = event.text.strip_prefix("<@U0A5X0FV9V4>").unwrap();
+            let cleaned_text = event
+                .text
+                .strip_prefix("<@U0A5X0FV9V4>")
+                .unwrap()
+                .to_string();
             if cleaned_text.is_empty() || cleaned_text.eq(" ") {
                 return Json(
                     json!({"response_type": "ephemeral", "text": "You didn't enter a recipe!"}),
                 );
             }
-            let requested_recipe = fix_recipe(cleaned_text);
-            if state.valid_recipes.contains_key(&requested_recipe) {
+            let (is_recipe_valid, assumption_text, recipe) =
+                validate_recipe(cleaned_text, &state.valid_recipes);
+            if is_recipe_valid {
                 match state.mpsc.try_send(Recipe {
-                    item_name: requested_recipe.clone(),
+                    item_name: recipe.clone(),
                     response_url: None,
                     channel_id: event.channel.clone(),
                     user_id: event.user.clone(),
@@ -420,10 +391,10 @@ async fn handle_mcrecipes(
                     Ok(..) => {
                         info!(
                             "Started processing recipe for {} from {}",
-                            requested_recipe, event.user
+                            recipe, event.user
                         );
                         match send_message(
-                            &json!({"channel": event.channel, "thread_ts": event.ts, "text": "This bot now uses <@U0B8ER7U1S5>'s backend for responses, as it has been replaced by it. You can also use /mcrecipe to get the recipe!\nGathering images and sewing 'em up, hang on a second!"}),
+                            &json!({"channel": event.channel, "thread_ts": event.ts, "text": format!("This bot now uses <@U0B8ER7U1S5>'s backend for responses, as it has been replaced by it. You can also use /mcrecipe to get the recipe!\nGathering images and sewing 'em up, hang on a second! {assumption_text}")}),
                             &state.client,
                             &state.bot_token
                         ).await {
@@ -464,66 +435,11 @@ async fn handle_mcrecipes(
                     }
                 }
             } else {
-                match fix_recipe_typo(&state.valid_recipes, &requested_recipe) {
-                    Some(fixed_requested_recipe) => {
-                        match state.mpsc.try_send(Recipe {
-                            item_name: fixed_requested_recipe.clone(),
-                            response_url: None,
-                            channel_id: event.channel.clone(),
-                            user_id: event.user.clone(),
-                            thread_ts: Some(event.ts.clone()),
-                            bot_token: state.bot_token.clone(),
-                        }) {
-                            Ok(..) => {
-                                info!(
-                                    "Started processing recipe for {} from {}",
-                                    fixed_requested_recipe, event.user
-                                );
-                                match send_message(
-                                    &json!({"channel": event.channel, "thread_ts": event.ts, "text": format!("This bot now uses <@U0B8ER7U1S5>'s backend for responses, as it has been replaced by it. You can also use /mcrecipe to get the recipe!\nGathering images and sewing 'em up, hang on a second! (Assumed you meant {})", fixed_requested_recipe.replace('_', " "))}),
-                                    &state.client,
-                                    &state.bot_token
-                                ).await {
-                                 Ok(..) =>   Json(json!({"ok": true})),
-                                    Err(e) => {error!("Error occurred sending message: {e}"); Json(json!({"ok": false}))}
-                                }
-                            }
-                            Err(e) => {
-                                error!("Error occurred sending task to generate image: {e}");
-                                match e {
-                                    TrySendError::Full(..) => {
-                                        match send_message(
-                                            &json!({"channel": event.channel, "thread_ts": event.ts, "text": "Too many people have requested recipes at the moment. Please try again later."}),
-                                            &state.client,
-                                            &state.bot_token
-                                        ).await {
-                                            Ok(..) =>   Json(json!({"ok": true})),
-                                            Err(e) => {error!("Error occurred sending message: {e}"); Json(json!({"ok": false}))}
-                                        }
-                                    },
-                                    _ => {
-                                        match send_message(
-                                            &json!({"channel": event.channel, "thread_ts": event.ts, "text": "An error occurred when trying to send the task to generate your image. Please try again!"}),
-                                            &state.client,
-                                            &state.bot_token
-                                        ).await {
-                                            Ok(..) => Json(json!({"ok": true})),
-                                            Err(e) => {
-                                                error!("Error occurred sending message: {e}");
-                                                Json(json!({"ok": false}))
-                                            }
-                                        }
-                                    },
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        warn!(
-                            "User {} tried to get recipe {} but it was invalid",
-                            event.user, requested_recipe
-                        );
-                        match send_message(
+                warn!(
+                    "User {} tried to get recipe {recipe} but it was invalid",
+                    event.user
+                );
+                match send_message(
                             &json!({"channel": event.channel, "thread_ts": event.ts, "text": "Sorry your recipe was invalid."}),
                             &state.client,
                             &state.bot_token
@@ -531,8 +447,6 @@ async fn handle_mcrecipes(
                             Ok(..) =>   Json(json!({"ok": true})),
                             Err(e) => {error!("Error occurred sending message: {e}"); Json(json!({"ok": false}))}
                         }
-                    }
-                }
             }
         }
     }
