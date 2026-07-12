@@ -9,6 +9,7 @@ use crate::{
     logging::initialise_logging,
     recipes::{RecipeData, validate_recipe},
 };
+use axum::response::IntoResponse;
 use axum::{
     Form, Json,
     body::Body,
@@ -43,8 +44,7 @@ enum Task {
         bot_token: String,
     },
     Subscriptions {
-        channel_id: String,
-        user_id: String,
+        trigger_id: String,
         bot_token: String,
     },
 }
@@ -84,6 +84,7 @@ struct SlackSlashCommand {
     channel_id: String,
     user_id: String,
     response_url: String,
+    trigger_id: String,
 }
 
 pub struct SlackMessageContext<'a> {
@@ -229,12 +230,13 @@ async fn main() {
                     };
                 }
                 Subscriptions {
-                    channel_id,
-                    user_id,
+                    trigger_id,
                     bot_token,
                 } => {
                     let mut blocks: serde_json::Value = serde_json::from_str(r#"
 
+                        {
+                        "view":
                     {
 	"type": "modal",
 	"callback_id": "configure_subs_modal",
@@ -425,13 +427,12 @@ async fn main() {
                         }
                         }
                         ]
-                    }"#).expect("Unable to convert to JSON");
-                    blocks["channel"] = serde_json::Value::String(channel_id);
-                    blocks["user"] = serde_json::Value::String(user_id);
+                    }}"#).expect("Unable to convert to JSON");
+                    blocks["trigger_id"] = serde_json::value::Value::String(trigger_id);
                     debug!(
                         "{:#?}",
                         client
-                            .post("https://slack.com/api/chat.postEphemeral")
+                            .post("https://slack.com/api/views.open")
                             .bearer_auth(bot_token)
                             .json(&blocks)
                             .send()
@@ -503,7 +504,7 @@ async fn handle_event(
 async fn handle_command(
     State(state): State<Arc<AppState>>,
     Form(payload): Form<SlackSlashCommand>,
-) -> Json<serde_json::Value> {
+) -> Response {
     trace!("Received command at /slack/commands");
     match payload.command.as_str() {
         "/mcrecipe" => {
@@ -514,7 +515,8 @@ async fn handle_command(
             if payload.text.is_empty() || payload.text.eq(" ") {
                 return Json(
                     json!({"response_type": "ephemeral", "text": "You didn't enter a recipe!"}),
-                );
+                )
+                .into_response();
             }
             let (is_recipe_valid, assumption_text, recipe) =
                 validate_recipe(payload.text, &state.valid_recipes);
@@ -534,17 +536,17 @@ async fn handle_command(
                         );
                         Json(
                             json!({"response_type": "ephemeral", "text": format!("Gathering images and sewing 'em up, hang on a second! {assumption_text}")}),
-                        )
+                        ).into_response()
                     }
                     Err(e) => {
                         error!("Error occurred sending task to generate image: {e}");
                         match e {
                             TrySendError::Full(..) => Json(
                                 json!({"response_type": "ephemeral", "text": "Too many people have requested recipes at the moment. Please try again later."}),
-                            ),
+                            ).into_response(),
                             _ => Json(
                                 json!({"response_type": "ephemeral", "text": "I wasn't able to start generating your image. Please try again."}),
-                            ),
+                            ).into_response(),
                         }
                     }
                 }
@@ -555,28 +557,27 @@ async fn handle_command(
                 );
                 Json(
                     json!({"response_type": "ephemeral", "text": format!("Sorry your recipe {recipe} was invalid.")}),
-                )
+                ).into_response()
             }
         }
         "/mc-subs-config" => {
             match state.mpsc.try_send(Subscriptions {
-                channel_id: payload.channel_id,
-                user_id: payload.user_id.clone(),
+                trigger_id: payload.trigger_id,
                 bot_token: state.bot_token.clone(),
             }) {
                 Ok(..) => {
                     info!("Configuring updates for {}", payload.user_id);
-                    Json(json!({"ok": true,}))
+                    StatusCode::OK.into_response()
                 }
                 Err(e) => {
                     error!("Error occurred sending task to generate image: {e}");
                     match e {
                         TrySendError::Full(..) => Json(
                             json!({"response_type": "ephemeral", "text": "Too many people are using MCBot at the moment. Please try again later."}),
-                        ),
+                        ).into_response(),
                         _ => Json(
                             json!({"response_type": "ephemeral", "text": "I wasn't able to open the config menu. Please try again."}),
-                        ),
+                        ).into_response(),
                     }
                 }
             }
@@ -588,7 +589,7 @@ async fn handle_command(
             );
             Json(
                 json!({"response_type": "ephemeral", "text": "Sorry that command isn't supported as of right now."}),
-            )
+            ).into_response()
         } // only registered slash commands should even come, this shouldn't trigger anyway
     }
 }
