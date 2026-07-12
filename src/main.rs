@@ -367,11 +367,10 @@ async fn handle_mcrecipes(
         }
 
         SlackPayload::EventCallback { event } => {
-            let cleaned_text = event
-                .text
-                .strip_prefix("<@U0A5X0FV9V4>")
-                .unwrap()
-                .to_string();
+            let cleaned_text = match event.text.strip_prefix("<@U0A5X0FV9V4>") {
+                Some(str) => str.to_string(),
+                None => return Json(json!({})),
+            };
             if cleaned_text.is_empty() || cleaned_text.eq(" ") {
                 return Json(
                     json!({"response_type": "ephemeral", "text": "You didn't enter a recipe!"}),
