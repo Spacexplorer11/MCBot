@@ -25,7 +25,7 @@ use hmac::{KeyInit, Mac};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::query;
+use sqlx::{query, query_as};
 use std::{collections::HashMap, env, sync::Arc};
 use tokio::{
     net::TcpListener,
@@ -45,9 +45,17 @@ enum Task {
         bot_token: String,
     },
     Subscriptions {
+        user_id: String,
         trigger_id: String,
         bot_token: String,
     },
+}
+
+struct Subscription {
+    id: i64,
+    target_id: String,
+    active: bool,
+    mc_username: Option<String>,
 }
 
 #[derive(Clone)]
@@ -185,14 +193,16 @@ async fn main() {
         .await
         .expect("Failed to fetch recipes");
 
+    let sqlx_pool = sqlx::Pool::connect(&env::var("DATABASE_URL").expect("DATABASE_URL NOT FOUND"))
+        .await
+        .expect("Failed to connect to database");
+
     let state = Arc::new(AppState {
         client: Client::new(),
         bot_token: bot_token.clone(),
         mpsc: queue_input.clone(),
         valid_recipes: recipe_data.valid_recipes.clone(),
-        sqlx_pool: sqlx::Pool::connect(&env::var("DATABASE_URL").expect("DATABASE_URL NOT FOUND"))
-            .await
-            .expect("Failed to connect to database"),
+        sqlx_pool: sqlx_pool.clone(),
     });
 
     let mcrecipes_state = Arc::new(MCRecipesAppState {
@@ -291,211 +301,34 @@ async fn main() {
                     };
                 }
                 Subscriptions {
+                    user_id,
                     trigger_id,
                     bot_token,
                 } => {
-                    let mut blocks: Value = serde_json::from_str(r#"
+                    let subs = match query_as!(Subscription, "SELECT s.id, s.active, s.target_id, u.mc_username FROM subscriptions AS s JOIN users AS u ON s.target_id = u.slack_id WHERE s.subscriber_id = $1;", user_id).fetch_all(&sqlx_pool).await {
+                        Ok(subs) => subs,
+                        Err(e) => {
+                            error!(error = ?e, "Failed to fetch subscriptions");
+                            continue;
+                        }
+                    };
 
-                        {
-                        "view":
-                    {
-	"type": "modal",
-	"callback_id": "configure_subs_modal",
-	"private_metadata": "{\"page\": 0, \"page_size\": 5}",
-                        "submit": {
-                            "type": "plain_text",
-                            "text": "Done",
-                            "emoji": true
-                        },
-                        "close": {
-                            "type": "plain_text",
-                            "text": "Exit",
-                            "emoji": true
-                        },
-                        "title": {
-                            "type": "plain_text",
-                            "text": "Configure Update Subs"
-                        },
-                        "blocks": [
-                        {
-                            "type": "section",
-                            "text": {
-                            "type": "mrkdwn",
-                            "text": "Configure your update subscriptions below"
-                        }
-                        },
-                        {
-                            "type": "divider"
-                        },
-                        {
-                            "type": "section",
-                            "text": {
-                            "type": "mrkdwn",
-                            "text": ":heavy_plus_sign: *Subscribe to a new person*"
-                        },
-                            "accessory": {
-                            "type": "button",
-                            "text": {
-                                "type": "plain_text",
-                                "text": "Subscribe",
-                                "emoji": true
-                            },
-                            "style": "primary",
-                            "action_id": "subscribe_new_person",
-                            "value": "click_me_123"
-                        }
-                        },
-                        {
-                            "type": "divider"
-                        },
-                        {
-                            "type": "header",
-                            "text": {
-                            "type": "plain_text",
-                            "text": "Current Subscriptions",
-                            "emoji": true
-                        }
-                        },
-                        {
-                            "type": "section",
-                            "text": {
-                            "type": "mrkdwn",
-                            "text": "*Alex Chen*"
-                        },
-                            "accessory": {
-                            "type": "button",
-                            "text": {
-                                "type": "plain_text",
-                                "text": "Remove",
-                                "emoji": true
-                            },
-                            "style": "danger",
-                            "action_id": "remove_subscription",
-                            "value": "5",
-                            "confirm": {
-                                "title": {
-                                    "type": "plain_text",
-                                    "text": "Remove subscription?"
-                                },
-                                "text": {
-                                    "type": "mrkdwn",
-                                    "text": "You'll stop receiving updates for *Alex Chen*."
-                                },
-                                "confirm": {
-                                    "type": "plain_text",
-                                    "text": "Remove"
-                                },
-                                "deny": {
-                                    "type": "plain_text",
-                                    "text": "Cancel"
-                                },
-                                "style": "danger"
-                            }
-                        }
-                        },
-                        {
-                            "type": "context",
-                            "elements": [
-                            {
-                                "type": "mrkdwn",
-                                "text": ":large_green_circle: Active"
-                            }
-                            ]
-                        },
-                        {
-                            "type": "section",
-                            "text": {
-                            "type": "mrkdwn",
-                            "text": "*Priya Nair*"
-                        },
-                            "accessory": {
-                            "type": "button",
-                            "text": {
-                                "type": "plain_text",
-                                "text": "Remove",
-                                "emoji": true
-                            },
-                            "style": "danger",
-                            "action_id": "remove_subscription",
-                            "value": "sub_id_002",
-                            "confirm": {
-                                "title": {
-                                    "type": "plain_text",
-                                    "text": "Remove subscription?"
-                                },
-                                "text": {
-                                    "type": "mrkdwn",
-                                    "text": "You'll stop receiving updates for *Priya Nair*."
-                                },
-                                "confirm": {
-                                    "type": "plain_text",
-                                    "text": "Remove"
-                                },
-                                "deny": {
-                                    "type": "plain_text",
-                                    "text": "Cancel"
-                                },
-                                "style": "danger"
-                            }
-                        }
-                        },
-                        {
-                            "type": "context",
-                            "elements": [
-                            {
-                                "type": "mrkdwn",
-                                "text": ":large_yellow_circle: Pending acceptance"
-                            }
-                            ]
-                        },
-                        {
-                            "type": "divider"
-                        },
-                        {
-                            "type": "actions",
-                            "block_id": "subs_pagination",
-                            "elements": [
-                            {
-                                "type": "button",
-                                "text": {
-                                "type": "plain_text",
-                                "text": "◀ Prev",
-                                "emoji": true
-                            },
-                                "action_id": "subs_page_prev",
-                                "value": "prev"
-                            },
-                            {
-                                "type": "button",
-                                "text": {
-                                "type": "plain_text",
-                                "text": "Next ▶",
-                                "emoji": true
-                            },
-                                "action_id": "subs_page_next",
-                                "value": "next"
-                            }
-                            ]
-                        },
-                        {
-                            "type": "divider"
-                        },
-                        {
-                            "type": "section",
-                            "text": {
-                            "type": "mrkdwn",
-                            "text": "*What is this?*\n This feature allows you to subscribe to DM updates when the player you choose joins/leaves the hackclub minecraft server."
-                        }
-                        }
-                        ]
-                    }}"#).expect("Unable to convert to JSON");
-                    blocks["trigger_id"] = Value::String(trigger_id);
-                    let _ = client
-                        .post("https://slack.com/api/views.open")
-                        .bearer_auth(bot_token)
-                        .json(&blocks)
-                        .send()
-                        .await;
+                    let modal_view = build_subs_modal_view(&subs, 0);
+
+                    let payload = json!({
+                        "trigger_id": trigger_id,
+                        "view": modal_view
+                    });
+                    debug!("{:#?}", payload);
+                    debug!(
+                        "{:#?}",
+                        client
+                            .post("https://slack.com/api/views.open")
+                            .bearer_auth(bot_token)
+                            .json(&payload)
+                            .send()
+                            .await
+                    );
                 }
             }
         }
@@ -621,6 +454,7 @@ async fn handle_command(
         }
         "/mc-subs-config" => {
             match state.mpsc.try_send(Subscriptions {
+                user_id: payload.user_id.clone(),
                 trigger_id: payload.trigger_id,
                 bot_token: state.bot_token.clone(),
             }) {
@@ -951,4 +785,166 @@ async fn send_message(json: &Value, client: &Client, bot_token: &String) -> anyh
         .send()
         .await?;
     Ok(())
+}
+
+fn build_subs_modal_view(subs: &[Subscription], page: usize) -> Value {
+    let mut blocks: Vec<Value> = Vec::new();
+
+    blocks.push(json!({"type": "section", "text": {"type": "mrkdwn", "text": "Configure your update subscriptions below"}})); // Title
+    blocks.push(json!({"type": "divider"}));
+    blocks.push(json!({
+        "type": "section",
+        "text": {
+        "type": "mrkdwn",
+        "text": ":heavy_plus_sign: *Subscribe to a new person*"
+    },
+        "accessory": {
+        "type": "button",
+        "text": {
+            "type": "plain_text",
+            "text": "Subscribe",
+            "emoji": true
+        },
+        "style": "primary",
+        "action_id": "subscribe_new_person",
+        "value": "click_me_123"
+    }
+    }));
+    blocks.push(json!({"type": "divider"}));
+    blocks.push(json!({
+        "type": "header",
+        "text": {
+        "type": "plain_text",
+        "text": "Current Subscriptions",
+        "emoji": true
+    }
+    }));
+
+    for subscription in subs {
+        let title = if let Some(mc_user) = &subscription.mc_username {
+            format!("<@{}> *({})*", subscription.target_id, mc_user)
+        } else {
+            format!("<@{}>", subscription.target_id)
+        };
+        blocks.push(json!({
+            "type": "section",
+            "text": {
+            "type": "mrkdwn",
+            "text": title
+        },
+            "accessory": {
+            "type": "button",
+            "text": {
+                "type": "plain_text",
+                "text": "Remove",
+                "emoji": true
+            },
+            "style": "danger",
+            "action_id": "remove_subscription",
+            "value": subscription.id.to_string(),
+            "confirm": {
+                "title": {
+                    "type": "plain_text",
+                    "text": "Remove subscription?"
+                },
+                "text": {
+                    "type": "mrkdwn",
+                    "text": format!("You'll stop receiving updates for {title}.")
+                },
+                "confirm": {
+                    "type": "plain_text",
+                    "text": "Remove"
+                },
+                "deny": {
+                    "type": "plain_text",
+                    "text": "Cancel"
+                },
+                "style": "danger"
+            }
+        }
+        }));
+        if subscription.active {
+            blocks.push(json!({
+                "type": "context",
+                "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": ":large_green_circle: Active"
+                }
+                ]
+            }))
+        } else {
+            blocks.push(json!({
+                "type": "context",
+                "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": ":large_yellow_circle: Pending acceptance"
+                }
+                ]
+            }))
+        }
+    }
+
+    blocks.push(json!({
+        "type": "divider"
+    }));
+    blocks.push(json!({
+        "type": "actions",
+        "block_id": "subs_pagination",
+        "elements": [
+        {
+            "type": "button",
+            "text": {
+            "type": "plain_text",
+            "text": "◀ Prev",
+            "emoji": true
+        },
+            "action_id": "subs_page_prev",
+            "value": "prev"
+        },
+        {
+            "type": "button",
+            "text": {
+            "type": "plain_text",
+            "text": "Next ▶",
+            "emoji": true
+        },
+            "action_id": "subs_page_next",
+            "value": "next"
+        }
+        ]
+    }));
+    blocks.push(json!({
+        "type": "divider"
+    }));
+
+    blocks.push(json!({
+                            "type": "section",
+                            "text": {
+                            "type": "mrkdwn",
+                            "text": "*What is this?*\n This feature allows you to subscribe to DM updates when the player you choose joins/leaves the hackclub minecraft server."
+                        }
+                        }));
+
+    json!(
+                    {
+	"type": "modal",
+	"callback_id": "configure_subs_modal",
+	"private_metadata": "{\"page\":\"".to_owned() + &page.to_string() + "\", \"page_size\": \"5\"}",
+                        "submit": {
+                            "type": "plain_text",
+                            "text": "Done",
+                            "emoji": true
+                        },
+                        "close": {
+                            "type": "plain_text",
+                            "text": "Exit",
+                            "emoji": true
+                        },
+                        "title": {
+                            "type": "plain_text",
+                            "text": "Configure Update Subs"
+                        },
+                        "blocks": blocks})
 }
