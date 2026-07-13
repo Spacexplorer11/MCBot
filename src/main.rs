@@ -24,7 +24,8 @@ use dotenvy::dotenv;
 use hmac::{KeyInit, Mac};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
+use sqlx::query;
 use std::{collections::HashMap, env, sync::Arc};
 use tokio::{
     net::TcpListener,
@@ -55,6 +56,15 @@ struct AppState {
     bot_token: String,
     mpsc: mpsc::Sender<Task>,
     valid_recipes: HashMap<String, usize>,
+    sqlx_pool: sqlx::PgPool,
+}
+
+#[derive(Clone)]
+struct MCRecipesAppState {
+    client: Client,
+    bot_token: String,
+    mpsc: mpsc::Sender<Task>,
+    valid_recipes: HashMap<String, usize>,
 }
 
 #[derive(Deserialize)]
@@ -65,6 +75,54 @@ enum SlackPayload {
 
     #[serde(rename = "event_callback")]
     EventCallback { event: SlackEvent },
+}
+
+#[derive(Deserialize)]
+struct SlackInteractionPayload {
+    payload: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum SlackInteraction {
+    #[serde(rename = "block_actions")]
+    BlockActions {
+        user: SlackUser,
+        view: SlackView,
+        actions: Vec<SlackActions>,
+    },
+}
+
+#[derive(Deserialize)]
+struct SlackView {
+    id: String,
+    callback_id: String,
+    private_metadata: Option<Value>,
+    hash: String,
+}
+
+#[derive(Deserialize)]
+struct SlackActions {
+    action_id: ActionId,
+    block_id: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+enum ActionId {
+    #[serde(rename = "subscribe_new_person")]
+    SubscribeNewPerson,
+    #[serde(rename = "remove_subscription")]
+    RemoveSubscription,
+    #[serde(rename = "subs_page_prev")]
+    SubsPagePrev,
+    #[serde(rename = "subs_page_next")]
+    SubsPageNext,
+}
+
+#[derive(Deserialize)]
+struct SlackUser {
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -132,9 +190,12 @@ async fn main() {
         bot_token: bot_token.clone(),
         mpsc: queue_input.clone(),
         valid_recipes: recipe_data.valid_recipes.clone(),
+        sqlx_pool: sqlx::Pool::connect(&env::var("DATABASE_URL").expect("DATABASE_URL NOT FOUND"))
+            .await
+            .expect("Failed to connect to database"),
     });
 
-    let mcrecipes_state = Arc::new(AppState {
+    let mcrecipes_state = Arc::new(MCRecipesAppState {
         client: Client::new(),
         bot_token: mcrecipes_bot_token,
         mpsc: queue_input,
@@ -233,7 +294,7 @@ async fn main() {
                     trigger_id,
                     bot_token,
                 } => {
-                    let mut blocks: serde_json::Value = serde_json::from_str(r#"
+                    let mut blocks: Value = serde_json::from_str(r#"
 
                         {
                         "view":
@@ -310,7 +371,7 @@ async fn main() {
                             },
                             "style": "danger",
                             "action_id": "remove_subscription",
-                            "value": "sub_id_001",
+                            "value": "5",
                             "confirm": {
                                 "title": {
                                     "type": "plain_text",
@@ -428,16 +489,13 @@ async fn main() {
                         }
                         ]
                     }}"#).expect("Unable to convert to JSON");
-                    blocks["trigger_id"] = serde_json::value::Value::String(trigger_id);
-                    debug!(
-                        "{:#?}",
-                        client
-                            .post("https://slack.com/api/views.open")
-                            .bearer_auth(bot_token)
-                            .json(&blocks)
-                            .send()
-                            .await
-                    );
+                    blocks["trigger_id"] = Value::String(trigger_id);
+                    let _ = client
+                        .post("https://slack.com/api/views.open")
+                        .bearer_auth(bot_token)
+                        .json(&blocks)
+                        .send()
+                        .await;
                 }
             }
         }
@@ -446,6 +504,7 @@ async fn main() {
     let mcbot_router = axum::Router::new()
         .route("/slack/events", post(handle_event))
         .route("/slack/commands", post(handle_command))
+        .route("/slack/interactions", post(handle_interactions))
         .route_layer(middleware::from_fn_with_state(
             signing_secret,
             verify_slack_signature,
@@ -479,7 +538,7 @@ async fn main() {
 async fn handle_event(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SlackPayload>,
-) -> Json<serde_json::Value> {
+) -> Json<Value> {
     trace!("Received an event at /slack/events");
     match payload {
         SlackPayload::UrlVerification { challenge } => {
@@ -594,10 +653,66 @@ async fn handle_command(
     }
 }
 
-async fn handle_mcrecipes(
+async fn handle_interactions(
     State(state): State<Arc<AppState>>,
+    Form(payload): Form<SlackInteractionPayload>,
+) -> Response {
+    let interaction: SlackInteraction = match serde_json::from_str(&payload.payload) {
+        Ok(i) => i,
+        Err(e) => {
+            error!("Failed to parse interaction payload: {e}");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+    match interaction {
+        SlackInteraction::BlockActions {
+            user,
+            view,
+            actions,
+        } => {
+            let actions = &actions[0];
+            let id = match actions.value.parse::<i64>() {
+                Ok(id) => id,
+                Err(..) => {
+                    error!("Failed to parse id as i64 (id = {})", actions.value);
+                    return StatusCode::OK.into_response();
+                }
+            };
+            match actions.action_id {
+                ActionId::RemoveSubscription => {
+                    match query!(
+                        "DELETE FROM subscriptions WHERE id = $1 and subscriber_id = $2",
+                        id,
+                        user.id
+                    )
+                    .execute(&state.sqlx_pool)
+                    .await
+                    {
+                        Ok(..) => {
+                            trace!("Successfully deleted row from database");
+                            StatusCode::OK.into_response()
+                        }
+                        Err(e) => {
+                            error!(
+                                "An error occurred when deleting a subscription from the database, error: {}",
+                                e
+                            );
+                            StatusCode::OK.into_response()
+                        }
+                    }
+                }
+                ActionId::SubscribeNewPerson => StatusCode::OK.into_response(),
+                ActionId::SubsPageNext => StatusCode::OK.into_response(),
+                ActionId::SubsPagePrev => StatusCode::OK.into_response(),
+            }
+        }
+    }
+}
+
+async fn handle_mcrecipes(
+    State(state): State<Arc<MCRecipesAppState>>,
     Json(payload): Json<SlackPayload>,
-) -> Json<serde_json::Value> {
+) -> Json<Value> {
     trace!("Received an event at /slack/mcrecipes");
     match payload {
         SlackPayload::UrlVerification { challenge } => {
@@ -691,7 +806,7 @@ async fn handle_mcrecipes(
     }
 }
 
-async fn uptime() -> Json<serde_json::Value> {
+async fn uptime() -> Json<Value> {
     Json(json!({"ok": true}))
 }
 
@@ -828,11 +943,7 @@ async fn verify_slack_signature(
     }
 }
 
-async fn send_message(
-    json: &serde_json::Value,
-    client: &Client,
-    bot_token: &String,
-) -> anyhow::Result<()> {
+async fn send_message(json: &Value, client: &Client, bot_token: &String) -> anyhow::Result<()> {
     client
         .post("https://slack.com/api/chat.postMessage")
         .bearer_auth(bot_token)
