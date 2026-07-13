@@ -9,6 +9,7 @@ use crate::{
     logging::initialise_logging,
     recipes::{RecipeData, validate_recipe},
 };
+use anyhow::{Context, anyhow};
 use axum::response::IntoResponse;
 use axum::{
     Form, Json,
@@ -23,7 +24,7 @@ use chrono::Utc;
 use dotenvy::dotenv;
 use hmac::{KeyInit, Mac};
 use reqwest::{Client, StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{query, query_as};
 use std::{collections::HashMap, env, sync::Arc};
@@ -75,6 +76,12 @@ struct MCRecipesAppState {
     valid_recipes: HashMap<String, usize>,
 }
 
+#[derive(Deserialize, Serialize)]
+struct SubsPageMetadata {
+    page: i64,
+    page_size: i64,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 enum SlackPayload {
@@ -105,7 +112,7 @@ enum SlackInteraction {
 struct SlackView {
     id: String,
     callback_id: String,
-    private_metadata: Option<Value>,
+    private_metadata: Option<String>,
     hash: String,
 }
 
@@ -305,30 +312,27 @@ async fn main() {
                     trigger_id,
                     bot_token,
                 } => {
-                    let subs = match query_as!(Subscription, "SELECT s.id, s.active, s.target_id, u.mc_username FROM subscriptions AS s JOIN users AS u ON s.target_id = u.slack_id WHERE s.subscriber_id = $1;", user_id).fetch_all(&sqlx_pool).await {
-                        Ok(subs) => subs,
+                    let modal_view = match fetch_and_build_subs_modal_view(&sqlx_pool, 0, user_id)
+                        .await
+                    {
+                        Ok(view) => view,
                         Err(e) => {
-                            error!(error = ?e, "Failed to fetch subscriptions");
+                            error!(error = ?e, "An error occurred fetching and building the modal view");
                             continue;
+                            // TODO: Tell the user somehow?
                         }
                     };
-
-                    let modal_view = build_subs_modal_view(&subs, 0);
 
                     let payload = json!({
                         "trigger_id": trigger_id,
                         "view": modal_view
                     });
-                    debug!("{:#?}", payload);
-                    debug!(
-                        "{:#?}",
-                        client
-                            .post("https://slack.com/api/views.open")
-                            .bearer_auth(bot_token)
-                            .json(&payload)
-                            .send()
-                            .await
-                    );
+                    let _ = client
+                        .post("https://slack.com/api/views.open")
+                        .bearer_auth(bot_token)
+                        .json(&payload)
+                        .send()
+                        .await; // TODO: Handle properly
                 }
             }
         }
@@ -505,15 +509,37 @@ async fn handle_interactions(
             actions,
         } => {
             let actions = &actions[0];
-            let id = match actions.value.parse::<i64>() {
-                Ok(id) => id,
-                Err(..) => {
-                    error!("Failed to parse id as i64 (id = {})", actions.value);
-                    return StatusCode::OK.into_response();
+            debug!("{:#?}", view.private_metadata);
+            let private_metadata: Option<SubsPageMetadata> = if let Some(private_metadata) =
+                view.private_metadata
+            {
+                let priv_metadata: Result<SubsPageMetadata, serde_json::error::Error> =
+                    serde_json::from_str(&private_metadata);
+                match priv_metadata {
+                    Ok(priv_metadata) => Some(priv_metadata),
+                    Err(e) => {
+                        warn!(error = ?e, "Couldn't convert private_metadata to array so just returning None");
+                        None
+                    }
                 }
+            } else {
+                None
+            };
+            let page = if let Some(pmd) = private_metadata {
+                pmd.page
+            } else {
+                warn!("Private metadata not found, defaulting page value to 0");
+                0
             };
             match actions.action_id {
                 ActionId::RemoveSubscription => {
+                    let id = match actions.value.parse::<i64>() {
+                        Ok(id) => id,
+                        Err(..) => {
+                            error!("Failed to parse id as i64 (id = {})", actions.value);
+                            return StatusCode::OK.into_response();
+                        }
+                    };
                     match query!(
                         "DELETE FROM subscriptions WHERE id = $1 and subscriber_id = $2",
                         id,
@@ -524,6 +550,31 @@ async fn handle_interactions(
                     {
                         Ok(..) => {
                             trace!("Successfully deleted row from database");
+                            let modal_view = match fetch_and_build_subs_modal_view(
+                                &state.sqlx_pool,
+                                page,
+                                user.id,
+                            )
+                            .await
+                            {
+                                Ok(json) => json,
+                                Err(e) => {
+                                    error!(error = ?e, "Unable to build and fetch subs");
+                                    return StatusCode::OK.into_response();
+                                }
+                            };
+                            let json = json!({
+                                "hash": view.hash,
+                                "view": modal_view,
+                                "view_id": view.id
+                            });
+                            let _ = state
+                                .client
+                                .post("https://slack.com/api/views.update")
+                                .bearer_auth(state.bot_token.clone())
+                                .json(&json)
+                                .send()
+                                .await; //TODO: Handle properly
                             StatusCode::OK.into_response()
                         }
                         Err(e) => {
@@ -787,7 +838,23 @@ async fn send_message(json: &Value, client: &Client, bot_token: &String) -> anyh
     Ok(())
 }
 
-fn build_subs_modal_view(subs: &[Subscription], page: usize) -> Value {
+async fn fetch_and_build_subs_modal_view(
+    sqlx_pool: &sqlx::PgPool,
+    page: i64,
+    user_id: String,
+) -> anyhow::Result<Value> {
+    let subs = match query_as!(Subscription, "SELECT s.id, s.active, s.target_id, u.mc_username FROM subscriptions AS s JOIN users AS u ON s.target_id = u.slack_id WHERE s.subscriber_id = $1;", user_id).fetch_all(sqlx_pool).await {
+        Ok(subs) => subs,
+        Err(e) => {
+            return Err(anyhow!("Failed to fetch subscriptions. Error: {e}"));
+        }
+    };
+
+    let metadata = SubsPageMetadata { page, page_size: 5 };
+
+    let subs =
+        &subs[(page * metadata.page_size) as usize..subs.len().min(((page + 1) * 5) as usize)];
+
     let mut blocks: Vec<Value> = Vec::new();
 
     blocks.push(json!({"type": "section", "text": {"type": "mrkdwn", "text": "Configure your update subscriptions below"}})); // Title
@@ -927,11 +994,11 @@ fn build_subs_modal_view(subs: &[Subscription], page: usize) -> Value {
                         }
                         }));
 
-    json!(
+    Ok(json!(
                     {
 	"type": "modal",
 	"callback_id": "configure_subs_modal",
-	"private_metadata": "{\"page\":\"".to_owned() + &page.to_string() + "\", \"page_size\": \"5\"}",
+	"private_metadata": serde_json::to_string(&metadata).context("Unable to serialise private metadata to string")?,
                         "submit": {
                             "type": "plain_text",
                             "text": "Done",
@@ -946,5 +1013,5 @@ fn build_subs_modal_view(subs: &[Subscription], page: usize) -> Value {
                             "type": "plain_text",
                             "text": "Configure Update Subs"
                         },
-                        "blocks": blocks})
+                        "blocks": blocks}))
 }
