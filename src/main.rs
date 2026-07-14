@@ -1,3 +1,5 @@
+#![allow(linker_messages)]
+
 pub mod data;
 pub mod font;
 pub mod logging;
@@ -105,13 +107,14 @@ enum SlackInteraction {
         user: SlackUser,
         view: SlackView,
         actions: Vec<SlackActions>,
+        trigger_id: String,
     },
 }
 
 #[derive(Deserialize)]
 struct SlackView {
     id: String,
-    callback_id: String,
+    // This can be used in the future -> callback_id: String,
     private_metadata: Option<String>,
     hash: String,
 }
@@ -119,7 +122,6 @@ struct SlackView {
 #[derive(Deserialize)]
 struct SlackActions {
     action_id: ActionId,
-    block_id: String,
     value: String,
 }
 
@@ -507,6 +509,7 @@ async fn handle_interactions(
             user,
             view,
             actions,
+            trigger_id,
         } => {
             let actions = &actions[0];
             let private_metadata: Option<SubsPageMetadata> = if let Some(private_metadata) =
@@ -585,7 +588,52 @@ async fn handle_interactions(
                         }
                     }
                 }
-                ActionId::SubscribeNewPerson => StatusCode::OK.into_response(),
+                ActionId::SubscribeNewPerson => {
+                    let user_select_block = json!({
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "Enter the user you wish to subscribe to:"
+                        },
+                        "accessory": {
+                            "type": "users_select",
+                            "placeholder": {
+                                "type": "plain_text",
+                                "text": "Select a user",
+                                "emoji": true
+                            },
+                            "action_id": "users_select-action"
+                        }
+                    });
+
+                    let json = json!({
+                        "view": {
+                            "type": "modal",
+                            "callback_id": "input_new_sub_user",
+                            "title": {
+                                "type": "plain_text",
+                                "text": "New Subscription",
+                                "emoji": true
+                            },
+                            "submit": {
+                                "type": "plain_text",
+                                "text": "Confirm"
+                            },
+                            "blocks": [user_select_block]
+                        },
+                        "trigger_id": trigger_id
+                    });
+
+                    let response = state
+                        .client
+                        .post("https://slack.com/api/views.push")
+                        .bearer_auth(state.bot_token.clone())
+                        .json(&json)
+                        .send()
+                        .await;
+
+                    StatusCode::OK.into_response()
+                }
                 ActionId::SubsPageNext => {
                     page += 1;
                     let modal_view = match fetch_and_build_subs_modal_view(
@@ -898,7 +946,20 @@ async fn fetch_and_build_subs_modal_view(
     page: i64,
     user_id: String,
 ) -> anyhow::Result<Value> {
-    let subs = match query_as!(Subscription, "SELECT s.id, s.active, s.target_id, u.mc_username FROM subscriptions AS s JOIN users AS u ON s.target_id = u.slack_id WHERE s.subscriber_id = $1;", user_id).fetch_all(sqlx_pool).await {
+    let subs = match query_as!(
+        Subscription,
+        "SELECT s.id, s.active, s.target_id, u.mc_username
+FROM subscriptions AS s
+JOIN users AS u ON s.target_id = u.slack_id
+WHERE s.subscriber_id = $1
+ORDER BY s.created_at
+LIMIT 6 OFFSET $2",
+        user_id,
+        page * 5
+    )
+    .fetch_all(sqlx_pool)
+    .await
+    {
         Ok(subs) => subs,
         Err(e) => {
             return Err(anyhow!("Failed to fetch subscriptions. Error: {e}"));
@@ -906,9 +967,6 @@ async fn fetch_and_build_subs_modal_view(
     };
 
     let metadata = SubsPageMetadata { page, page_size: 5 };
-
-    let subs =
-        &subs[(page * metadata.page_size) as usize..subs.len().min(((page + 1) * 5) as usize)];
 
     let mut blocks: Vec<Value> = Vec::new();
 
@@ -942,7 +1000,7 @@ async fn fetch_and_build_subs_modal_view(
     }
     }));
 
-    for subscription in subs {
+    for subscription in &subs[..subs.len().min(6)] {
         let title = if let Some(mc_user) = &subscription.mc_username {
             format!("<@{}> *({})*", subscription.target_id, mc_user)
         } else {
@@ -1014,7 +1072,7 @@ async fn fetch_and_build_subs_modal_view(
 
     let mut pagination_buttons: Vec<Value> = Vec::new();
 
-    if page > 0 {
+    if page > 0 && !subs.is_empty() {
         pagination_buttons.push(json!(
             {
                 "type": "button",
@@ -1029,7 +1087,7 @@ async fn fetch_and_build_subs_modal_view(
         ));
     }
 
-    if !(subs.len() + 5 < ((page + 1) * 5) as usize) {
+    if subs.len() > 5 {
         pagination_buttons.push(json!(
             {
                 "type": "button",
