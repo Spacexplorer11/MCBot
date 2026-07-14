@@ -509,7 +509,6 @@ async fn handle_interactions(
             actions,
         } => {
             let actions = &actions[0];
-            debug!("{:#?}", view.private_metadata);
             let private_metadata: Option<SubsPageMetadata> = if let Some(private_metadata) =
                 view.private_metadata
             {
@@ -525,7 +524,7 @@ async fn handle_interactions(
             } else {
                 None
             };
-            let page = if let Some(pmd) = private_metadata {
+            let mut page = if let Some(pmd) = private_metadata {
                 pmd.page
             } else {
                 warn!("Private metadata not found, defaulting page value to 0");
@@ -587,8 +586,64 @@ async fn handle_interactions(
                     }
                 }
                 ActionId::SubscribeNewPerson => StatusCode::OK.into_response(),
-                ActionId::SubsPageNext => StatusCode::OK.into_response(),
-                ActionId::SubsPagePrev => StatusCode::OK.into_response(),
+                ActionId::SubsPageNext => {
+                    page += 1;
+                    let modal_view = match fetch_and_build_subs_modal_view(
+                        &state.sqlx_pool,
+                        page,
+                        user.id,
+                    )
+                    .await
+                    {
+                        Ok(json) => json,
+                        Err(e) => {
+                            error!(error = ?e, "Unable to build and fetch subs");
+                            return StatusCode::OK.into_response();
+                        }
+                    };
+                    let json = json!({
+                        "hash": view.hash,
+                        "view": modal_view,
+                        "view_id": view.id
+                    });
+                    let _ = state
+                        .client
+                        .post("https://slack.com/api/views.update")
+                        .bearer_auth(state.bot_token.clone())
+                        .json(&json)
+                        .send()
+                        .await; //TODO: Handle properly
+                    StatusCode::OK.into_response()
+                }
+                ActionId::SubsPagePrev => {
+                    page -= 1;
+                    let modal_view = match fetch_and_build_subs_modal_view(
+                        &state.sqlx_pool,
+                        page,
+                        user.id,
+                    )
+                    .await
+                    {
+                        Ok(json) => json,
+                        Err(e) => {
+                            error!(error = ?e, "Unable to build and fetch subs");
+                            return StatusCode::OK.into_response();
+                        }
+                    };
+                    let json = json!({
+                        "hash": view.hash,
+                        "view": modal_view,
+                        "view_id": view.id
+                    });
+                    let _ = state
+                        .client
+                        .post("https://slack.com/api/views.update")
+                        .bearer_auth(state.bot_token.clone())
+                        .json(&json)
+                        .send()
+                        .await; //TODO: Handle properly
+                    StatusCode::OK.into_response()
+                }
             }
         }
     }
@@ -956,31 +1011,43 @@ async fn fetch_and_build_subs_modal_view(
     blocks.push(json!({
         "type": "divider"
     }));
+
+    let mut pagination_buttons: Vec<Value> = Vec::new();
+
+    if page > 0 {
+        pagination_buttons.push(json!(
+            {
+                "type": "button",
+                "text": {
+                "type": "plain_text",
+                "text": "◀ Prev",
+                "emoji": true
+            },
+                "action_id": "subs_page_prev",
+                "value": "prev"
+            }
+        ));
+    }
+
+    if !(subs.len() + 5 < ((page + 1) * 5) as usize) {
+        pagination_buttons.push(json!(
+            {
+                "type": "button",
+                "text": {
+                "type": "plain_text",
+                "text": "Next ▶",
+                "emoji": true
+            },
+                "action_id": "subs_page_next",
+                "value": "next"
+            }
+        ));
+    }
+
     blocks.push(json!({
         "type": "actions",
         "block_id": "subs_pagination",
-        "elements": [
-        {
-            "type": "button",
-            "text": {
-            "type": "plain_text",
-            "text": "◀ Prev",
-            "emoji": true
-        },
-            "action_id": "subs_page_prev",
-            "value": "prev"
-        },
-        {
-            "type": "button",
-            "text": {
-            "type": "plain_text",
-            "text": "Next ▶",
-            "emoji": true
-        },
-            "action_id": "subs_page_next",
-            "value": "next"
-        }
-        ]
+        "elements": pagination_buttons
     }));
     blocks.push(json!({
         "type": "divider"
