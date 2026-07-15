@@ -114,7 +114,7 @@ enum SlackInteraction {
 #[derive(Deserialize)]
 struct SlackView {
     id: String,
-    // This can be used in the future -> callback_id: String,
+    callback_id: CallbackId,
     private_metadata: Option<String>,
     hash: String,
 }
@@ -122,10 +122,10 @@ struct SlackView {
 #[derive(Deserialize)]
 struct SlackActions {
     action_id: ActionId,
-    value: String,
+    value: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 enum ActionId {
     #[serde(rename = "subscribe_new_person")]
     SubscribeNewPerson,
@@ -135,6 +135,18 @@ enum ActionId {
     SubsPagePrev,
     #[serde(rename = "subs_page_next")]
     SubsPageNext,
+    #[serde(rename = "users_select")]
+    UserSelect,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+enum CallbackId {
+    #[serde(rename = "configure_subs_modal")]
+    ConfigureSubsModal,
+    #[serde(rename = "input_new_sub_user")]
+    InputNewSubUser,
 }
 
 #[derive(Deserialize)]
@@ -512,33 +524,40 @@ async fn handle_interactions(
             trigger_id,
         } => {
             let actions = &actions[0];
-            let private_metadata: Option<SubsPageMetadata> = if let Some(private_metadata) =
-                view.private_metadata
-            {
-                let priv_metadata: Result<SubsPageMetadata, serde_json::error::Error> =
-                    serde_json::from_str(&private_metadata);
-                match priv_metadata {
-                    Ok(priv_metadata) => Some(priv_metadata),
-                    Err(e) => {
-                        warn!(error = ?e, "Couldn't convert private_metadata to array so just returning None");
+            let private_metadata: Option<SubsPageMetadata>;
+            let mut page: i64 = 0;
+
+            #[allow(clippy::single_match)]
+            match view.callback_id {
+                CallbackId::ConfigureSubsModal => {
+                    private_metadata = if let Some(private_metadata) = view.private_metadata {
+                        let priv_metadata: Result<SubsPageMetadata, serde_json::error::Error> =
+                            serde_json::from_str(&private_metadata);
+                        match priv_metadata {
+                            Ok(priv_metadata) => Some(priv_metadata),
+                            Err(e) => {
+                                warn!(error = ?e, "Couldn't convert private_metadata to array so just returning None");
+                                None
+                            }
+                        }
+                    } else {
                         None
+                    };
+                    page = if let Some(pmd) = private_metadata {
+                        pmd.page
+                    } else {
+                        warn!("Private metadata not found, defaulting page value to 0");
+                        0
                     }
                 }
-            } else {
-                None
-            };
-            let mut page = if let Some(pmd) = private_metadata {
-                pmd.page
-            } else {
-                warn!("Private metadata not found, defaulting page value to 0");
-                0
+                _ => (),
             };
             match actions.action_id {
                 ActionId::RemoveSubscription => {
-                    let id = match actions.value.parse::<i64>() {
+                    let id = match actions.value.as_ref().expect("According to slack docs this should not fail. If it does then you must re-check your code + their API response").parse::<i64>() {
                         Ok(id) => id,
                         Err(..) => {
-                            error!("Failed to parse id as i64 (id = {})", actions.value);
+                            error!("Failed to parse id as i64 (id = {})", actions.value.as_ref().expect("According to slack docs this should not fail. If it does then you must re-check your code + their API response"));
                             return StatusCode::OK.into_response();
                         }
                     };
@@ -588,6 +607,14 @@ async fn handle_interactions(
                         }
                     }
                 }
+                /* TODO: Do all the other TODO's
+                 TODO: Add the entered user to the db - both subscriptions and users (obvs check it dont already exist for this user in subs)
+                 TODO: Send the DM obviously
+                 TODO: Verify the entered mc_username exists and is a valid one (Mojang API) and say only Java names supported at the moment
+                 TODO: Add to database, accept/decline, and username if provided (might not be needed if in db already)
+                 TODO: Send DM to subscriber that they accepted/declined
+                 TODO: Patrol #minecraft-bridge and send DM's (hammer the index remember)
+                */
                 ActionId::SubscribeNewPerson => {
                     let user_select_block = json!({
                         "type": "section",
@@ -602,7 +629,7 @@ async fn handle_interactions(
                                 "text": "Select a user",
                                 "emoji": true
                             },
-                            "action_id": "users_select-action"
+                            "action_id": "users_select"
                         }
                     });
 
@@ -624,18 +651,32 @@ async fn handle_interactions(
                         "trigger_id": trigger_id
                     });
 
-                    let response = state
+                    match state
                         .client
                         .post("https://slack.com/api/views.push")
                         .bearer_auth(state.bot_token.clone())
                         .json(&json)
                         .send()
-                        .await;
+                        .await
+                    {
+                        Ok(..) => (),
+                        Err(e) => {
+                            error!(error=?e, "An error occurred pushing an input view"); //TODO: Handle properly
+                        }
+                    }
 
                     StatusCode::OK.into_response()
                 }
-                ActionId::SubsPageNext => {
-                    page += 1;
+                ActionId::SubsPageNext | ActionId::SubsPagePrev => {
+                    match actions.action_id {
+                        ActionId::SubsPageNext => {
+                            page += 1;
+                        }
+                        ActionId::SubsPagePrev => {
+                            page -= 1;
+                        }
+                        _ => (), // This is literally impossible anyway
+                    }
                     let modal_view = match fetch_and_build_subs_modal_view(
                         &state.sqlx_pool,
                         page,
@@ -663,33 +704,10 @@ async fn handle_interactions(
                         .await; //TODO: Handle properly
                     StatusCode::OK.into_response()
                 }
-                ActionId::SubsPagePrev => {
-                    page -= 1;
-                    let modal_view = match fetch_and_build_subs_modal_view(
-                        &state.sqlx_pool,
-                        page,
-                        user.id,
-                    )
-                    .await
-                    {
-                        Ok(json) => json,
-                        Err(e) => {
-                            error!(error = ?e, "Unable to build and fetch subs");
-                            return StatusCode::OK.into_response();
-                        }
-                    };
-                    let json = json!({
-                        "hash": view.hash,
-                        "view": modal_view,
-                        "view_id": view.id
-                    });
-                    let _ = state
-                        .client
-                        .post("https://slack.com/api/views.update")
-                        .bearer_auth(state.bot_token.clone())
-                        .json(&json)
-                        .send()
-                        .await; //TODO: Handle properly
+                ActionId::UserSelect => StatusCode::OK.into_response(),
+                ActionId::Other => {
+                    warn!("Received a block action's event that is not handled");
+                    debug!("Event: {:#?}", payload.payload);
                     StatusCode::OK.into_response()
                 }
             }
