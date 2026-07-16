@@ -45,12 +45,12 @@ enum Task {
         channel_id: String,
         user_id: String,
         thread_ts: Option<String>,
-        bot_token: String,
+        bot_token: Arc<str>,
     },
     Subscriptions {
         user_id: String,
         trigger_id: String,
-        bot_token: String,
+        bot_token: Arc<str>,
     },
 }
 
@@ -64,7 +64,7 @@ struct Subscription {
 #[derive(Clone)]
 struct AppState {
     client: Client,
-    bot_token: String,
+    bot_token: Arc<str>,
     mpsc: mpsc::Sender<Task>,
     valid_recipes: HashMap<String, usize>,
     sqlx_pool: sqlx::PgPool,
@@ -73,7 +73,7 @@ struct AppState {
 #[derive(Clone)]
 struct MCRecipesAppState {
     client: Client,
-    bot_token: String,
+    bot_token: Arc<str>,
     mpsc: mpsc::Sender<Task>,
     valid_recipes: HashMap<String, usize>,
 }
@@ -117,26 +117,28 @@ struct SlackView {
     callback_id: CallbackId,
     private_metadata: Option<String>,
     hash: String,
+    blocks: Vec<Value>,
 }
 
 #[derive(Deserialize)]
 struct SlackActions {
+    #[serde(flatten)]
     action_id: ActionId,
-    value: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(tag = "action_id")]
 enum ActionId {
     #[serde(rename = "subscribe_new_person")]
     SubscribeNewPerson,
     #[serde(rename = "remove_subscription")]
-    RemoveSubscription,
+    RemoveSubscription { value: String },
     #[serde(rename = "subs_page_prev")]
     SubsPagePrev,
     #[serde(rename = "subs_page_next")]
     SubsPageNext,
     #[serde(rename = "users_select")]
-    UserSelect,
+    UserSelect { selected_user: String },
     #[serde(other)]
     Other,
 }
@@ -220,7 +222,7 @@ async fn main() {
 
     let state = Arc::new(AppState {
         client: Client::new(),
-        bot_token: bot_token.clone(),
+        bot_token: bot_token.into(),
         mpsc: queue_input.clone(),
         valid_recipes: recipe_data.valid_recipes.clone(),
         sqlx_pool: sqlx_pool.clone(),
@@ -228,7 +230,7 @@ async fn main() {
 
     let mcrecipes_state = Arc::new(MCRecipesAppState {
         client: Client::new(),
-        bot_token: mcrecipes_bot_token,
+        bot_token: mcrecipes_bot_token.into(),
         mpsc: queue_input,
         valid_recipes: recipe_data.valid_recipes.clone(),
     });
@@ -519,7 +521,7 @@ async fn handle_interactions(
     match interaction {
         SlackInteraction::BlockActions {
             user,
-            view,
+            mut view,
             actions,
             trigger_id,
         } => {
@@ -552,12 +554,12 @@ async fn handle_interactions(
                 }
                 _ => (),
             };
-            match actions.action_id {
-                ActionId::RemoveSubscription => {
-                    let id = match actions.value.as_ref().expect("According to slack docs this should not fail. If it does then you must re-check your code + their API response").parse::<i64>() {
+            match &actions.action_id {
+                ActionId::RemoveSubscription { value } => {
+                    let id = match value.parse::<i64>() {
                         Ok(id) => id,
                         Err(..) => {
-                            error!("Failed to parse id as i64 (id = {})", actions.value.as_ref().expect("According to slack docs this should not fail. If it does then you must re-check your code + their API response"));
+                            error!("Failed to parse id as i64 (id = {})", value);
                             return StatusCode::OK.into_response();
                         }
                     };
@@ -629,7 +631,8 @@ async fn handle_interactions(
                                 "text": "Select a user",
                                 "emoji": true
                             },
-                            "action_id": "users_select"
+                            "action_id": "users_select",
+                            "focus_on_load": true
                         }
                     });
 
@@ -704,7 +707,64 @@ async fn handle_interactions(
                         .await; //TODO: Handle properly
                     StatusCode::OK.into_response()
                 }
-                ActionId::UserSelect => StatusCode::OK.into_response(),
+                ActionId::UserSelect { selected_user } => {
+                    let existing_subscription = query!(
+                    "SELECT 1 as exists FROM subscriptions WHERE subscriber_id = $1 AND target_id = $2",
+                    user.id,
+                    selected_user
+                    )
+                        .fetch_optional(&state.sqlx_pool)
+                        .await;
+
+                    let existing_subscription = match existing_subscription {
+                        Ok(row) => row.is_some(),
+                        Err(e) => {
+                            error!("Failed to check for existing subscription: {e}");
+                            return StatusCode::OK.into_response();
+                        }
+                    };
+
+                    if existing_subscription {
+                        view.blocks.push(json!({
+                            "type": "alert",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "*Error*: You are already subscribed to this person",
+                                "verbatim": false
+                            },
+                            "level": "error"
+                        }));
+
+                        let json = json!({
+                            "view": {
+                                "type": "modal",
+                                "callback_id": "input_new_sub_user",
+                                "title": {
+                                    "type": "plain_text",
+                                    "text": "New Subscription",
+                                    "emoji": true
+                                },
+                                "submit": {
+                                    "type": "plain_text",
+                                    "text": "Confirm"
+                                },
+                                "blocks": view.blocks
+                            },
+                            "hash": view.hash,
+                            "view_id": view.id
+                        });
+
+                        let _ = state
+                            .client
+                            .post("https://slack.com/api/views.update")
+                            .bearer_auth(state.bot_token.clone())
+                            .json(&json)
+                            .send()
+                            .await;
+                    }
+
+                    StatusCode::OK.into_response()
+                }
                 ActionId::Other => {
                     warn!("Received a block action's event that is not handled");
                     debug!("Event: {:#?}", payload.payload);
@@ -949,7 +1009,7 @@ async fn verify_slack_signature(
     }
 }
 
-async fn send_message(json: &Value, client: &Client, bot_token: &String) -> anyhow::Result<()> {
+async fn send_message(json: &Value, client: &Client, bot_token: &str) -> anyhow::Result<()> {
     client
         .post("https://slack.com/api/chat.postMessage")
         .bearer_auth(bot_token)
