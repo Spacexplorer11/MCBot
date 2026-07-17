@@ -109,6 +109,8 @@ enum SlackInteraction {
         actions: Vec<SlackActions>,
         trigger_id: String,
     },
+    #[serde(rename = "view_submission")]
+    ViewSubmission { user: SlackUser, view: SlackView },
 }
 
 #[derive(Deserialize)]
@@ -118,6 +120,19 @@ struct SlackView {
     private_metadata: Option<String>,
     hash: String,
     blocks: Vec<Value>,
+    state: Option<ViewState>,
+}
+
+#[derive(Deserialize)]
+struct ViewState {
+    values: HashMap<String, HashMap<String, StateElements>>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum StateElements {
+    #[serde(rename = "users_select")]
+    UserSelect {},
 }
 
 #[derive(Deserialize)]
@@ -619,20 +634,24 @@ async fn handle_interactions(
                 */
                 ActionId::SubscribeNewPerson => {
                     let user_select_block = json!({
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": "Enter the user you wish to subscribe to:"
+                        "type": "input",
+                        "label": {
+                            "type": "plain_text",
+                            "text": "Select the user you wish to subscribe to:"
                         },
-                        "accessory": {
+                        "element": {
                             "type": "users_select",
                             "placeholder": {
                                 "type": "plain_text",
                                 "text": "Select a user",
                                 "emoji": true
                             },
-                            "action_id": "users_select",
-                            "focus_on_load": true
+                            "action_id": "users_select"
+                        },
+                        "dispatch_action": true,
+                        "hint": {
+                            "type": "plain_text",
+                            "text": "How this works: After selecting and confirming the user, a DM will be sent which asks for approval from the user you selected. Their decision will be relayed back to you via a DM and if it's a yes, you will automatically start receiving DM updates when the join/leave the hackclub minecraft server."
                         }
                     });
 
@@ -724,44 +743,54 @@ async fn handle_interactions(
                         }
                     };
 
-                    if existing_subscription {
-                        view.blocks.push(json!({
-                            "type": "alert",
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": "*Error*: You are already subscribed to this person",
-                                "verbatim": false
-                            },
-                            "level": "error"
-                        }));
+                    let alert_block = json!({
+                        "type": "alert",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "*Error*: You are already subscribed to this person",
+                            "verbatim": false
+                        },
+                        "level": "error"
+                    });
 
-                        let json = json!({
-                            "view": {
-                                "type": "modal",
-                                "callback_id": "input_new_sub_user",
-                                "title": {
-                                    "type": "plain_text",
-                                    "text": "New Subscription",
-                                    "emoji": true
-                                },
-                                "submit": {
-                                    "type": "plain_text",
-                                    "text": "Confirm"
-                                },
-                                "blocks": view.blocks
-                            },
-                            "hash": view.hash,
-                            "view_id": view.id
-                        });
+                    let already_error_block_present = view
+                        .blocks
+                        .iter()
+                        .any(|v| v.get("type") == Some(&json!("alert")));
 
-                        let _ = state
-                            .client
-                            .post("https://slack.com/api/views.update")
-                            .bearer_auth(state.bot_token.clone())
-                            .json(&json)
-                            .send()
-                            .await;
+                    if existing_subscription && !already_error_block_present {
+                        view.blocks.insert(0, alert_block);
+                    } else if !existing_subscription && already_error_block_present {
+                        view.blocks
+                            .retain(|v| v.get("type") != Some(&json!("alert")));
                     }
+
+                    let json = json!({
+                        "view": {
+                            "type": "modal",
+                            "callback_id": "input_new_sub_user",
+                            "title": {
+                                "type": "plain_text",
+                                "text": "New Subscription",
+                                "emoji": true
+                            },
+                            "submit": {
+                                "type": "plain_text",
+                                "text": "Confirm"
+                            },
+                            "blocks": view.blocks
+                        },
+                        "hash": view.hash,
+                        "view_id": view.id
+                    });
+
+                    let _ = state
+                        .client
+                        .post("https://slack.com/api/views.update")
+                        .bearer_auth(state.bot_token.clone())
+                        .json(&json)
+                        .send()
+                        .await; //TODO: Handle properly
 
                     StatusCode::OK.into_response()
                 }
@@ -771,6 +800,13 @@ async fn handle_interactions(
                     StatusCode::OK.into_response()
                 }
             }
+        }
+        SlackInteraction::ViewSubmission { user, view } => {
+            match view.callback_id {
+                CallbackId::ConfigureSubsModal => (),
+                CallbackId::InputNewSubUser => {}
+            }
+            StatusCode::OK.into_response()
         }
     }
 }
@@ -1107,7 +1143,7 @@ LIMIT 6 OFFSET $2",
                 },
                 "text": {
                     "type": "mrkdwn",
-                    "text": format!("You'll stop receiving updates for {title}.")
+                    "text": format!("You'll stop receiving updates for {title}. They will be asked for approval again should you wish to subscribe to them again.")
                 },
                 "confirm": {
                     "type": "plain_text",
