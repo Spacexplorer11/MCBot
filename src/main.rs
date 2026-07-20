@@ -121,6 +121,14 @@ struct SlackView {
     hash: String,
     blocks: Vec<Value>,
     state: Option<ViewState>,
+    response_urls: Option<Vec<ViewResponseUrls>>
+}
+
+#[derive(Deserialize)]
+struct ViewResponseUrls {
+    block_id: String,
+    action_id: String,
+    response_url: String
 }
 
 #[derive(Deserialize)]
@@ -132,7 +140,7 @@ struct ViewState {
 #[serde(tag = "type")]
 enum StateElements {
     #[serde(rename = "users_select")]
-    UserSelect {},
+    UserSelect { selected_user: String },
 }
 
 #[derive(Deserialize)]
@@ -652,7 +660,8 @@ async fn handle_interactions(
                         "hint": {
                             "type": "plain_text",
                             "text": "How this works: After selecting and confirming the user, a DM will be sent which asks for approval from the user you selected. Their decision will be relayed back to you via a DM and if it's a yes, you will automatically start receiving DM updates when the join/leave the hackclub minecraft server."
-                        }
+                        },
+                        "block_id": "users_select"
                     });
 
                     let json = json!({
@@ -804,7 +813,133 @@ async fn handle_interactions(
         SlackInteraction::ViewSubmission { user, view } => {
             match view.callback_id {
                 CallbackId::ConfigureSubsModal => (),
-                CallbackId::InputNewSubUser => {}
+                CallbackId::InputNewSubUser => {
+                    
+                    let response_url: Option<String> = view.response_urls.and_then(|v| {
+                        for item in v {
+                            if item.block_id == "users_select" && item.action_id == "users_select" {
+                                return Some(item.response_url);
+                            }
+                        }
+                        None
+                    });
+                    
+                        let view_state = match view
+                            .state
+                        {
+                            Some(view_state) => view_state,
+                            None => {
+                                warn!("No view state");
+                                if let Err(e) = push_error_alert_modal("Internal error / Slack's fault: No state found in the view submission payload", &state.client, &state.bot_token).await {
+                                    todo!("Handle errors")
+                                } else {
+                                    return StatusCode::OK.into_response()
+                                }}
+                        };
+                    
+                    let users_select_state = match view_state.values.get("users_select") {
+                        Some(user_select_state) => user_select_state,
+                        None => {
+                            warn!("No users_select state");
+                            if let Err(e) = push_error_alert_modal("Internal error / Slack's fault: No users_select state found in the view submission payload", &state.client, &state.bot_token).await {
+                                todo!("Handle errors")
+                            } else {
+                                return StatusCode::OK.into_response()
+                            }
+                        }
+                    };
+
+                    let target_user_id =
+                        match users_select_state.get("users_select").and_then(|s| match s { // this is cuz the object is first its block id: users_select and then its action id, which I aptly named... users_select
+                            StateElements::UserSelect { selected_user } => Some(selected_user),
+                        }) {
+                            Some(tui) => tui,
+                            None => { // This clause should not trigger because slack validates input fields are not empty before submission
+                                warn!("No target user selected");
+                                if let Some(response_url) = response_url {
+                                    let _ = state.client.post(response_url)
+                                        .bearer_auth(state.bot_token.clone())
+                                        .json(&json!(
+                                                 {
+                        "response_action": "errors",
+                        "errors": {
+                        "users_select": "Please enter a user!"
+                            }
+                        }
+                                
+                                )).send().await; // todo: dont ignore errors??
+                                    return StatusCode::OK.into_response()
+                                }
+                                else {
+                                    if let Err(e) = push_error_alert_modal("You are already subscribed to this user!", &state.client, &state.bot_token).await {
+                                        todo!("Handle errors")
+                                    }
+                                    else {
+                                        return StatusCode::OK.into_response()
+                                    }
+                                }
+                            }
+                        };
+
+                    let existing_subscription = query!(
+                    "SELECT 1 as exists FROM subscriptions WHERE subscriber_id = $1 AND target_id = $2",
+                    user.id,
+                    target_user_id
+                    )
+                        .fetch_optional(&state.sqlx_pool)
+                        .await;
+
+                    let existing_subscription = match existing_subscription {
+                        Ok(row) => row.is_some(),
+                        Err(e) => {
+                            error!("Failed to check for existing subscription: {e}");
+                            if let Err(e) = push_error_alert_modal(
+                                "Internal error: failed to check for existing subscription.",
+                                &state.client,
+                                &state.bot_token,
+                            )
+                            .await
+                            {
+                                todo!("Handle errors")
+                            } else {
+                                return StatusCode::OK.into_response();
+                            }
+                        }
+                    };
+
+                    if existing_subscription {
+                        if let Some(response_url) = response_url {
+                            if let Err(e) = state.client.post(response_url)
+                                .bearer_auth(state.bot_token.clone())
+                                .json(&json!(
+                                                 {
+                        "response_action": "errors",
+                        "errors": {
+                        "users_select": "You are already subscribed to this user!"
+                            }
+                        }
+                            
+                                    // TODO: WHY ISNT THE FUNCTION NOR THE RESPONSE URL WORKING. DEBUG AND FIX THIS
+                                    
+                                )).send().await {
+                                if let Err(e) = push_error_alert_modal("You are already subscribed to this user!", &state.client, &state.bot_token).await {
+                                    todo!("Handle errors")
+                                }
+                                else {
+                                    return StatusCode::OK.into_response()
+                                }
+                            }
+                        }
+                        else {
+                            if let Err(e) = push_error_alert_modal("You are already subscribed to this user!", &state.client, &state.bot_token).await {
+                                todo!("Handle errors")
+                            }
+                            else {
+                                return StatusCode::OK.into_response()
+                            }
+                        }
+                    }
+                }
             }
             StatusCode::OK.into_response()
         }
@@ -1253,4 +1388,43 @@ LIMIT 6 OFFSET $2",
                             "text": "Configure Update Subs"
                         },
                         "blocks": blocks}))
+}
+
+async fn push_error_alert_modal(
+    text: &str,
+    client: &Client,
+    bot_token: &str,
+) -> anyhow::Result<()> {
+    let alert_block = json!({
+                        "type": "alert",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": format!("*Error*: {}. \n If this error was unexpected or persists then please contact <@U08D22QNUVD> or email akaal@akaalroop.com", text),
+                            "verbatim": false
+                        },
+    "level": "error"
+                    });
+    let json = json!({
+        "view": {
+            "type": "modal",
+            "title": {
+                "type": "plain_text",
+                "text": "An error occurred",
+                "emoji": true
+            },
+            "close": {
+                "type": "plain_text",
+                "text": "Understood",
+                "emoji": true
+            },
+        "blocks": [alert_block]
+            }
+    });
+    client
+        .post("https://slack.com/api/views.push")
+        .bearer_auth(bot_token)
+        .json(&json)
+        .send()
+        .await?;
+    Ok(())
 }
