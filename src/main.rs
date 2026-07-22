@@ -120,7 +120,7 @@ struct SlackView {
     private_metadata: Option<String>,
     hash: String,
     blocks: Vec<Value>,
-    state: Option<ViewState>
+    state: Option<ViewState>,
 }
 
 #[derive(Deserialize)]
@@ -829,12 +829,10 @@ async fn handle_interactions(
                     };
 
                     let target_user_id =
-                        match users_select_state
-                            .get("users_select")
-                            .and_then(|s| match s {
-                                // this is cuz the object is first its block id: users_select and then its action id, which I aptly named... users_select
-                                StateElements::UserSelect { selected_user } => Some(selected_user),
-                            }) {
+                        match users_select_state.get("users_select").map(|s| match s {
+                            // this is cuz the object is first its block id: users_select and then its action id, which I aptly named... users_select
+                            StateElements::UserSelect { selected_user } => selected_user,
+                        }) {
                             Some(tui) => tui,
                             None => {
                                 // This clause should not trigger because slack validates input fields are not empty before submission
@@ -871,6 +869,38 @@ async fn handle_interactions(
                             "You are already subscribed to this user!",
                         );
                     }
+
+                    if let Err(e) =
+                        query!("INSERT INTO users (slack_id) VALUES ($1)", target_user_id)
+                            .execute(&state.sqlx_pool)
+                            .await
+                    {
+                        error!("Failed to insert user into database: {e}");
+                        return build_inline_error_response(
+                            "users_select",
+                            "Internal error: Failed to insert user into database.",
+                        );
+                    }
+
+                    if let Err(e) = query!(
+                        "INSERT INTO subscriptions (subscriber_id, target_id) VALUES ($1, $2)",
+                        user.id,
+                        target_user_id
+                    )
+                    .execute(&state.sqlx_pool)
+                    .await
+                    {
+                        error!("Failed to insert new subscription: {e}");
+                        return build_inline_error_response(
+                            "users_select",
+                            "Internal error: failed to create new subscription in database.",
+                        );
+                    }
+
+                    info!(
+                        "Added new subscription ({}) for {}",
+                        target_user_id, user.id
+                    );
                 }
             }
             StatusCode::OK.into_response()
@@ -963,13 +993,13 @@ async fn handle_mcrecipes(
                     event.user
                 );
                 match send_message(
-                            &json!({"channel": event.channel, "thread_ts": event.ts, "text": "Sorry your recipe was invalid."}),
-                            &state.client,
-                            &state.bot_token
-                        ).await {
-                            Ok(..) =>   Json(json!({"ok": true})),
-                            Err(e) => {error!("Error occurred sending message: {e}"); Json(json!({"ok": false}))}
-                        }
+                    &json!({"channel": event.channel, "thread_ts": event.ts, "text": "Sorry your recipe was invalid."}),
+                    &state.client,
+                    &state.bot_token
+                ).await {
+                    Ok(..) =>   Json(json!({"ok": true})),
+                    Err(e) => {error!("Error occurred sending message: {e}"); Json(json!({"ok": false}))}
+                }
             }
         }
     }
@@ -1322,7 +1352,11 @@ LIMIT 6 OFFSET $2",
                         "blocks": blocks}))
 }
 
-fn build_inline_error_response(field: &str, message: &str) -> Response {
+fn build_inline_error_response(field: &str, message: &str) -> Response<Body> {
+    let mut message = message.to_string();
+    if message.to_lowercase().contains("internal") {
+        message.push_str(" Please try again. If this persists, please contact the @Akaalroop on slack or email akaal@akaalroop.com");
+    }
     Json(json!({
         "response_action": "errors",
         "errors": {
