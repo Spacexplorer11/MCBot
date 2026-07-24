@@ -369,12 +369,14 @@ async fn main() {
                         "trigger_id": trigger_id,
                         "view": modal_view
                     });
-                    let _ = client
-                        .post("https://slack.com/api/views.open")
-                        .bearer_auth(bot_token)
-                        .json(&payload)
-                        .send()
-                        .await; // TODO: Handle properly
+                    send_and_log_on_failure(
+                        client
+                            .post("https://slack.com/api/views.open")
+                            .bearer_auth(bot_token)
+                            .json(&payload),
+                        "Opening the initial configuration modal",
+                    )
+                    .await;
                 }
             }
         }
@@ -617,13 +619,15 @@ async fn handle_interactions(
                                 "view": modal_view,
                                 "view_id": view.id
                             });
-                            let _ = state
-                                .client
-                                .post("https://slack.com/api/views.update")
-                                .bearer_auth(state.bot_token.clone())
-                                .json(&json)
-                                .send()
-                                .await; //TODO: Handle properly
+                            send_and_log_on_failure(
+                                state
+                                    .client
+                                    .post("https://slack.com/api/views.update")
+                                    .bearer_auth(state.bot_token.clone())
+                                    .json(&json),
+                                "Updating the view after a subscription was removed",
+                            )
+                            .await;
                             StatusCode::OK.into_response()
                         }
                         Err(e) => {
@@ -636,7 +640,6 @@ async fn handle_interactions(
                     }
                 }
                 /* TODO: Do all the other TODO's
-                 TODO: Send the DM obviously
                  TODO: Verify the entered mc_username exists and is a valid one (Mojang API) and say only Java names supported at the moment
                  TODO: Add to database, accept/decline, and username if provided (might not be needed if in db already)
                  TODO: Send DM to subscriber that they accepted/declined
@@ -684,19 +687,15 @@ async fn handle_interactions(
                         "trigger_id": trigger_id
                     });
 
-                    match state
-                        .client
-                        .post("https://slack.com/api/views.push")
-                        .bearer_auth(state.bot_token.clone())
-                        .json(&json)
-                        .send()
-                        .await
-                    {
-                        Ok(..) => (),
-                        Err(e) => {
-                            error!(error=?e, "An error occurred pushing an input view"); //TODO: Handle properly
-                        }
-                    }
+                    send_and_log_on_failure(
+                        state
+                            .client
+                            .post("https://slack.com/api/views.push")
+                            .bearer_auth(state.bot_token.clone())
+                            .json(&json),
+                        "Pushing an input view",
+                    )
+                    .await;
 
                     StatusCode::OK.into_response()
                 }
@@ -728,13 +727,15 @@ async fn handle_interactions(
                         "view": modal_view,
                         "view_id": view.id
                     });
-                    let _ = state
-                        .client
-                        .post("https://slack.com/api/views.update")
-                        .bearer_auth(state.bot_token.clone())
-                        .json(&json)
-                        .send()
-                        .await; //TODO: Handle properly
+                    send_and_log_on_failure(
+                        state
+                            .client
+                            .post("https://slack.com/api/views.update")
+                            .bearer_auth(state.bot_token.clone())
+                            .json(&json),
+                        "Updating the view after a page change",
+                    )
+                    .await;
                     StatusCode::OK.into_response()
                 }
                 ActionId::UserSelect { selected_user } => {
@@ -795,13 +796,15 @@ async fn handle_interactions(
                         "view_id": view.id
                     });
 
-                    let _ = state
-                        .client
-                        .post("https://slack.com/api/views.update")
-                        .bearer_auth(state.bot_token.clone())
-                        .json(&json)
-                        .send()
-                        .await; //TODO: Handle properly
+                    send_and_log_on_failure(
+                        state
+                            .client
+                            .post("https://slack.com/api/views.update")
+                            .bearer_auth(state.bot_token.clone())
+                            .json(&json),
+                        "Updating the view after a user was selected",
+                    )
+                    .await;
 
                     StatusCode::OK.into_response()
                 }
@@ -1508,4 +1511,18 @@ fn build_inline_error_response(field: &str, message: &str) -> Response<Body> {
         }
     }))
     .into_response()
+}
+
+async fn send_and_log_on_failure(request: reqwest::RequestBuilder, context: &str) {
+    match request.send().await {
+        Ok(response) => match response.json::<Value>().await {
+            Ok(body) => {
+                if body.get("ok") != Some(&json!(true)) {
+                    error!(context, response = ?body, "Slack API call reported failure");
+                }
+            }
+            Err(e) => error!(context, error = ?e, "Failed to parse Slack response as JSON"),
+        },
+        Err(e) => error!(context, error = ?e, "Request to Slack failed"),
+    }
 }
