@@ -100,6 +100,17 @@ struct SlackInteractionPayload {
 }
 
 #[derive(Deserialize)]
+struct SlackChannel {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct OpenConversationResponse {
+    ok: bool,
+    channel: SlackChannel,
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "type")]
 enum SlackInteraction {
     #[serde(rename = "block_actions")]
@@ -625,7 +636,6 @@ async fn handle_interactions(
                     }
                 }
                 /* TODO: Do all the other TODO's
-                 TODO: Add the entered user to the db - both subscriptions and users (obvs check it dont already exist for this user in subs)
                  TODO: Send the DM obviously
                  TODO: Verify the entered mc_username exists and is a valid one (Mojang API) and say only Java names supported at the moment
                  TODO: Add to database, accept/decline, and username if provided (might not be needed if in db already)
@@ -871,7 +881,7 @@ async fn handle_interactions(
                     }
 
                     if let Err(e) =
-                        query!("INSERT INTO users (slack_id) VALUES ($1)", target_user_id)
+                        query!("INSERT INTO users (slack_id) VALUES ($1) ON CONFLICT (slack_id) DO NOTHING", target_user_id)
                             .execute(&state.sqlx_pool)
                             .await
                     {
@@ -901,6 +911,140 @@ async fn handle_interactions(
                         "Added new subscription ({}) for {}",
                         target_user_id, user.id
                     );
+
+                    let target_user_id = target_user_id.clone();
+
+                    tokio::spawn(async move {
+                        let json = json!({
+                            "users": target_user_id
+                        });
+
+                        let response = state
+                            .client
+                            .post("https://slack.com/api/conversations.open")
+                            .bearer_auth(state.bot_token.clone())
+                            .json(&json)
+                            .send()
+                            .await;
+
+                        if let Ok(response) = response {
+                            trace!("Opened conversation with user {target_user_id}");
+
+                            let response_bytes = response.bytes().await;
+
+                            if let Ok(response_bytes) = response_bytes {
+                                let json: serde_json::error::Result<OpenConversationResponse> =
+                                    serde_json::from_slice(&response_bytes);
+                                if let Ok(json) = json {
+                                    if !json.ok {
+                                        error!(
+                                            "Slack conversations.open API returned a non-OK response"
+                                        );
+                                    }
+
+                                    let channel = json.channel.id;
+
+                                    let blocks = json!([
+                                        {
+                                            "type": "header",
+                                            "text": {
+                                                "type": "plain_text",
+                                                "text": "Request for Approval",
+                                                "emoji": true
+                                            }
+                                        },
+                                        {
+                                            "type": "section",
+                                            "text": {
+                                                "type": "mrkdwn",
+                                                "text": format!("<@{}> wants to subscribe to your join/leave updates for the Hack Club Minecraft Server.", user.id)
+                                            }
+                                        },
+                                        {
+                                            "type": "actions",
+                                            "block_id": "approval_actions",
+                                            "elements": [
+                                                {
+                                                    "type": "button",
+                                                    "text": {
+                                                        "type": "plain_text",
+                                                        "text": "Approve",
+                                                        "emoji": true
+                                                    },
+                                                    "style": "primary",
+                                                    "action_id": "approve_subscription",
+                                                    "value": user.id
+                                                },
+                                                {
+                                                    "type": "button",
+                                                    "text": {
+                                                        "type": "plain_text",
+                                                        "text": "Decline",
+                                                        "emoji": true
+                                                    },
+                                                    "style": "danger",
+                                                    "action_id": "decline_subscription",
+                                                    "value": user.id
+                                                },
+                                                {
+                                                    "type": "button",
+                                                    "text": {
+                                                        "type": "plain_text",
+                                                        "text": "I don't play",
+                                                        "emoji": true
+                                                    },
+                                                    "action_id": "doesnt_play",
+                                                    "value": user.id
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "type": "context",
+                                            "elements": [
+                                                {
+                                                    "type": "mrkdwn",
+                                                    "text": "They will be notified of your decision."
+                                                }
+                                            ]
+                                        }
+                                    ]);
+
+                                    let message = json!({
+                                        "channel": channel,
+                                        "blocks": blocks
+                                    });
+
+                                    let res = state
+                                        .client
+                                        .post("https://slack.com/api/chat.postMessage")
+                                        .bearer_auth(state.bot_token.clone())
+                                        .json(&message)
+                                        .send()
+                                        .await;
+
+                                    if let Err(e) = res {
+                                        error!(error=?e, "An error occurred sending a message to the newly opened DM with {target_user_id}");
+                                    } else {
+                                        match res {
+                                            Ok(response) => match response.text().await {
+                                                Ok(body) => debug!("Slack response body: {body}"),
+                                                Err(e) => {
+                                                    error!(error = ?e, "Failed to read Slack response body")
+                                                }
+                                            },
+                                            Err(e) => error!(error = ?e, "Request to Slack failed"),
+                                        }
+                                    }
+                                } else if let Err(e) = json {
+                                    error!(
+                                        "Failed to parse response from slack for conversations.open: {e}"
+                                    );
+                                }
+                            }
+                        } else if let Err(e) = response {
+                            error!(error=?e, "An error occurred opening a conversation with user {target_user_id}");
+                        }
+                    });
                 }
             }
             StatusCode::OK.into_response()
