@@ -27,7 +27,7 @@ enum MCRecipe {
     },
     #[serde(rename = "minecraft:crafting_shapeless")]
     Shapeless {
-        ingredients: Vec<String>,
+        ingredients: Vec<RecipeIngredient>,
         result: RecipeResult,
     },
     #[serde(rename = "minecraft:crafting_transmute")]
@@ -334,6 +334,10 @@ impl RecipeData {
                 let mut items_to_place = Vec::new();
                 for ingredient in ingredients {
                     let item: &str;
+                    let ingredient = match ingredient {
+                        RecipeIngredient::Single(ingredient) => ingredient,
+                        RecipeIngredient::Multiple(ingredient) => ingredient[0].clone(),
+                    };
                     if ingredient.starts_with("#minecraft:") {
                         let tag = ingredient.strip_prefix("#minecraft:").unwrap();
 
