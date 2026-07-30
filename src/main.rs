@@ -50,6 +50,7 @@ struct AppState {
     bot_token: String,
     mpsc: mpsc::Sender<Task>,
     valid_recipes: HashMap<String, usize>,
+    flipped_language_mappings: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -121,11 +122,18 @@ async fn main() {
         .await
         .expect("Failed to fetch recipes");
 
+    let mut flipped_language_mappings = HashMap::new();
+    for (key, value) in recipe_data.language_mappings() {
+        let value = value.to_lowercase().replace(' ', "_");
+        flipped_language_mappings.insert(value, key);
+    }
+
     let state = Arc::new(AppState {
         client: Client::new(),
         bot_token: bot_token.clone(),
         mpsc: queue_input.clone(),
         valid_recipes: recipe_data.valid_recipes.clone(),
+        flipped_language_mappings: flipped_language_mappings.clone(),
     });
 
     let mcrecipes_state = Arc::new(AppState {
@@ -133,6 +141,7 @@ async fn main() {
         bot_token: mcrecipes_bot_token,
         mpsc: queue_input,
         valid_recipes: recipe_data.valid_recipes.clone(),
+        flipped_language_mappings,
     });
 
     tokio::spawn(async move {
@@ -301,8 +310,11 @@ async fn handle_command(
                     json!({"response_type": "ephemeral", "text": "You didn't enter a recipe!"}),
                 );
             }
-            let (is_recipe_valid, assumption_text, recipe) =
-                validate_recipe(payload.text, &state.valid_recipes);
+            let (is_recipe_valid, assumption_text, recipe) = validate_recipe(
+                &payload.text,
+                &state.valid_recipes,
+                &state.flipped_language_mappings,
+            );
             if is_recipe_valid {
                 match state.mpsc.try_send(Recipe {
                     item_name: recipe.clone(),
@@ -376,8 +388,11 @@ async fn handle_mcrecipes(
                     json!({"response_type": "ephemeral", "text": "You didn't enter a recipe!"}),
                 );
             }
-            let (is_recipe_valid, assumption_text, recipe) =
-                validate_recipe(cleaned_text, &state.valid_recipes);
+            let (is_recipe_valid, assumption_text, recipe) = validate_recipe(
+                &cleaned_text,
+                &state.valid_recipes,
+                &state.flipped_language_mappings,
+            );
             if is_recipe_valid {
                 match state.mpsc.try_send(Recipe {
                     item_name: recipe.clone(),

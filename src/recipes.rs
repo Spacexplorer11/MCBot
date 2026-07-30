@@ -64,11 +64,15 @@ impl RecipeResult {
             .expect("Result doesn't start with 'minecraft:'")
     }
 
-    fn get_pretty_item(&self) -> String {
-        self.id
-            .strip_prefix("minecraft:")
-            .expect("Result doesn't start with 'minecraft:'")
-            .replace("_", " ")
+    fn get_pretty_item(&self, language_mappings: &HashMap<String, String>) -> String {
+        language_mappings
+            .get(
+                self.id
+                    .strip_prefix("minecraft:")
+                    .expect("Result doesn't start with 'minecraft:'"),
+            )
+            .expect("Unable to find result in language mappings")
+            .to_string()
     }
 }
 
@@ -84,6 +88,10 @@ pub struct RecipeData {
 }
 
 impl RecipeData {
+    pub fn language_mappings(&self) -> HashMap<String, String> {
+        self.language_mappings.clone()
+    }
+
     #[tracing::instrument(name = "fetching_on_startup_pipeline", skip(self, client_jar_zip))]
     pub async fn fetch_recipes_and_more(
         &mut self,
@@ -440,7 +448,7 @@ impl RecipeData {
                 "text": format!(
                     "<@{}> Here's your {} recipe!\n{}",
                     ctx.user_id,
-                    result.get_pretty_item(),
+                    result.get_pretty_item(&self.language_mappings),
                     recipe_link
                 ),
                 "unfurl_links": true,
@@ -694,9 +702,9 @@ impl RecipeData {
         trace!("Completing the file upload (Step 3 of file upload)");
 
         let mut payload = json!({
-            "files": [{ "id": file_id, "title": format!("{} recipe", result.get_pretty_item()) }],
+            "files": [{ "id": file_id, "title": format!("{} recipe", result.get_pretty_item(&self.language_mappings)) }],
             "channel_id": ctx.channel_id,
-            "initial_comment": format!("<@{}> Here's your {} recipe!", ctx.user_id, result.get_pretty_item())
+            "initial_comment": format!("<@{}> Here's your *{}* recipe!", ctx.user_id, result.get_pretty_item(&self.language_mappings))
         });
 
         if let Some(thread_ts) = ctx.thread_ts {
@@ -743,10 +751,11 @@ impl RecipeData {
 }
 
 pub fn validate_recipe(
-    recipe: String,
+    recipe: &str,
     valid_recipes: &HashMap<String, usize>,
+    flipped_language_mappings: &HashMap<String, String>,
 ) -> (bool, String, String) {
-    let recipe = fix_recipe(&recipe);
+    let recipe = fix_recipe(recipe, flipped_language_mappings);
     if valid_recipes.contains_key(&recipe) {
         (true, "".to_string(), recipe)
     } else if let Some(closest_recipe) = fix_recipe_typo(valid_recipes, &recipe) {
@@ -778,7 +787,7 @@ fn fix_recipe_typo<'a>(
     closest_recipe
 }
 
-fn fix_recipe(recipe: &str) -> String {
+fn fix_recipe(recipe: &str, flipped_language_mappings: &HashMap<String, String>) -> String {
     let mut recipe = recipe;
     if recipe.starts_with(" ") {
         recipe = recipe.strip_prefix(" ").unwrap()
@@ -789,8 +798,15 @@ fn fix_recipe(recipe: &str) -> String {
     // Matches any whitespace (\s), dashes (\-), forward slashes (/), or backslashes (\\)
     let re = Regex::new(r"[\s\-/\\]+").unwrap();
 
-    re.replace_all(recipe.to_lowercase().as_str(), "_")
-        .into_owned()
+    let fixed_recipe = re
+        .replace_all(recipe.to_lowercase().as_str(), "_")
+        .into_owned();
+
+    if let Some(mapped_recipe) = flipped_language_mappings.get(&fixed_recipe) {
+        mapped_recipe.to_string()
+    } else {
+        fixed_recipe
+    }
 }
 
 #[tracing::instrument(name = "fetching_fallback_from_wiki_pipeline", skip(client))]
