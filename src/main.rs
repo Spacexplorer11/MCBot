@@ -68,6 +68,7 @@ struct AppState {
     mpsc: mpsc::Sender<Task>,
     valid_recipes: HashMap<String, usize>,
     sqlx_pool: sqlx::PgPool,
+    flipped_language_mappings: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -117,9 +118,10 @@ enum SlackInteraction {
     #[serde(rename = "block_actions")]
     BlockActions {
         user: SlackUser,
-        view: SlackView,
+        view: Option<SlackView>,
         actions: Vec<SlackActions>,
         trigger_id: String,
+        response_url: String,
     },
     #[serde(rename = "view_submission")]
     ViewSubmission { user: SlackUser, view: SlackView },
@@ -166,6 +168,12 @@ enum ActionId {
     SubsPageNext,
     #[serde(rename = "users_select")]
     UserSelect { selected_user: String },
+    #[serde(rename = "accept_subscription")]
+    AcceptSubscription { value: String },
+    #[serde(rename = "decline_subscription")]
+    DeclineSubscription { value: String },
+    #[serde(rename = "doesnt_play")]
+    DoesntPlay { value: String },
     #[serde(other)]
     Other,
 }
@@ -246,7 +254,7 @@ async fn main() {
     let sqlx_pool = sqlx::Pool::connect(&env::var("DATABASE_URL").expect("DATABASE_URL NOT FOUND"))
         .await
         .expect("Failed to connect to database");
-  
+
     let mut flipped_language_mappings = HashMap::new();
     for (key, value) in recipe_data.language_mappings() {
         let value = value.to_lowercase().replace(' ', "_");
@@ -259,7 +267,7 @@ async fn main() {
         mpsc: queue_input.clone(),
         valid_recipes: recipe_data.valid_recipes.clone(),
         sqlx_pool: sqlx_pool.clone(),
-        flipped_language_mappings: flipped_language_mappings.clone()
+        flipped_language_mappings: flipped_language_mappings.clone(),
     });
 
     let mcrecipes_state = Arc::new(MCRecipesAppState {
@@ -267,7 +275,7 @@ async fn main() {
         bot_token: mcrecipes_bot_token.into(),
         mpsc: queue_input,
         valid_recipes: recipe_data.valid_recipes.clone(),
-        flipped_language_mappings
+        flipped_language_mappings,
     });
 
     tokio::spawn(async move {
@@ -343,12 +351,13 @@ async fn main() {
                                     })
                                 };
                                 let mut response =
-                                    send_message(&polite_msg, &client, &bot_token).await;
+                                    legacy_send_message(&polite_msg, &client, &bot_token).await;
                                 if response.is_err() {
                                     for _ in 0..=3 {
                                         error!(error = ?response.err().unwrap(), "The generic error message failed to send to the user");
                                         response =
-                                            send_message(&polite_msg, &client, &bot_token).await;
+                                            legacy_send_message(&polite_msg, &client, &bot_token)
+                                                .await;
                                         if response.is_ok() {
                                             break;
                                         }
@@ -428,24 +437,17 @@ async fn main() {
 async fn handle_event(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SlackPayload>,
-) -> Json<Value> {
+) -> Response<Body> {
     trace!("Received an event at /slack/events");
     match payload {
         SlackPayload::UrlVerification { challenge } => {
             info!("Url Verification challenge received");
-            Json(json!({"challenge": challenge}))
+            Json(json!({"challenge": challenge})).into_response()
         }
 
         SlackPayload::EventCallback { event } => {
             trace!(event_type = event.event_type, "Received event");
-            match state.client.post("https://slack.com/api/chat.postMessage")
-                .bearer_auth(state.bot_token.clone())
-                .json(&json!({"channel": event.channel, "text": "Hi! I'm MCBot! :) \nUse /mcrecipe to get crafting recipes!", "thread_ts": event.ts}))
-                .send().await {
-                Ok(..) => (),
-                Err(e) => error!("Something went wrong with sending a message, {e}")
-            };
-            Json(json!({"ok":true}))
+            send_message(&json!({"channel": event.channel, "text": "Hi! I'm MCBot! :) \nUse /mcrecipe to get crafting recipes!", "thread_ts": event.ts}), &state.client, &state.bot_token).await
         }
     }
 }
@@ -564,91 +566,99 @@ async fn handle_interactions(
             mut view,
             actions,
             trigger_id,
+            response_url,
         } => {
             let actions = &actions[0];
             let private_metadata: Option<SubsPageMetadata>;
             let mut page: i64 = 0;
 
-            #[allow(clippy::single_match)]
-            match view.callback_id {
-                CallbackId::ConfigureSubsModal => {
-                    private_metadata = if let Some(private_metadata) = view.private_metadata {
-                        let priv_metadata: Result<SubsPageMetadata, serde_json::error::Error> =
-                            serde_json::from_str(&private_metadata);
-                        match priv_metadata {
-                            Ok(priv_metadata) => Some(priv_metadata),
+            if let Some(view) = &view {
+                #[allow(clippy::single_match)]
+                match view.callback_id {
+                    CallbackId::ConfigureSubsModal => {
+                        private_metadata = if let Some(private_metadata) = &view.private_metadata {
+                            let priv_metadata: Result<SubsPageMetadata, serde_json::error::Error> =
+                                serde_json::from_str(private_metadata);
+                            match priv_metadata {
+                                Ok(priv_metadata) => Some(priv_metadata),
+                                Err(e) => {
+                                    warn!(error = ?e, "Couldn't convert private_metadata to array so just returning None");
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        page = if let Some(pmd) = private_metadata {
+                            pmd.page
+                        } else {
+                            warn!("Private metadata not found, defaulting page value to 0");
+                            0
+                        }
+                    }
+                    _ => (),
+                };
+            }
+            match &actions.action_id {
+                ActionId::RemoveSubscription { value } => {
+                    if let Some(view) = view {
+                        let id = match value.parse::<i64>() {
+                            Ok(id) => id,
+                            Err(..) => {
+                                error!("Failed to parse id as i64 (id = {value})");
+                                return StatusCode::OK.into_response();
+                            }
+                        };
+                        match query!(
+                            "DELETE FROM subscriptions WHERE id = $1 and subscriber_id = $2",
+                            id,
+                            user.id
+                        )
+                        .execute(&state.sqlx_pool)
+                        .await
+                        {
+                            Ok(..) => {
+                                trace!("Successfully deleted row from database");
+                                let modal_view = match fetch_and_build_subs_modal_view(
+                                    &state.sqlx_pool,
+                                    page,
+                                    user.id,
+                                )
+                                .await
+                                {
+                                    Ok(json) => json,
+                                    Err(e) => {
+                                        error!(error = ?e, "Unable to build and fetch subs");
+                                        return StatusCode::OK.into_response();
+                                    }
+                                };
+                                let json = json!({
+                                    "hash": view.hash,
+                                    "view": modal_view,
+                                    "view_id": view.id
+                                });
+                                send_and_log_on_failure(
+                                    state
+                                        .client
+                                        .post("https://slack.com/api/views.update")
+                                        .bearer_auth(state.bot_token.clone())
+                                        .json(&json),
+                                    "Updating the view after a subscription was removed",
+                                )
+                                .await;
+                                StatusCode::OK.into_response()
+                            }
                             Err(e) => {
-                                warn!(error = ?e, "Couldn't convert private_metadata to array so just returning None");
-                                None
+                                error!(
+                                    "An error occurred when deleting a subscription from the database, error: {}",
+                                    e
+                                );
+                                StatusCode::OK.into_response()
                             }
                         }
                     } else {
-                        None
-                    };
-                    page = if let Some(pmd) = private_metadata {
-                        pmd.page
-                    } else {
-                        warn!("Private metadata not found, defaulting page value to 0");
-                        0
-                    }
-                }
-                _ => (),
-            };
-            match &actions.action_id {
-                ActionId::RemoveSubscription { value } => {
-                    let id = match value.parse::<i64>() {
-                        Ok(id) => id,
-                        Err(..) => {
-                            error!("Failed to parse id as i64 (id = {})", value);
-                            return StatusCode::OK.into_response();
-                        }
-                    };
-                    match query!(
-                        "DELETE FROM subscriptions WHERE id = $1 and subscriber_id = $2",
-                        id,
-                        user.id
-                    )
-                    .execute(&state.sqlx_pool)
-                    .await
-                    {
-                        Ok(..) => {
-                            trace!("Successfully deleted row from database");
-                            let modal_view = match fetch_and_build_subs_modal_view(
-                                &state.sqlx_pool,
-                                page,
-                                user.id,
-                            )
-                            .await
-                            {
-                                Ok(json) => json,
-                                Err(e) => {
-                                    error!(error = ?e, "Unable to build and fetch subs");
-                                    return StatusCode::OK.into_response();
-                                }
-                            };
-                            let json = json!({
-                                "hash": view.hash,
-                                "view": modal_view,
-                                "view_id": view.id
-                            });
-                            send_and_log_on_failure(
-                                state
-                                    .client
-                                    .post("https://slack.com/api/views.update")
-                                    .bearer_auth(state.bot_token.clone())
-                                    .json(&json),
-                                "Updating the view after a subscription was removed",
-                            )
-                            .await;
-                            StatusCode::OK.into_response()
-                        }
-                        Err(e) => {
-                            error!(
-                                "An error occurred when deleting a subscription from the database, error: {}",
-                                e
-                            );
-                            StatusCode::OK.into_response()
-                        }
+                        error!("View not found when required for removing a subscription");
+                        StatusCode::BAD_REQUEST.into_response()
                     }
                 }
                 /* TODO: Do all the other TODO's
@@ -656,6 +666,7 @@ async fn handle_interactions(
                  TODO: Add to database, accept/decline, and username if provided (might not be needed if in db already)
                  TODO: Send DM to subscriber that they accepted/declined
                  TODO: Patrol #minecraft-bridge and send DM's (hammer the index remember)
+                 TODO: Make the code better and use let Variant(x) = x else {} instead of if let Err(e) blah blah blah
                 */
                 ActionId::SubscribeNewPerson => {
                     let user_select_block = json!({
@@ -712,109 +723,221 @@ async fn handle_interactions(
                     StatusCode::OK.into_response()
                 }
                 ActionId::SubsPageNext | ActionId::SubsPagePrev => {
-                    match actions.action_id {
-                        ActionId::SubsPageNext => {
-                            page += 1;
+                    if let Some(view) = view {
+                        match actions.action_id {
+                            ActionId::SubsPageNext => {
+                                page += 1;
+                            }
+                            ActionId::SubsPagePrev => {
+                                page -= 1;
+                            }
+                            _ => unreachable!(),
                         }
-                        ActionId::SubsPagePrev => {
-                            page -= 1;
-                        }
-                        _ => (), // This is literally impossible anyway
+                        let modal_view =
+                            match fetch_and_build_subs_modal_view(&state.sqlx_pool, page, user.id)
+                                .await
+                            {
+                                Ok(json) => json,
+                                Err(e) => {
+                                    error!(error = ?e, "Unable to build and fetch subs");
+                                    return StatusCode::OK.into_response();
+                                }
+                            };
+                        let json = json!({
+                            "hash": view.hash,
+                            "view": modal_view,
+                            "view_id": view.id
+                        });
+                        send_and_log_on_failure(
+                            state
+                                .client
+                                .post("https://slack.com/api/views.update")
+                                .bearer_auth(state.bot_token.clone())
+                                .json(&json),
+                            "Updating the view after a page change",
+                        )
+                        .await;
+                        StatusCode::OK.into_response()
+                    } else {
+                        error!("View not found when required for changing the page");
+                        StatusCode::BAD_REQUEST.into_response()
                     }
-                    let modal_view = match fetch_and_build_subs_modal_view(
-                        &state.sqlx_pool,
-                        page,
-                        user.id,
-                    )
-                    .await
-                    {
-                        Ok(json) => json,
-                        Err(e) => {
-                            error!(error = ?e, "Unable to build and fetch subs");
-                            return StatusCode::OK.into_response();
-                        }
-                    };
-                    let json = json!({
-                        "hash": view.hash,
-                        "view": modal_view,
-                        "view_id": view.id
-                    });
-                    send_and_log_on_failure(
-                        state
-                            .client
-                            .post("https://slack.com/api/views.update")
-                            .bearer_auth(state.bot_token.clone())
-                            .json(&json),
-                        "Updating the view after a page change",
-                    )
-                    .await;
-                    StatusCode::OK.into_response()
                 }
                 ActionId::UserSelect { selected_user } => {
-                    let existing_subscription = query!(
+                    if let Some(view) = &mut view {
+                        let existing_subscription = query!(
                     "SELECT 1 as exists FROM subscriptions WHERE subscriber_id = $1 AND target_id = $2",
                     user.id,
                     selected_user
                     )
-                        .fetch_optional(&state.sqlx_pool)
+                            .fetch_optional(&state.sqlx_pool)
+                            .await;
+
+                        let existing_subscription = match existing_subscription {
+                            Ok(row) => row.is_some(),
+                            Err(e) => {
+                                error!("Failed to check for existing subscription: {e}");
+                                return StatusCode::OK.into_response();
+                            }
+                        };
+
+                        let alert_block = json!({
+                            "type": "alert",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "*Error*: You are already subscribed to this person",
+                                "verbatim": false
+                            },
+                            "level": "error"
+                        });
+
+                        let already_error_block_present = view
+                            .blocks
+                            .iter()
+                            .any(|v| v.get("type") == Some(&json!("alert")));
+
+                        if existing_subscription && !already_error_block_present {
+                            view.blocks.insert(0, alert_block);
+                        } else if !existing_subscription && already_error_block_present {
+                            view.blocks
+                                .retain(|v| v.get("type") != Some(&json!("alert")));
+                        }
+
+                        let json = json!({
+                            "view": {
+                                "type": "modal",
+                                "callback_id": "input_new_sub_user",
+                                "title": {
+                                    "type": "plain_text",
+                                    "text": "New Subscription",
+                                    "emoji": true
+                                },
+                                "submit": {
+                                    "type": "plain_text",
+                                    "text": "Confirm"
+                                },
+                                "blocks": view.blocks
+                            },
+                            "hash": view.hash,
+                            "view_id": view.id
+                        });
+
+                        send_and_log_on_failure(
+                            state
+                                .client
+                                .post("https://slack.com/api/views.update")
+                                .bearer_auth(state.bot_token.clone())
+                                .json(&json),
+                            "Updating the view after a user was selected",
+                        )
                         .await;
 
-                    let existing_subscription = match existing_subscription {
-                        Ok(row) => row.is_some(),
-                        Err(e) => {
-                            error!("Failed to check for existing subscription: {e}");
-                            return StatusCode::OK.into_response();
+                        StatusCode::OK.into_response()
+                    } else {
+                        error!("View not found when required for the user select block action");
+                        StatusCode::BAD_REQUEST.into_response()
+                    }
+                }
+                ActionId::AcceptSubscription { value } => StatusCode::OK.into_response(),
+                ActionId::DeclineSubscription { value } | ActionId::DoesntPlay { value } => {
+                    let dm_text: String;
+                    let completed_text: String;
+
+                    match &actions.action_id {
+                        ActionId::DeclineSubscription { value } => {
+                            dm_text = format!(
+                                "Unfortunately <@{}> has declined your request to track their join/leave updates for the hackclub minecraft server",
+                                user.id
+                            );
+                            completed_text = format!(
+                                "Successfully declined request to track join/leave updates for the hackclub minecraft server from <@{value}>"
+                            );
                         }
-                    };
+                        ActionId::DoesntPlay { value } => {
+                            dm_text = format!(
+                                "<@{}> has stated they do not play on the hackclub minecraft server, therefore your request to track their join/leave updates was declined automatically.",
+                                user.id
+                            );
+                            completed_text = format!(
+                                "Successfully notified <@{value}> that you do not play on the hackclub minecraft server"
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
 
-                    let alert_block = json!({
-                        "type": "alert",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": "*Error*: You are already subscribed to this person",
-                            "verbatim": false
-                        },
-                        "level": "error"
-                    });
-
-                    let already_error_block_present = view
-                        .blocks
-                        .iter()
-                        .any(|v| v.get("type") == Some(&json!("alert")));
-
-                    if existing_subscription && !already_error_block_present {
-                        view.blocks.insert(0, alert_block);
-                    } else if !existing_subscription && already_error_block_present {
-                        view.blocks
-                            .retain(|v| v.get("type") != Some(&json!("alert")));
+                    if let Err(e) = query!(
+                        "DELETE FROM subscriptions WHERE target_id = $1 AND subscriber_id = $2",
+                        user.id,
+                        value
+                    )
+                    .execute(&state.sqlx_pool)
+                    .await
+                    {
+                        error!(error=?e, "An error occurred when deleting a subscription row from the database where the target_id was {} and the subscriber_id was {value}", user.id);
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
 
                     let json = json!({
-                        "view": {
-                            "type": "modal",
-                            "callback_id": "input_new_sub_user",
-                            "title": {
-                                "type": "plain_text",
-                                "text": "New Subscription",
-                                "emoji": true
-                            },
-                            "submit": {
-                                "type": "plain_text",
-                                "text": "Confirm"
-                            },
-                            "blocks": view.blocks
-                        },
-                        "hash": view.hash,
-                        "view_id": view.id
+                        "users": value
                     });
+
+                    let Ok(response) = state
+                        .client
+                        .post("https://slack.com/api/conversations.open")
+                        .bearer_auth(state.bot_token.clone())
+                        .json(&json)
+                        .send()
+                        .await
+                    else {
+                        error!(
+                            "An error occurred when sending the request to open a conversation with user {value}"
+                        );
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    };
+
+                    let Ok(response_bytes) = response.bytes().await else {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    };
+
+                    let Ok(json): serde_json::error::Result<OpenConversationResponse> =
+                        serde_json::from_slice(&response_bytes)
+                    else {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    };
+                    if !json.ok {
+                        error!("Slack conversations.open API returned a non-OK response");
+                    }
+
+                    let dm_channel = json.channel.id;
+
+                    let json = json!({
+                        "text": dm_text,
+                        "channel": dm_channel
+                    });
+
+                    if send_and_log_on_failure_with_return(
+                        state
+                            .client
+                            .post("https://slack.com/api/chat.postMessage")
+                            .bearer_auth(state.bot_token.clone())
+                            .json(&json),
+                        "Sending the DM to reply with the decision of doesnt play or declination",
+                    )
+                    .await
+                    {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
 
                     send_and_log_on_failure(
                         state
                             .client
-                            .post("https://slack.com/api/views.update")
+                            .post(response_url)
                             .bearer_auth(state.bot_token.clone())
-                            .json(&json),
-                        "Updating the view after a user was selected",
+                            .json(&json!({
+                                "replace_original": true,
+                                "text": completed_text
+                            })),
+                        "Replacing the request DM with the completed message",
                     )
                     .await;
 
@@ -955,6 +1078,7 @@ async fn handle_interactions(
                                         error!(
                                             "Slack conversations.open API returned a non-OK response"
                                         );
+                                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                                     }
 
                                     let channel = json.channel.id;
@@ -1042,7 +1166,7 @@ async fn handle_interactions(
                                     } else {
                                         match res {
                                             Ok(response) => match response.text().await {
-                                                Ok(body) => debug!("Slack response body: {body}"),
+                                                Ok(..) => (),
                                                 Err(e) => {
                                                     error!(error = ?e, "Failed to read Slack response body")
                                                 }
@@ -1058,7 +1182,9 @@ async fn handle_interactions(
                             }
                         } else if let Err(e) = response {
                             error!(error=?e, "An error occurred opening a conversation with user {target_user_id}");
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                         }
+                        StatusCode::OK.into_response()
                     });
                 }
             }
@@ -1070,23 +1196,24 @@ async fn handle_interactions(
 async fn handle_mcrecipes(
     State(state): State<Arc<MCRecipesAppState>>,
     Json(payload): Json<SlackPayload>,
-) -> Json<Value> {
+) -> Response<Body> {
     trace!("Received an event at /slack/mcrecipes");
     match payload {
         SlackPayload::UrlVerification { challenge } => {
             info!("Url Verification challenge received for MCRecipes");
-            Json(json!({"challenge": challenge}))
+            Json(json!({"challenge": challenge})).into_response()
         }
 
         SlackPayload::EventCallback { event } => {
             let cleaned_text = match event.text.strip_prefix("<@U0A5X0FV9V4>") {
                 Some(str) => str.to_string(),
-                None => return Json(json!({})),
+                None => return StatusCode::OK.into_response(),
             };
             if cleaned_text.is_empty() || cleaned_text.eq(" ") {
                 return Json(
                     json!({"response_type": "ephemeral", "text": "You didn't enter a recipe!"}),
-                );
+                )
+                .into_response();
             }
             let (is_recipe_valid, assumption_text, recipe) = validate_recipe(
                 &cleaned_text,
@@ -1107,43 +1234,28 @@ async fn handle_mcrecipes(
                             "Started processing recipe for {} from {}",
                             recipe, event.user
                         );
-                        match send_message(
+                        send_message(
                             &json!({"channel": event.channel, "thread_ts": event.ts, "text": format!("This bot now uses <@U0B8ER7U1S5>'s backend for responses, as it has been replaced by it. You can also use /mcrecipe to get the recipe!\nGathering images and sewing 'em up, hang on a second! {assumption_text}")}),
                             &state.client,
                             &state.bot_token
-                        ).await {
-                            Ok(..) =>   Json(json!({"ok": true})),
-                            Err(e) => {error!("Error occurred sending message: {e}"); Json(json!({"ok": false}))}
-                        }
+                        ).await
                     }
                     Err(e) => {
                         error!("Error occurred sending task to generate image: {e}");
                         match e {
                             TrySendError::Full(..) => {
-                                match send_message(
+                                send_message(
                                     &json!({"channel": event.channel, "thread_ts": event.ts, "text": "Too many people have requested recipes at the moment. Please try again later."}),
                                     &state.client,
                                     &state.bot_token
-                                ).await {
-                                    Ok(..) => Json(json!({"ok": true})),
-                                    Err(e) => {
-                                        error!("Error occurred sending message: {e}");
-                                        Json(json!({"ok": false}))
-                                    }
-                                }
+                                ).await
                             },
                             _ => {
-                                match send_message(
+                                send_message(
                                     &json!({"channel": event.channel, "thread_ts": event.ts, "text": "An error occurred when trying to send the task to generate your image. Please try again!"}),
                                     &state.client,
                                     &state.bot_token
-                                ).await {
-                                    Ok(..) => Json(json!({"ok": true})),
-                                    Err(e) => {
-                                        error!("Error occurred sending message: {e}");
-                                        Json(json!({"ok": false}))
-                                    }
-                                }
+                                ).await
                             }
                         }
                     }
@@ -1153,14 +1265,11 @@ async fn handle_mcrecipes(
                     "User {} tried to get recipe {recipe} but it was invalid",
                     event.user
                 );
-                match send_message(
+                send_message(
                     &json!({"channel": event.channel, "thread_ts": event.ts, "text": "Sorry your recipe was invalid."}),
                     &state.client,
                     &state.bot_token
-                ).await {
-                    Ok(..) =>   Json(json!({"ok": true})),
-                    Err(e) => {error!("Error occurred sending message: {e}"); Json(json!({"ok": false}))}
-                }
+                ).await
             }
         }
     }
@@ -1170,7 +1279,6 @@ async fn uptime() -> Json<Value> {
     Json(json!({"ok": true}))
 }
 
-//noinspection RsUnresolvedPath (RustRover seems to not be able to find the new_from_slice function in scope so supressed)
 async fn verify_slack_signature(
     State(secret): State<Arc<String>>,
     request: Request,
@@ -1303,7 +1411,23 @@ async fn verify_slack_signature(
     }
 }
 
-async fn send_message(json: &Value, client: &Client, bot_token: &str) -> anyhow::Result<()> {
+async fn send_message(json: &Value, client: &Client, bot_token: &str) -> Response<Body> {
+    match client
+        .post("https://slack.com/api/chat.postMessage")
+        .bearer_auth(bot_token)
+        .json(json)
+        .send()
+        .await
+    {
+        Ok(..) => StatusCode::OK.into_response(),
+        Err(e) => {
+            error!("Error occurred sending message: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn legacy_send_message(json: &Value, client: &Client, bot_token: &str) -> anyhow::Result<()> {
     client
         .post("https://slack.com/api/chat.postMessage")
         .bearer_auth(bot_token)
@@ -1538,5 +1662,33 @@ async fn send_and_log_on_failure(request: reqwest::RequestBuilder, context: &str
             Err(e) => error!(context, error = ?e, "Failed to parse Slack response as JSON"),
         },
         Err(e) => error!(context, error = ?e, "Request to Slack failed"),
+    }
+}
+
+/// This does the exact same as [send_and_log_on_failure] but returns **true** if an error occurred which allows the caller to handle the error.
+async fn send_and_log_on_failure_with_return(
+    request: reqwest::RequestBuilder,
+    context: &str,
+) -> bool {
+    // error: yes/no
+    match request.send().await {
+        Ok(response) => match response.json::<Value>().await {
+            Ok(body) => {
+                if body.get("ok") != Some(&json!(true)) {
+                    error!(context, response = ?body, "Slack API call reported failure");
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(e) => {
+                error!(context, error = ?e, "Failed to parse Slack response as JSON");
+                true
+            }
+        },
+        Err(e) => {
+            error!(context, error = ?e, "Request to Slack failed");
+            true
+        }
     }
 }
