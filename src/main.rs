@@ -284,7 +284,7 @@ async fn handle_event(
             trace!(event_type = event.event_type, "Received event");
             match state.client.post("https://slack.com/api/chat.postMessage")
                 .bearer_auth(state.bot_token.clone())
-                .json(&json!({"channel": event.channel, "text": "Hi! I'm MCBot! :) \nUse /mcrecipe to get crafting recipes!", "thread_ts": event.ts}))
+                .json(&json!({"channel": event.channel, "text": "Hi! I'm MCBot, made by <@U08D22QNUVD>! :) \nUse /mcrecipe to get crafting recipes!", "thread_ts": event.ts}))
                 .send().await {
                 Ok(..) => (),
                 Err(e) => error!("Something went wrong with sending a message, {e}")
