@@ -447,7 +447,7 @@ async fn handle_event(
 
         SlackPayload::EventCallback { event } => {
             trace!(event_type = event.event_type, "Received event");
-            send_message(&json!({"channel": event.channel, "text": "Hi! I'm MCBot! :) \nUse /mcrecipe to get crafting recipes!", "thread_ts": event.ts}), &state.client, &state.bot_token).await
+            send_message(&json!({"channel": event.channel, "text": "Hi! I'm MCBot, made by <@U08D22QNUVD>! :) \nUse /mcrecipe to get crafting recipes!", "thread_ts": event.ts}), &state.client, &state.bot_token).await
         }
     }
 }
