@@ -76,6 +76,7 @@ struct MCRecipesAppState {
     bot_token: Arc<str>,
     mpsc: mpsc::Sender<Task>,
     valid_recipes: HashMap<String, usize>,
+    flipped_language_mappings: HashMap<String, String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -245,6 +246,12 @@ async fn main() {
     let sqlx_pool = sqlx::Pool::connect(&env::var("DATABASE_URL").expect("DATABASE_URL NOT FOUND"))
         .await
         .expect("Failed to connect to database");
+  
+    let mut flipped_language_mappings = HashMap::new();
+    for (key, value) in recipe_data.language_mappings() {
+        let value = value.to_lowercase().replace(' ', "_");
+        flipped_language_mappings.insert(value, key);
+    }
 
     let state = Arc::new(AppState {
         client: Client::new(),
@@ -252,6 +259,7 @@ async fn main() {
         mpsc: queue_input.clone(),
         valid_recipes: recipe_data.valid_recipes.clone(),
         sqlx_pool: sqlx_pool.clone(),
+        flipped_language_mappings: flipped_language_mappings.clone()
     });
 
     let mcrecipes_state = Arc::new(MCRecipesAppState {
@@ -259,6 +267,7 @@ async fn main() {
         bot_token: mcrecipes_bot_token.into(),
         mpsc: queue_input,
         valid_recipes: recipe_data.valid_recipes.clone(),
+        flipped_language_mappings
     });
 
     tokio::spawn(async move {
@@ -458,8 +467,11 @@ async fn handle_command(
                 )
                 .into_response();
             }
-            let (is_recipe_valid, assumption_text, recipe) =
-                validate_recipe(payload.text, &state.valid_recipes);
+            let (is_recipe_valid, assumption_text, recipe) = validate_recipe(
+                &payload.text,
+                &state.valid_recipes,
+                &state.flipped_language_mappings,
+            );
             if is_recipe_valid {
                 match state.mpsc.try_send(Recipe {
                     item_name: recipe.clone(),
@@ -1067,18 +1079,20 @@ async fn handle_mcrecipes(
         }
 
         SlackPayload::EventCallback { event } => {
-            let cleaned_text = event
-                .text
-                .strip_prefix("<@U0A5X0FV9V4>")
-                .unwrap()
-                .to_string();
+            let cleaned_text = match event.text.strip_prefix("<@U0A5X0FV9V4>") {
+                Some(str) => str.to_string(),
+                None => return Json(json!({})),
+            };
             if cleaned_text.is_empty() || cleaned_text.eq(" ") {
                 return Json(
                     json!({"response_type": "ephemeral", "text": "You didn't enter a recipe!"}),
                 );
             }
-            let (is_recipe_valid, assumption_text, recipe) =
-                validate_recipe(cleaned_text, &state.valid_recipes);
+            let (is_recipe_valid, assumption_text, recipe) = validate_recipe(
+                &cleaned_text,
+                &state.valid_recipes,
+                &state.flipped_language_mappings,
+            );
             if is_recipe_valid {
                 match state.mpsc.try_send(Recipe {
                     item_name: recipe.clone(),
