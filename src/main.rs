@@ -1645,11 +1645,13 @@ LIMIT 6 OFFSET $2",
         ));
     }
 
-    blocks.push(json!({
-        "type": "actions",
-        "block_id": "subs_pagination",
-        "elements": pagination_buttons
-    }));
+    if !pagination_buttons.is_empty() {
+        blocks.push(json!({
+            "type": "actions",
+            "block_id": "subs_pagination",
+            "elements": pagination_buttons
+        }));
+    }
     blocks.push(json!({
         "type": "divider"
     }));
