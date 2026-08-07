@@ -1,4 +1,4 @@
-name: Cross-Compile and Deploy to Pi Zero 2W
+name: Cross-Compile and Deploy to Pi 5
 
 on:
   push:
@@ -93,7 +93,7 @@ jobs:
     timeout-minutes: 10
     env:
       DEPLOY_USER: akaalroopsingh
-      DEPLOY_HOST: 100.66.120.48
+      DEPLOY_HOST: 100.76.77.1
       REMOTE_DIR: /home/akaalroopsingh/mcbot
       REMOTE_BIN: /home/akaalroopsingh/mcbot/mcbot
       REMOTE_TMP_BIN: /home/akaalroopsingh/mcbot/mcbot_new
