@@ -1390,66 +1390,66 @@ async fn send_request_dm(
 
     let blocks = json!([
     {
-    "type": "header",
-    "text": {
-    "type": "plain_text",
-    "text": "Request for Approval",
-    "emoji": true
-    }
+        "type": "header",
+        "text": {
+            "type": "plain_text",
+            "text": "Request for Approval",
+            "emoji": true
+        }
     },
     {
-    "type": "section",
-    "text": {
-    "type": "mrkdwn",
-    "text": format!("<@{}> wants to subscribe to your join/leave updates for the Hack Club Minecraft Server.", user.id)
-    }
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": format!("<@{}> wants to subscribe to your join/leave updates for the Hack Club Minecraft Server.", user.id)
+        }
     },
     {
-    "type": "actions",
-    "block_id": "approval_actions",
-    "elements": [
+        "type": "actions",
+        "block_id": "approval_actions",
+        "elements": [
+            {
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "Approve",
+                    "emoji": true
+                },
+                "style": "primary",
+                "action_id": "accept_subscription",
+                "value": user.id
+            },
+            {
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "Decline",
+                    "emoji": true
+                },
+                "style": "danger",
+                "action_id": "decline_subscription",
+                "value": user.id
+            },
+            {
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "I don't play",
+                    "emoji": true
+                },
+                "action_id": "doesnt_play",
+                "value": user.id
+            }
+        ]
+    },
     {
-    "type": "button",
-    "text": {
-    "type": "plain_text",
-    "text": "Approve",
-    "emoji": true
-    },
-    "style": "primary",
-    "action_id": "approve_subscription",
-    "value": user.id
-    },
-    {
-    "type": "button",
-    "text": {
-    "type": "plain_text",
-    "text": "Decline",
-    "emoji": true
-    },
-    "style": "danger",
-    "action_id": "decline_subscription",
-    "value": user.id
-    },
-    {
-    "type": "button",
-    "text": {
-    "type": "plain_text",
-    "text": "I don't play",
-    "emoji": true
-    },
-    "action_id": "doesnt_play",
-    "value": user.id
-    }
-    ]
-    },
-    {
-    "type": "context",
-    "elements": [
-    {
-    "type": "mrkdwn",
-    "text": "They will be notified of your decision."
-    }
-    ]
+        "type": "context",
+        "elements": [
+            {
+            "type": "mrkdwn",
+            "text": "They will be notified of your decision."
+            }
+        ]
     }
     ]);
 
