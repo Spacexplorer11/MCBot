@@ -29,6 +29,7 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{query, query_as};
+use std::time::Duration;
 use std::{collections::HashMap, env, sync::Arc};
 use tokio::{
     net::TcpListener,
@@ -1053,138 +1054,50 @@ async fn handle_interactions(
                     let target_user_id = target_user_id.clone();
 
                     tokio::spawn(async move {
-                        let json = json!({
-                            "users": target_user_id
-                        });
-
-                        let response = state
-                            .client
-                            .post("https://slack.com/api/conversations.open")
-                            .bearer_auth(state.bot_token.clone())
-                            .json(&json)
-                            .send()
-                            .await;
-
-                        if let Ok(response) = response {
-                            trace!("Opened conversation with user {target_user_id}");
-
-                            let response_bytes = response.bytes().await;
-
-                            if let Ok(response_bytes) = response_bytes {
-                                let json: serde_json::error::Result<OpenConversationResponse> =
-                                    serde_json::from_slice(&response_bytes);
-                                if let Ok(json) = json {
-                                    if !json.ok {
-                                        error!(
-                                            "Slack conversations.open API returned a non-OK response"
-                                        );
-                                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                                    }
-
-                                    let channel = json.channel.id;
-
-                                    let blocks = json!([
-                                        {
-                                            "type": "header",
-                                            "text": {
-                                                "type": "plain_text",
-                                                "text": "Request for Approval",
-                                                "emoji": true
-                                            }
-                                        },
-                                        {
-                                            "type": "section",
-                                            "text": {
-                                                "type": "mrkdwn",
-                                                "text": format!("<@{}> wants to subscribe to your join/leave updates for the Hack Club Minecraft Server.", user.id)
-                                            }
-                                        },
-                                        {
-                                            "type": "actions",
-                                            "block_id": "approval_actions",
-                                            "elements": [
-                                                {
-                                                    "type": "button",
-                                                    "text": {
-                                                        "type": "plain_text",
-                                                        "text": "Approve",
-                                                        "emoji": true
-                                                    },
-                                                    "style": "primary",
-                                                    "action_id": "approve_subscription",
-                                                    "value": user.id
-                                                },
-                                                {
-                                                    "type": "button",
-                                                    "text": {
-                                                        "type": "plain_text",
-                                                        "text": "Decline",
-                                                        "emoji": true
-                                                    },
-                                                    "style": "danger",
-                                                    "action_id": "decline_subscription",
-                                                    "value": user.id
-                                                },
-                                                {
-                                                    "type": "button",
-                                                    "text": {
-                                                        "type": "plain_text",
-                                                        "text": "I don't play",
-                                                        "emoji": true
-                                                    },
-                                                    "action_id": "doesnt_play",
-                                                    "value": user.id
-                                                }
-                                            ]
-                                        },
-                                        {
-                                            "type": "context",
-                                            "elements": [
-                                                {
-                                                    "type": "mrkdwn",
-                                                    "text": "They will be notified of your decision."
-                                                }
-                                            ]
-                                        }
-                                    ]);
-
-                                    let message = json!({
-                                        "channel": channel,
-                                        "blocks": blocks
-                                    });
-
-                                    let res = state
-                                        .client
-                                        .post("https://slack.com/api/chat.postMessage")
-                                        .bearer_auth(state.bot_token.clone())
-                                        .json(&message)
-                                        .send()
-                                        .await;
-
-                                    if let Err(e) = res {
-                                        error!(error=?e, "An error occurred sending a message to the newly opened DM with {target_user_id}");
-                                    } else {
-                                        match res {
-                                            Ok(response) => match response.text().await {
-                                                Ok(..) => (),
-                                                Err(e) => {
-                                                    error!(error = ?e, "Failed to read Slack response body")
-                                                }
-                                            },
-                                            Err(e) => error!(error = ?e, "Request to Slack failed"),
-                                        }
-                                    }
-                                } else if let Err(e) = json {
-                                    error!(
-                                        "Failed to parse response from slack for conversations.open: {e}"
-                                    );
+                        let mut last_err = None;
+                        for attempt in 1..=5 {
+                            match send_request_dm(
+                                &state.client,
+                                &state.bot_token,
+                                &target_user_id,
+                                &user,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    debug!("Request DM delivered on attempt {attempt}");
+                                    return;
+                                }
+                                Err(e) => {
+                                    warn!(attempt, error = ?e, "Request DM failed, retrying");
+                                    last_err = Some(e);
+                                    tokio::time::sleep(Duration::from_secs(attempt)).await;
                                 }
                             }
-                        } else if let Err(e) = response {
-                            error!(error=?e, "An error occurred opening a conversation with user {target_user_id}");
-                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                         }
-                        StatusCode::OK.into_response()
+                        // All retries exhausted — roll back the row so the user can retry
+                        error!(
+                            subscriber_id = %user.id,
+                            target_id = %target_user_id,
+                            error = ?last_err,
+                            "Approval DM failed after 5 attempts; removing subscription row for retry"
+                        );
+                        if let Err(e) = query!(
+                            "DELETE FROM subscriptions WHERE subscriber_id = $1 AND target_id = $2",
+                            user.id,
+                            target_user_id
+                        )
+                        .execute(&state.sqlx_pool)
+                        .await
+                        {
+                            // Worst case: stuck row. Log everything needed to clean up manually.
+                            error!(
+                                subscriber_id = %user.id,
+                                target_id = %target_user_id,
+                                error = ?e,
+                                "MANUAL CLEANUP NEEDED: failed to remove stuck subscription row"
+                            );
+                        }
                     });
                 }
             }
@@ -1435,6 +1348,140 @@ async fn legacy_send_message(json: &Value, client: &Client, bot_token: &str) -> 
         .send()
         .await?;
     Ok(())
+}
+
+async fn send_request_dm(
+    client: &Client,
+    bot_token: &str,
+    target_user_id: &str,
+    user: &SlackUser,
+) -> Response {
+    let json = json!({
+    "users": target_user_id
+    });
+
+    let response = client
+        .post("https://slack.com/api/conversations.open")
+        .bearer_auth(bot_token)
+        .json(&json)
+        .send()
+        .await;
+
+    if let Ok(response) = response {
+        trace!("Opened conversation with user {target_user_id}");
+
+        let response_bytes = response.bytes().await;
+
+        if let Ok(response_bytes) = response_bytes {
+            let json: serde_json::error::Result<OpenConversationResponse> =
+                serde_json::from_slice(&response_bytes);
+            if let Ok(json) = json {
+                if !json.ok {
+                    error!("Slack conversations.open API returned a non-OK response");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+
+                let channel = json.channel.id;
+
+                let blocks = json!([
+                {
+                "type": "header",
+                "text": {
+                "type": "plain_text",
+                "text": "Request for Approval",
+                "emoji": true
+                }
+                },
+                {
+                "type": "section",
+                "text": {
+                "type": "mrkdwn",
+                "text": format!("<@{}> wants to subscribe to your join/leave updates for the Hack Club Minecraft Server.", user.id)
+                }
+                },
+                {
+                "type": "actions",
+                "block_id": "approval_actions",
+                "elements": [
+                {
+                "type": "button",
+                "text": {
+                "type": "plain_text",
+                "text": "Approve",
+                "emoji": true
+                },
+                "style": "primary",
+                "action_id": "approve_subscription",
+                "value": user.id
+                },
+                {
+                "type": "button",
+                "text": {
+                "type": "plain_text",
+                "text": "Decline",
+                "emoji": true
+                },
+                "style": "danger",
+                "action_id": "decline_subscription",
+                "value": user.id
+                },
+                {
+                "type": "button",
+                "text": {
+                "type": "plain_text",
+                "text": "I don't play",
+                "emoji": true
+                },
+                "action_id": "doesnt_play",
+                "value": user.id
+                }
+                ]
+                },
+                {
+                "type": "context",
+                "elements": [
+                {
+                "type": "mrkdwn",
+                "text": "They will be notified of your decision."
+                }
+                ]
+                }
+                ]);
+
+                let message = json!({
+                "channel": channel,
+                "blocks": blocks
+                });
+
+                let res = client
+                    .post("https://slack.com/api/chat.postMessage")
+                    .bearer_auth(bot_token)
+                    .json(&message)
+                    .send()
+                    .await;
+
+                if let Err(e) = res {
+                    error!(error=?e, "An error occurred sending a message to the newly opened DM with {target_user_id}");
+                } else {
+                    match res {
+                        Ok(response) => match response.text().await {
+                            Ok(..) => (),
+                            Err(e) => {
+                                error!(error = ?e, "Failed to read Slack response body")
+                            }
+                        },
+                        Err(e) => error!(error = ?e, "Request to Slack failed"),
+                    }
+                }
+            } else if let Err(e) = json {
+                error!("Failed to parse response from slack for conversations.open: {e}");
+            }
+        }
+    } else if let Err(e) = response {
+        error!(error=?e, "An error occurred opening a conversation with user {target_user_id}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    StatusCode::OK.into_response()
 }
 
 async fn fetch_and_build_subs_modal_view(
