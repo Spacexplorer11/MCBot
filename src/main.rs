@@ -173,8 +173,6 @@ enum ActionId {
     AcceptSubscription { value: String },
     #[serde(rename = "decline_subscription")]
     DeclineSubscription { value: String },
-    #[serde(rename = "doesnt_play")]
-    DoesntPlay { value: String },
     #[serde(other)]
     Other,
 }
@@ -380,7 +378,6 @@ async fn main() {
                         Err(e) => {
                             error!(error = ?e, "An error occurred fetching and building the modal view");
                             continue;
-                            // TODO: Tell the user somehow?
                         }
                     };
 
@@ -662,10 +659,9 @@ async fn handle_interactions(
                         StatusCode::BAD_REQUEST.into_response()
                     }
                 }
-                /* TODO: Do all the other TODO's
-                 TODO: Verify the entered mc_username exists and is a valid one (Mojang API) and say only Java names supported at the moment
-                 TODO: Add to database, accept/decline, and username if provided (might not be needed if in db already)
-                 TODO: Send DM to subscriber that they accepted/declined
+                /*
+                 TODO: Add to database on request
+                 TODO: Send DM to subscriber that they accepted
                  TODO: Patrol #minecraft-bridge and send DM's (hammer the index remember)
                  TODO: Make the code better and use let Variant(x) = x else {} instead of if let Err(e) blah blah blah
                 */
@@ -840,31 +836,14 @@ async fn handle_interactions(
                     }
                 }
                 ActionId::AcceptSubscription { value } => StatusCode::OK.into_response(),
-                ActionId::DeclineSubscription { value } | ActionId::DoesntPlay { value } => {
-                    let dm_text: String;
-                    let completed_text: String;
-
-                    match &actions.action_id {
-                        ActionId::DeclineSubscription { value } => {
-                            dm_text = format!(
-                                "Unfortunately <@{}> has declined your request to track their join/leave updates for the hackclub minecraft server",
-                                user.id
-                            );
-                            completed_text = format!(
-                                "Successfully declined request to track join/leave updates for the hackclub minecraft server from <@{value}>"
-                            );
-                        }
-                        ActionId::DoesntPlay { value } => {
-                            dm_text = format!(
-                                "<@{}> has stated they do not play on the hackclub minecraft server, therefore your request to track their join/leave updates was declined automatically.",
-                                user.id
-                            );
-                            completed_text = format!(
-                                "Successfully notified <@{value}> that you do not play on the hackclub minecraft server"
-                            );
-                        }
-                        _ => unreachable!(),
-                    }
+                ActionId::DeclineSubscription { value } => {
+                    let dm_text = format!(
+                        "Unfortunately <@{}> has declined your request to track their join/leave updates for the hackclub minecraft server",
+                        user.id
+                    );
+                    let completed_text = format!(
+                        "Successfully declined request to track join/leave updates for the hackclub minecraft server from <@{value}>"
+                    );
 
                     if let Err(e) = query!(
                         "DELETE FROM subscriptions WHERE target_id = $1 AND subscriber_id = $2",
@@ -922,7 +901,7 @@ async fn handle_interactions(
                             .post("https://slack.com/api/chat.postMessage")
                             .bearer_auth(state.bot_token.clone())
                             .json(&json),
-                        "Sending the DM to reply with the decision of doesnt play or declination",
+                        "Sending the DM to reply with the decision of declination",
                     )
                     .await
                     {
@@ -1428,16 +1407,6 @@ async fn send_request_dm(
                 },
                 "style": "danger",
                 "action_id": "decline_subscription",
-                "value": user.id
-            },
-            {
-                "type": "button",
-                "text": {
-                    "type": "plain_text",
-                    "text": "I don't play",
-                    "emoji": true
-                },
-                "action_id": "doesnt_play",
                 "value": user.id
             }
         ]
