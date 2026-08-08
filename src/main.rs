@@ -169,8 +169,8 @@ enum ActionId {
     SubsPageNext,
     #[serde(rename = "users_select")]
     UserSelect { selected_user: String },
-    #[serde(rename = "accept_subscription")]
-    AcceptSubscription { value: String },
+    #[serde(rename = "approve_subscription")]
+    ApproveSubscription { value: String },
     #[serde(rename = "decline_subscription")]
     DeclineSubscription { value: String },
     #[serde(other)]
@@ -835,26 +835,55 @@ async fn handle_interactions(
                         StatusCode::BAD_REQUEST.into_response()
                     }
                 }
-                ActionId::AcceptSubscription { value } => StatusCode::OK.into_response(),
-                ActionId::DeclineSubscription { value } => {
-                    let dm_text = format!(
-                        "Unfortunately <@{}> has declined your request to track their join/leave updates for the hackclub minecraft server",
-                        user.id
-                    );
-                    let completed_text = format!(
-                        "Successfully declined request to track join/leave updates for the hackclub minecraft server from <@{value}>"
-                    );
+                ActionId::DeclineSubscription { value }
+                | ActionId::ApproveSubscription { value } => {
+                    let dm_text: String;
+                    let completed_text: String;
 
-                    if let Err(e) = query!(
+                    match &actions.action_id {
+                        ActionId::DeclineSubscription { value } => {
+                            dm_text = format!(
+                                "Unfortunately <@{}> has declined your request to track their join/leave updates for the hackclub minecraft server",
+                                user.id
+                            );
+                            completed_text = format!(
+                                "Successfully declined request to track join/leave updates for the hackclub minecraft server from <@{value}>"
+                            );
+
+                            if let Err(e) = query!(
                         "DELETE FROM subscriptions WHERE target_id = $1 AND subscriber_id = $2",
                         user.id,
                         value
                     )
-                    .execute(&state.sqlx_pool)
-                    .await
-                    {
-                        error!(error=?e, "An error occurred when deleting a subscription row from the database where the target_id was {} and the subscriber_id was {value}", user.id);
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                                .execute(&state.sqlx_pool)
+                                .await
+                            {
+                                error!(error=?e, "An error occurred when deleting a subscription row from the database where the target_id was {} and the subscriber_id was {value}", user.id);
+                                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                            }
+                        }
+                        ActionId::ApproveSubscription { value } => {
+                            dm_text = format!(
+                                "<@{}> has approved your request to track their join/leave updates on the hackclub minecraft server. You will begin receiving updates when they next join/leave the server.",
+                                user.id
+                            );
+                            completed_text = format!(
+                                "Successfully notified <@{value}> that you have approved their request!"
+                            );
+
+                            if let Err(e) = query!(
+                        "UPDATE subscriptions SET active = true WHERE target_id = $1 AND subscriber_id = $2",
+                        user.id,
+                        value
+                    )
+                                .execute(&state.sqlx_pool)
+                                .await
+                            {
+                                error!(error=?e, "An error occurred when setting a subscription to active from the database where the target_id was {} and the subscriber_id was {value}", user.id);
+                                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                            }
+                        }
+                        _ => unreachable!(),
                     }
 
                     let json = json!({
@@ -901,7 +930,7 @@ async fn handle_interactions(
                             .post("https://slack.com/api/chat.postMessage")
                             .bearer_auth(state.bot_token.clone())
                             .json(&json),
-                        "Sending the DM to reply with the decision of declination",
+                        "Sending the DM to reply with the decision",
                     )
                     .await
                     {
@@ -1395,7 +1424,7 @@ async fn send_request_dm(
                     "emoji": true
                 },
                 "style": "primary",
-                "action_id": "accept_subscription",
+                "action_id": "approve_subscription",
                 "value": user.id
             },
             {
@@ -1574,7 +1603,7 @@ LIMIT 6 OFFSET $2",
                 "elements": [
                 {
                     "type": "mrkdwn",
-                    "text": ":large_yellow_circle: Pending acceptance"
+                    "text": ":large_yellow_circle: Pending approval"
                 }
                 ]
             }))
