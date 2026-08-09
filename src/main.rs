@@ -59,7 +59,7 @@ struct Subscription {
     id: i64,
     target_id: String,
     active: bool,
-    mc_username: Option<String>,
+    mc_usernames: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -1492,7 +1492,7 @@ async fn fetch_and_build_subs_modal_view(
 ) -> anyhow::Result<Value> {
     let subs = match query_as!(
         Subscription,
-        "SELECT s.id, s.active, s.target_id, u.mc_username
+        "SELECT s.id, s.active, s.target_id, u.mc_usernames
 FROM subscriptions AS s
 JOIN users AS u ON s.target_id = u.slack_id
 WHERE s.subscriber_id = $1
@@ -1545,10 +1545,27 @@ LIMIT 6 OFFSET $2",
     }));
 
     for subscription in &subs[..subs.len().min(6)] {
-        let title = if let Some(mc_user) = &subscription.mc_username {
-            format!("<@{}> *({})*", subscription.target_id, mc_user)
+        let len = subscription.mc_usernames.len();
+        let title = if len > 1 {
+            let mut mcusers = String::new();
+
+            let i = 1;
+
+            for mcuser in &subscription.mc_usernames {
+                if i != len {
+                    let mcuser = format!("{mcuser}, ");
+                    mcusers.push_str(&mcuser)
+                } else {
+                    mcusers.push_str(mcuser)
+                }
+            }
+
+            format!("<@{}> *({})*", subscription.target_id, mcusers)
         } else {
-            format!("<@{}>", subscription.target_id)
+            format!(
+                "<@{}> *({})*",
+                subscription.target_id, subscription.mc_usernames[0]
+            )
         };
         blocks.push(json!({
             "type": "section",
