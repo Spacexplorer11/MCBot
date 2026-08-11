@@ -131,6 +131,7 @@ pub fn initialise_logging() {
         .with(tracing_subscriber::fmt::layer())
         .with(telemetry_layer)
         .with(filter)
+        .with(sentry::integrations::tracing::layer())
         .with(HttpLogger {
             client: client.clone(),
             url: logs_url,

@@ -26,15 +26,17 @@ use chrono::Utc;
 use dotenvy::dotenv;
 use hmac::{KeyInit, Mac};
 use reqwest::{Client, StatusCode};
+use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{query, query_as};
 use std::time::Duration;
-use std::{collections::HashMap, env, sync::Arc};
+use std::{collections::HashMap, env, io, sync::Arc};
 use tokio::{
     net::TcpListener,
     sync::{mpsc, mpsc::error::TrySendError},
 };
+use tower::ServiceBuilder;
 use tracing::{debug, error, info, trace, warn};
 
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
@@ -219,221 +221,328 @@ pub struct SlackMessageContext<'a> {
     thread_ts: Option<&'a str>,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() -> io::Result<()> {
     trace!("Loading .env");
+
     if dotenv().is_err() {
         warn!(".env file NOT LOADED");
     }
 
+    let sentry_url = env::var("SENTRY_URL").expect("SENTRY URL NOT FOUND");
+
+    // Sentry MUST be initialised before the Tokio runtime starts.
+    let _guard = sentry::init(
+        sentry::ClientOptions::new()
+            .dsn(&sentry_url)
+            .maybe_release(sentry::release_name!())
+            .send_default_pii(true)
+            .enable_logs(true)
+            .enable_metrics(true)
+            .traces_sample_rate(1.0)
+            .auto_session_tracking(true)
+            .session_mode(sentry::SessionMode::Request),
+    );
+
     debug!("Initialising logging");
     initialise_logging();
 
-    let client = Client::new();
-
-    let bot_token = env::var("SLACK_BOT_TOKEN").expect("MCBot Bot Token NOT FOUND");
-    let mcrecipes_bot_token =
-        env::var("SLACK_BOT_TOKEN_MCRECIPES").expect("MCRecipes Bot Token NOT FOUND");
-
-    let signing_secret =
-        Arc::new(env::var("SLACK_SIGNING_SECRET").expect("MCBot Signing Secret NOT FOUND"));
-    let mcrecipes_signing_secret = Arc::new(
-        env::var("SLACK_SIGNING_SECRET_MCRECIPES").expect("MCRecipes Bot Token NOT FOUND"),
-    );
-
-    let hackclub_api_key = env::var("HACKCLUB_API_KEY").expect("HACKCLUB API KEY NOT FOUND");
-
-    let (queue_input, mut queue_output) = mpsc::channel::<Task>(128);
-
-    let mut client_jar_zip = fetch_client_jar(&client).await;
-    let mut recipe_data = RecipeData::default();
-    info!("Now adding recipes, items & tags to memory");
-    recipe_data
-        .fetch_recipes_and_more(&mut client_jar_zip)
-        .await
-        .expect("Failed to fetch recipes");
-
-    let sqlx_pool = sqlx::Pool::connect(&env::var("DATABASE_URL").expect("DATABASE_URL NOT FOUND"))
-        .await
-        .expect("Failed to connect to database");
-
-    let mut flipped_language_mappings = HashMap::new();
-    for (key, value) in recipe_data.language_mappings() {
-        let value = value.to_lowercase().replace(' ', "_");
-        flipped_language_mappings.insert(value, key);
-    }
-
-    let state = Arc::new(AppState {
-        client: Client::new(),
-        bot_token: bot_token.into(),
-        mpsc: queue_input.clone(),
-        valid_recipes: recipe_data.valid_recipes.clone(),
-        sqlx_pool: sqlx_pool.clone(),
-        flipped_language_mappings: flipped_language_mappings.clone(),
-        hackclub_api_key: hackclub_api_key.into(),
-    });
-
-    let mcrecipes_state = Arc::new(MCRecipesAppState {
-        client: Client::new(),
-        bot_token: mcrecipes_bot_token.into(),
-        mpsc: queue_input,
-        valid_recipes: recipe_data.valid_recipes.clone(),
-        flipped_language_mappings,
-    });
-
-    tokio::spawn(async move {
-        while let Some(task) = queue_output.recv().await {
-            trace!("Received task in async thread");
-            match task {
-                Recipe {
-                    item_name,
-                    response_url,
-                    channel_id,
-                    user_id,
-                    thread_ts,
-                    bot_token,
-                } => {
-                    let ctx = SlackMessageContext {
-                        client: &client,
-                        bot_token: &bot_token,
-                        channel_id: &channel_id,
-                        user_id: &user_id,
-                        thread_ts: thread_ts.as_deref(),
-                    };
-                    match recipe_data
-                        .process_recipe(item_name.as_str(), ctx, &mut client_jar_zip)
-                        .await
-                    {
-                        Ok(..) => debug!("Recipe successfully processed"),
-                        Err(e) => {
-                            error!(error = ?e, "Failed to fulfill recipe task processing pipeline");
-
-                            if let Some(response_url) = response_url {
-                                let polite_msg = if e
-                                    .to_string()
-                                    .eq("Unable to convert the json to MCRecipe type")
-                                {
-                                    json!({
-                                        "response_type": "ephemeral",
-                                        "text": "Uh oh, that type of recipe isn't supported! This bot currently only supports crafting recipes. If that was supposed to work, please contact @Akaalroop or email akaal@akaalroop.com"
-                                    })
-                                } else {
-                                    json!({
-                                        "response_type": "ephemeral",
-                                        "text": format!("Uh oh, something went wrong! Please try again! If this persists, please contact @Akaalroop on slack or email akaal@akaalroop.com. Error: {e}")
-                                    })
-                                };
-                                let mut response =
-                                    client.post(&response_url).json(&polite_msg).send().await;
-                                if response.is_err() {
-                                    for _ in 0..=3 {
-                                        error!(error = ?response.err().unwrap(), "The generic error message failed to send to the user");
-                                        response = client
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let client = Client::new();
+            
+            let bot_token =
+                env::var("SLACK_BOT_TOKEN").expect("MCBot Bot Token NOT FOUND");
+            
+            let mcrecipes_bot_token = env::var("SLACK_BOT_TOKEN_MCRECIPES")
+                .expect("MCRecipes Bot Token NOT FOUND");
+            
+            let signing_secret = Arc::new(
+                env::var("SLACK_SIGNING_SECRET")
+                    .expect("MCBot Signing Secret NOT FOUND"),
+            );
+            
+            let mcrecipes_signing_secret = Arc::new(
+                env::var("SLACK_SIGNING_SECRET_MCRECIPES")
+                    .expect("MCRecipes Bot Token NOT FOUND"),
+            );
+            
+            let hackclub_api_key =
+                env::var("HACKCLUB_API_KEY").expect("HACKCLUB API KEY NOT FOUND");
+            
+            let (queue_input, mut queue_output) = mpsc::channel::<Task>(128);
+            
+            let mut client_jar_zip = fetch_client_jar(&client).await;
+            let mut recipe_data = RecipeData::default();
+            
+            info!("Now adding recipes, items & tags to memory");
+            
+            recipe_data
+                .fetch_recipes_and_more(&mut client_jar_zip)
+                .await
+                .expect("Failed to fetch recipes");
+            
+            let sqlx_pool = sqlx::Pool::connect(
+                &env::var("DATABASE_URL").expect("DATABASE_URL NOT FOUND"),
+            )
+                .await
+                .expect("Failed to connect to database");
+            
+            let mut flipped_language_mappings = HashMap::new();
+            
+            for (key, value) in recipe_data.language_mappings() {
+                let value = value.to_lowercase().replace(' ', "_");
+                flipped_language_mappings.insert(value, key);
+            }
+            
+            let state = Arc::new(AppState {
+                client: Client::new(),
+                bot_token: bot_token.into(),
+                mpsc: queue_input.clone(),
+                valid_recipes: recipe_data.valid_recipes.clone(),
+                sqlx_pool: sqlx_pool.clone(),
+                flipped_language_mappings: flipped_language_mappings.clone(),
+                hackclub_api_key: hackclub_api_key.into(),
+            });
+            
+            let mcrecipes_state = Arc::new(MCRecipesAppState {
+                client: Client::new(),
+                bot_token: mcrecipes_bot_token.into(),
+                mpsc: queue_input,
+                valid_recipes: recipe_data.valid_recipes.clone(),
+                flipped_language_mappings,
+            });
+            
+            tokio::spawn(async move {
+                while let Some(task) = queue_output.recv().await {
+                    trace!("Received task in async thread");
+                    
+                    match task {
+                        Recipe {
+                            item_name,
+                            response_url,
+                            channel_id,
+                            user_id,
+                            thread_ts,
+                            bot_token,
+                        } => {
+                            let ctx = SlackMessageContext {
+                                client: &client,
+                                bot_token: &bot_token,
+                                channel_id: &channel_id,
+                                user_id: &user_id,
+                                thread_ts: thread_ts.as_deref(),
+                            };
+                            
+                            match recipe_data
+                                .process_recipe(
+                                    item_name.as_str(),
+                                    ctx,
+                                    &mut client_jar_zip,
+                                )
+                                .await
+                            {
+                                Ok(..) => {
+                                    debug!("Recipe successfully processed");
+                                }
+                                
+                                Err(e) => {
+                                    error!(
+                                        error = ?e,
+                                        "Failed to fulfil recipe task processing pipeline"
+                                    );
+                                    
+                                    if let Some(response_url) = response_url {
+                                        let polite_msg = if e
+                                            .to_string()
+                                            .eq("Unable to convert the json to MCRecipe type")
+                                        {
+                                            json!({
+                                                "response_type": "ephemeral",
+                                                "text": "Uh oh, that type of recipe isn't supported! This bot currently only supports crafting recipes. If that was supposed to work, please contact @Akaalroop or email akaal@akaalroop.com"
+                                            })
+                                        } else {
+                                            json!({
+                                                "response_type": "ephemeral",
+                                                "text": format!(
+                                                    "Uh oh, something went wrong! Please try again! If this persists, please contact @Akaalroop on Slack or email akaal@akaalroop.com. Error: {e}"
+                                                )
+                                            })
+                                        };
+                                        
+                                        let mut response = client
                                             .post(&response_url)
                                             .json(&polite_msg)
                                             .send()
                                             .await;
-                                        if response.is_ok() {
-                                            break;
+                                        
+                                        if response.is_err() {
+                                            for _ in 0..=3 {
+                                                error!(
+                                                    error = ?response.err().unwrap(),
+                                                    "The generic error message failed to send to the user"
+                                                );
+                                                
+                                                response = client
+                                                    .post(&response_url)
+                                                    .json(&polite_msg)
+                                                    .send()
+                                                    .await;
+                                                
+                                                if response.is_ok() {
+                                                    break;
+                                                }
+                                            }
                                         }
-                                    }
-                                }
-                            } else if let Some(thread_ts) = thread_ts {
-                                let polite_msg = if e
-                                    .to_string()
-                                    .eq("Unable to convert the json to MCRecipe type")
-                                {
-                                    json!({
-                                        "channel": channel_id, "thread_ts": thread_ts,
-                                        "text": "Uh oh, that type of recipe isn't supported! This bot currently only supports crafting recipes. If that was supposed to work, please contact @Akaalroop or email akaal@akaalroop.com"
-                                    })
-                                } else {
-                                    json!({
-                                        "channel": channel_id, "thread_ts": thread_ts,
-                                        "text": format!("Uh oh, something went wrong! Please try again! If this persists, please contact @Akaalroop on slack or email akaal@akaalroop.com. Error: {e}")
-                                    })
-                                };
-                                let mut response =
-                                    legacy_send_message(&polite_msg, &client, &bot_token).await;
-                                if response.is_err() {
-                                    for _ in 0..=3 {
-                                        error!(error = ?response.err().unwrap(), "The generic error message failed to send to the user");
-                                        response =
-                                            legacy_send_message(&polite_msg, &client, &bot_token)
-                                                .await;
-                                        if response.is_ok() {
-                                            break;
+                                    } else if let Some(thread_ts) = thread_ts {
+                                        let polite_msg = if e
+                                            .to_string()
+                                            .eq("Unable to convert the json to MCRecipe type")
+                                        {
+                                            json!({
+                                                "channel": channel_id,
+                                                "thread_ts": thread_ts,
+                                                "text": "Uh oh, that type of recipe isn't supported! This bot currently only supports crafting recipes. If that was supposed to work, please contact @Akaalroop or email akaal@akaalroop.com"
+                                            })
+                                        } else {
+                                            json!({
+                                                "channel": channel_id,
+                                                "thread_ts": thread_ts,
+                                                "text": format!(
+                                                    "Uh oh, something went wrong! Please try again! If this persists, please contact @Akaalroop on Slack or email akaal@akaalroop.com. Error: {e}"
+                                                )
+                                            })
+                                        };
+                                        
+                                        let mut response = legacy_send_message(
+                                            &polite_msg,
+                                            &client,
+                                            &bot_token,
+                                        )
+                                            .await;
+                                        
+                                        if response.is_err() {
+                                            for _ in 0..=3 {
+                                                error!(
+                                                    error = ?response.err().unwrap(),
+                                                    "The generic error message failed to send to the user"
+                                                );
+                                                
+                                                response = legacy_send_message(
+                                                    &polite_msg,
+                                                    &client,
+                                                    &bot_token,
+                                                )
+                                                    .await;
+                                                
+                                                if response.is_ok() {
+                                                    break;
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                    };
-                }
-                Subscriptions {
-                    user_id,
-                    trigger_id,
-                    bot_token,
-                } => {
-                    let modal_view = match fetch_and_build_subs_modal_view(&sqlx_pool, 0, user_id)
-                        .await
-                    {
-                        Ok(view) => view,
-                        Err(e) => {
-                            error!(error = ?e, "An error occurred fetching and building the modal view");
-                            continue;
+                        
+                        Subscriptions {
+                            user_id,
+                            trigger_id,
+                            bot_token,
+                        } => {
+                            let modal_view = match fetch_and_build_subs_modal_view(
+                                &sqlx_pool,
+                                0,
+                                user_id,
+                            )
+                                .await
+                            {
+                                Ok(view) => view,
+                                
+                                Err(e) => {
+                                    error!(
+                                        error = ?e,
+                                        "An error occurred fetching and building the modal view"
+                                    );
+                                    
+                                    continue;
+                                }
+                            };
+                            
+                            let payload = json!({
+                                "trigger_id": trigger_id,
+                                "view": modal_view,
+                            });
+                            
+                            send_and_log_on_failure(
+                                client
+                                    .post("https://slack.com/api/views.open")
+                                    .bearer_auth(bot_token)
+                                    .json(&payload),
+                                "Opening the initial configuration modal",
+                            )
+                                .await;
                         }
-                    };
-
-                    let payload = json!({
-                        "trigger_id": trigger_id,
-                        "view": modal_view
-                    });
-                    send_and_log_on_failure(
-                        client
-                            .post("https://slack.com/api/views.open")
-                            .bearer_auth(bot_token)
-                            .json(&payload),
-                        "Opening the initial configuration modal",
-                    )
-                    .await;
+                    }
                 }
-            }
-        }
-    });
-
-    let mcbot_router = axum::Router::new()
-        .route("/slack/events", post(handle_event))
-        .route("/slack/commands", post(handle_command))
-        .route("/slack/interactions", post(handle_interactions))
-        .route_layer(middleware::from_fn_with_state(
-            signing_secret,
-            verify_slack_signature,
-        ))
-        .with_state(state);
-
-    let mcrecipes_router = axum::Router::new()
-        .route("/slack/mcrecipes", post(handle_mcrecipes))
-        .route_layer(middleware::from_fn_with_state(
-            mcrecipes_signing_secret,
-            verify_slack_signature,
-        ))
-        .with_state(mcrecipes_state);
-
-    let uptime_router = axum::Router::new().route("/status/uptime", get(uptime));
-
-    let listener = TcpListener::bind("0.0.0.0:4598")
-        .await
-        .expect("Unable to bind the TcpListener");
-
-    let router = axum::Router::new()
-        .merge(mcbot_router)
-        .merge(mcrecipes_router)
-        .merge(uptime_router);
-
-    axum::serve(listener, router)
-        .await
-        .expect("Unable to serve the axum server");
+            });
+            
+            let mcbot_router = axum::Router::new()
+                .route("/slack/events", post(handle_event))
+                .route("/slack/commands", post(handle_command))
+                .route(
+                    "/slack/interactions",
+                    post(handle_interactions),
+                )
+                .route_layer(middleware::from_fn_with_state(
+                    signing_secret,
+                    verify_slack_signature,
+                ))
+                .with_state(state);
+            
+            let mcrecipes_router = axum::Router::new()
+                .route(
+                    "/slack/mcrecipes",
+                    post(handle_mcrecipes),
+                )
+                .route_layer(middleware::from_fn_with_state(
+                    mcrecipes_signing_secret,
+                    verify_slack_signature,
+                ))
+                .with_state(mcrecipes_state);
+            
+            let uptime_router =
+                axum::Router::new().route("/status/uptime", get(uptime));
+            
+            let router = axum::Router::new()
+                .merge(mcbot_router)
+                .merge(mcrecipes_router)
+                .merge(uptime_router)
+                .layer(
+                    ServiceBuilder::new()
+                        // Bind a Sentry Hub to each request so errors
+                        // are correctly associated with that request.
+                        .layer(
+                            NewSentryLayer::<Request<Body>>::new_from_top(),
+                        )
+                        // Create a Sentry transaction for every HTTP request.
+                        .layer(
+                            SentryHttpLayer::new()
+                                .enable_transaction(),
+                        ),
+                );
+            
+            let listener = TcpListener::bind("0.0.0.0:4598")
+                .await
+                .expect("Unable to bind the TcpListener");
+                
+            axum::serve(listener, router)
+                .await
+                .expect("Unable to serve the axum server");
+            
+            Ok(())
+        })
 }
 
 async fn handle_event(
