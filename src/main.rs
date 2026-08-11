@@ -70,6 +70,7 @@ struct AppState {
     valid_recipes: HashMap<String, usize>,
     sqlx_pool: sqlx::PgPool,
     flipped_language_mappings: HashMap<String, String>,
+    hackclub_api_key: Arc<str>,
 }
 
 #[derive(Clone)]
@@ -122,7 +123,7 @@ enum SlackInteraction {
         view: Option<SlackView>,
         actions: Vec<SlackActions>,
         trigger_id: String,
-        response_url: String,
+        response_url: Option<String>,
     },
     #[serde(rename = "view_submission")]
     ViewSubmission { user: SlackUser, view: SlackView },
@@ -240,6 +241,8 @@ async fn main() {
         env::var("SLACK_SIGNING_SECRET_MCRECIPES").expect("MCRecipes Bot Token NOT FOUND"),
     );
 
+    let hackclub_api_key = env::var("HACKCLUB_API_KEY").expect("HACKCLUB API KEY NOT FOUND");
+
     let (queue_input, mut queue_output) = mpsc::channel::<Task>(128);
 
     let mut client_jar_zip = fetch_client_jar(&client).await;
@@ -267,6 +270,7 @@ async fn main() {
         valid_recipes: recipe_data.valid_recipes.clone(),
         sqlx_pool: sqlx_pool.clone(),
         flipped_language_mappings: flipped_language_mappings.clone(),
+        hackclub_api_key: hackclub_api_key.into(),
     });
 
     let mcrecipes_state = Arc::new(MCRecipesAppState {
@@ -778,24 +782,50 @@ async fn handle_interactions(
                             }
                         };
 
-                        let alert_block = json!({
-                            "type": "alert",
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": "*Error*: You are already subscribed to this person",
-                                "verbatim": false
-                            },
-                            "level": "error"
-                        });
+                        let non_player = match state
+                            .client
+                            .get(format!("https://api.mc.hackclub.com?slack={selected_user}"))
+                            .bearer_auth(state.hackclub_api_key.clone())
+                            .send()
+                            .await
+                        {
+                            Ok(response) => response.status().eq(&StatusCode::NOT_FOUND),
+                            Err(e) => {
+                                error!(error=?e, "Failed to check for linked account on hackclub mc API.");
+                                return StatusCode::OK.into_response();
+                            }
+                        };
 
-                        let already_error_block_present = view
-                            .blocks
-                            .iter()
-                            .any(|v| v.get("type") == Some(&json!("alert")));
+                        let alert_text = if existing_subscription {
+                            Some("You are already subscribed to this person".to_string())
+                        } else if non_player {
+                            Some(format!(
+                                "This person doesn't play on the hackclub minecraft server!\nIf this is incorrect, please ask <@{selected_user}> to join the server and link their slack account."
+                            ))
+                        } else {
+                            None
+                        };
 
-                        if existing_subscription && !already_error_block_present {
-                            view.blocks.insert(0, alert_block);
-                        } else if !existing_subscription && already_error_block_present {
+                        if let Some(alert_text) = alert_text {
+                            let alert_block = json!({
+                                "type": "alert",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": format!("*Error*: {alert_text}"),
+                                    "verbatim": false
+                                },
+                                "level": "error"
+                            });
+
+                            let already_error_block_present = view
+                                .blocks
+                                .iter()
+                                .any(|v| v.get("type") == Some(&json!("alert")));
+
+                            if !already_error_block_present {
+                                view.blocks.insert(0, alert_block);
+                            }
+                        } else {
                             view.blocks
                                 .retain(|v| v.get("type") != Some(&json!("alert")));
                         }
@@ -937,18 +967,25 @@ async fn handle_interactions(
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
 
-                    send_and_log_on_failure(
-                        state
-                            .client
-                            .post(response_url)
-                            .bearer_auth(state.bot_token.clone())
-                            .json(&json!({
-                                "replace_original": true,
-                                "text": completed_text
-                            })),
-                        "Replacing the request DM with the completed message",
-                    )
-                    .await;
+                    if let Some(response_url) = response_url {
+                        send_and_log_on_failure(
+                            state
+                                .client
+                                .post(response_url)
+                                .bearer_auth(state.bot_token.clone())
+                                .json(&json!({
+                                    "replace_original": true,
+                                    "text": completed_text
+                                })),
+                            "Replacing the request DM with the completed message",
+                        )
+                        .await;
+                    } else {
+                        error!(
+                            "URGENT ERROR. SLACK HAS CHANGED THEIR API RESPONSE SHAPE AND HAS NOT GIVEN A RESPONSE URL FOR RESPONDING TO THE BUTTON CLICK IN A MESSAGE. THIS HAS ORIGINATED FROM THE DECLINE/APPROVE SUBSCRIPTION BRANCH IN THE BLOCK ACTIONS MATCH STATEMENT."
+                        );
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
 
                     StatusCode::OK.into_response()
                 }
@@ -1669,10 +1706,10 @@ LIMIT 6 OFFSET $2",
             "block_id": "subs_pagination",
             "elements": pagination_buttons
         }));
+        blocks.push(json!({
+            "type": "divider"
+        }));
     }
-    blocks.push(json!({
-        "type": "divider"
-    }));
 
     blocks.push(json!({
                             "type": "section",
