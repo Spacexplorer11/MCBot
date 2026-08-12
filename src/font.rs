@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use async_zip::tokio::read::seek::ZipFileReader;
 use image::{DynamicImage, load_from_memory};
+use sentry::metrics::counter;
 use serde_json::Value;
 use tokio::{fs::File, io::BufReader};
+use tracing::{debug, info, trace, warn};
 
 #[derive(Default)]
 pub struct MinecraftFont {
@@ -16,6 +18,8 @@ impl MinecraftFont {
         font_indexes: Vec<Option<usize>>,
         file: &mut ZipFileReader<BufReader<File>>,
     ) -> Result<MinecraftFont> {
+        trace!("Initialising MinecraftFont");
+        debug!("Reading font bitmap from default.json");
         let mut font_bitmap_reader = file
             .reader_with_entry(font_indexes[0].context("Unable to find font bitmap index")?)
             .await
@@ -42,6 +46,8 @@ impl MinecraftFont {
             })
             .collect();
         drop(font_bitmap_json);
+
+        debug!("Reading font image from ascii.png");
         let mut font_image_reader = file
             .reader_with_entry(font_indexes[1].context("Unable to find font image's index")?)
             .await
@@ -55,6 +61,7 @@ impl MinecraftFont {
         let font_image =
             load_from_memory(&font_image_bytes).context("Unable to load font/ascii.png")?;
 
+        info!("MinecraftFont successfully initialised");
         Ok(MinecraftFont {
             bitmap: font_bitmap,
             image: font_image,
@@ -67,14 +74,18 @@ impl MinecraftFont {
     fields(index = %index, character = %character)
     )]
     pub fn get_character_image(&self, index: usize, character: String) -> Result<DynamicImage> {
+        trace!(character = %character, index = index, "Looking up character image");
         let line = &self.bitmap[index];
         for (i, bit) in line.chars().enumerate() {
             if bit.to_string().eq(&character) {
                 let x = i * 8;
                 let y = index * 8; // The images/letters/characters idk what are 8 x 8px
+                debug!(character = %character, x = x, y = y, "Found character in font");
                 return Ok(self.image.crop_imm(x as u32, y as u32, 8, 8));
             }
         }
+        warn!(character = %character, index = index, "Character not found in font");
+        counter("font.character.missing", 1).capture();
         Err(anyhow::anyhow!("Character not found in font"))
     }
 }

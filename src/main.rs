@@ -26,7 +26,10 @@ use chrono::Utc;
 use dotenvy::dotenv;
 use hmac::{KeyInit, Mac};
 use reqwest::{Client, StatusCode};
+use sentry::integrations::anyhow::capture_anyhow;
 use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
+use sentry::metrics::{counter, distribution};
+use sentry::protocol::Unit;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{query, query_as};
@@ -180,6 +183,21 @@ enum ActionId {
     Other,
 }
 
+impl ActionId {
+    fn as_metric_name(&self) -> &'static str {
+        match self {
+            ActionId::SubscribeNewPerson => "subscribe_new_person",
+            ActionId::RemoveSubscription { .. } => "remove_subscription",
+            ActionId::SubsPagePrev => "subs_page_prev",
+            ActionId::SubsPageNext => "subs_page_next",
+            ActionId::UserSelect { .. } => "users_select",
+            ActionId::ApproveSubscription { .. } => "approve_subscription",
+            ActionId::DeclineSubscription { .. } => "decline_subscription",
+            ActionId::Other => "other",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 enum CallbackId {
     #[serde(rename = "configure_subs_modal")]
@@ -251,51 +269,60 @@ fn main() -> io::Result<()> {
         .build()?
         .block_on(async {
             let client = Client::new();
-            
+
             let bot_token =
                 env::var("SLACK_BOT_TOKEN").expect("MCBot Bot Token NOT FOUND");
-            
+
             let mcrecipes_bot_token = env::var("SLACK_BOT_TOKEN_MCRECIPES")
                 .expect("MCRecipes Bot Token NOT FOUND");
-            
+
             let signing_secret = Arc::new(
                 env::var("SLACK_SIGNING_SECRET")
                     .expect("MCBot Signing Secret NOT FOUND"),
             );
-            
+
             let mcrecipes_signing_secret = Arc::new(
                 env::var("SLACK_SIGNING_SECRET_MCRECIPES")
                     .expect("MCRecipes Bot Token NOT FOUND"),
             );
-            
+
             let hackclub_api_key =
                 env::var("HACKCLUB_API_KEY").expect("HACKCLUB API KEY NOT FOUND");
-            
-            let (queue_input, mut queue_output) = mpsc::channel::<Task>(128);
-            
+
+            let task_queue_capacity = 128usize;
+            let (queue_input, mut queue_output) = mpsc::channel::<Task>(task_queue_capacity);
+            debug!(capacity = task_queue_capacity, "MPSC task queue created");
+
             let mut client_jar_zip = fetch_client_jar(&client).await;
             let mut recipe_data = RecipeData::default();
-            
+
             info!("Now adding recipes, items & tags to memory");
-            
-            recipe_data
+
+            match recipe_data
                 .fetch_recipes_and_more(&mut client_jar_zip)
                 .await
-                .expect("Failed to fetch recipes");
-            
+            {
+                Ok(()) => info!("All startup assets loaded successfully"),
+                Err(e) => {
+                    capture_anyhow(&e);
+                    panic!("Failed to fetch recipes: {e:?}");
+                }
+            }
+
             let sqlx_pool = sqlx::Pool::connect(
                 &env::var("DATABASE_URL").expect("DATABASE_URL NOT FOUND"),
             )
                 .await
                 .expect("Failed to connect to database");
-            
+            info!("Connected to the PostgreSQL database");
+
             let mut flipped_language_mappings = HashMap::new();
-            
+
             for (key, value) in recipe_data.language_mappings() {
                 let value = value.to_lowercase().replace(' ', "_");
                 flipped_language_mappings.insert(value, key);
             }
-            
+
             let state = Arc::new(AppState {
                 client: Client::new(),
                 bot_token: bot_token.into(),
@@ -305,7 +332,7 @@ fn main() -> io::Result<()> {
                 flipped_language_mappings: flipped_language_mappings.clone(),
                 hackclub_api_key: hackclub_api_key.into(),
             });
-            
+
             let mcrecipes_state = Arc::new(MCRecipesAppState {
                 client: Client::new(),
                 bot_token: mcrecipes_bot_token.into(),
@@ -313,11 +340,11 @@ fn main() -> io::Result<()> {
                 valid_recipes: recipe_data.valid_recipes.clone(),
                 flipped_language_mappings,
             });
-            
+
             tokio::spawn(async move {
                 while let Some(task) = queue_output.recv().await {
                     trace!("Received task in async thread");
-                    
+
                     match task {
                         Recipe {
                             item_name,
@@ -327,6 +354,7 @@ fn main() -> io::Result<()> {
                             thread_ts,
                             bot_token,
                         } => {
+                            let processing_start = std::time::Instant::now();
                             let ctx = SlackMessageContext {
                                 client: &client,
                                 bot_token: &bot_token,
@@ -334,7 +362,7 @@ fn main() -> io::Result<()> {
                                 user_id: &user_id,
                                 thread_ts: thread_ts.as_deref(),
                             };
-                            
+
                             match recipe_data
                                 .process_recipe(
                                     item_name.as_str(),
@@ -344,15 +372,25 @@ fn main() -> io::Result<()> {
                                 .await
                             {
                                 Ok(..) => {
-                                    debug!("Recipe successfully processed");
+                                    counter("recipe.processed", 1)
+                                        .attribute("result", "success")
+                                        .capture();
+                                    debug!(item_name = %item_name, user_id = %user_id, channel_id = %channel_id, "Recipe successfully processed");
                                 }
-                                
+
                                 Err(e) => {
+                                    counter("recipe.processed", 1)
+                                        .attribute("result", "error")
+                                        .capture();
+                                    capture_anyhow(&e);
                                     error!(
                                         error = ?e,
+                                        item_name = %item_name,
+                                        user_id = %user_id,
                                         "Failed to fulfil recipe task processing pipeline"
                                     );
-                                    
+                                    warn!(item_name = %item_name, user_id = %user_id, "Sending user-friendly error message to Slack");
+
                                     if let Some(response_url) = response_url {
                                         let polite_msg = if e
                                             .to_string()
@@ -370,26 +408,26 @@ fn main() -> io::Result<()> {
                                                 )
                                             })
                                         };
-                                        
+
                                         let mut response = client
                                             .post(&response_url)
                                             .json(&polite_msg)
                                             .send()
                                             .await;
-                                        
+
                                         if response.is_err() {
                                             for _ in 0..=3 {
                                                 error!(
                                                     error = ?response.err().unwrap(),
                                                     "The generic error message failed to send to the user"
                                                 );
-                                                
+
                                                 response = client
                                                     .post(&response_url)
                                                     .json(&polite_msg)
                                                     .send()
                                                     .await;
-                                                
+
                                                 if response.is_ok() {
                                                     break;
                                                 }
@@ -414,28 +452,28 @@ fn main() -> io::Result<()> {
                                                 )
                                             })
                                         };
-                                        
+
                                         let mut response = legacy_send_message(
                                             &polite_msg,
                                             &client,
                                             &bot_token,
                                         )
                                             .await;
-                                        
+
                                         if response.is_err() {
                                             for _ in 0..=3 {
                                                 error!(
                                                     error = ?response.err().unwrap(),
                                                     "The generic error message failed to send to the user"
                                                 );
-                                                
+
                                                 response = legacy_send_message(
                                                     &polite_msg,
                                                     &client,
                                                     &bot_token,
                                                 )
                                                     .await;
-                                                
+
                                                 if response.is_ok() {
                                                     break;
                                                 }
@@ -444,13 +482,20 @@ fn main() -> io::Result<()> {
                                     }
                                 }
                             }
+                            distribution(
+                                "recipe.processing.duration",
+                                processing_start.elapsed().as_millis() as f64,
+                            )
+                            .unit(Unit::Millisecond)
+                            .capture();
                         }
-                        
+
                         Subscriptions {
                             user_id,
                             trigger_id,
                             bot_token,
                         } => {
+                            debug!(user_id = %user_id, "Processing Subscriptions task: fetching and building modal view");
                             let modal_view = match fetch_and_build_subs_modal_view(
                                 &sqlx_pool,
                                 0,
@@ -458,23 +503,34 @@ fn main() -> io::Result<()> {
                             )
                                 .await
                             {
-                                Ok(view) => view,
-                                
+                                Ok(view) => {
+                                    counter("subscriptions.modal", 1)
+                                        .attribute("result", "opened")
+                                        .capture();
+                                    trace!("Subscriptions modal view built successfully");
+                                    view
+                                }
+
                                 Err(e) => {
+                                    counter("subscriptions.modal", 1)
+                                        .attribute("result", "error")
+                                        .capture();
+                                    capture_anyhow(&e);
                                     error!(
                                         error = ?e,
                                         "An error occurred fetching and building the modal view"
                                     );
-                                    
+
                                     continue;
                                 }
                             };
-                            
+
+                            info!("Opening subscriptions configuration modal");
                             let payload = json!({
                                 "trigger_id": trigger_id,
                                 "view": modal_view,
                             });
-                            
+
                             send_and_log_on_failure(
                                 client
                                     .post("https://slack.com/api/views.open")
@@ -487,7 +543,7 @@ fn main() -> io::Result<()> {
                     }
                 }
             });
-            
+
             let mcbot_router = axum::Router::new()
                 .route("/slack/events", post(handle_event))
                 .route("/slack/commands", post(handle_command))
@@ -500,7 +556,7 @@ fn main() -> io::Result<()> {
                     verify_slack_signature,
                 ))
                 .with_state(state);
-            
+
             let mcrecipes_router = axum::Router::new()
                 .route(
                     "/slack/mcrecipes",
@@ -511,10 +567,10 @@ fn main() -> io::Result<()> {
                     verify_slack_signature,
                 ))
                 .with_state(mcrecipes_state);
-            
+
             let uptime_router =
                 axum::Router::new().route("/status/uptime", get(uptime));
-            
+
             let router = axum::Router::new()
                 .merge(mcbot_router)
                 .merge(mcrecipes_router)
@@ -532,15 +588,16 @@ fn main() -> io::Result<()> {
                                 .enable_transaction(),
                         ),
                 );
-            
+
             let listener = TcpListener::bind("0.0.0.0:4598")
                 .await
                 .expect("Unable to bind the TcpListener");
-                
+            info!(addr = "0.0.0.0:4598", "MCBot HTTP server listening");
+
             axum::serve(listener, router)
                 .await
                 .expect("Unable to serve the axum server");
-            
+
             Ok(())
         })
 }
@@ -552,11 +609,17 @@ async fn handle_event(
     trace!("Received an event at /slack/events");
     match payload {
         SlackPayload::UrlVerification { challenge } => {
+            counter("slack.event", 1)
+                .attribute("type", "url_verification")
+                .capture();
             info!("Url Verification challenge received");
             Json(json!({"challenge": challenge})).into_response()
         }
 
         SlackPayload::EventCallback { event } => {
+            counter("slack.event", 1)
+                .attribute("type", "event_callback")
+                .capture();
             trace!(event_type = event.event_type, "Received event");
             send_message(&json!({"channel": event.channel, "text": "Hi! I'm MCBot, made by <@U08D22QNUVD>! :) \nUse /mcrecipe to get crafting recipes!", "thread_ts": event.ts}), &state.client, &state.bot_token).await
         }
@@ -568,6 +631,9 @@ async fn handle_command(
     Form(payload): Form<SlackSlashCommand>,
 ) -> Response {
     trace!("Received command at /slack/commands");
+    counter("slack.command", 1)
+        .attribute("command", payload.command.as_str())
+        .capture();
     match payload.command.as_str() {
         "/mcrecipe" => {
             trace!(
@@ -575,6 +641,9 @@ async fn handle_command(
                 recipe = &payload.text
             );
             if payload.text.is_empty() || payload.text.eq(" ") {
+                counter("recipe.request", 1)
+                    .attribute("result", "empty")
+                    .capture();
                 return Json(
                     json!({"response_type": "ephemeral", "text": "You didn't enter a recipe!"}),
                 )
@@ -586,6 +655,9 @@ async fn handle_command(
                 &state.flipped_language_mappings,
             );
             if is_recipe_valid {
+                counter("recipe.request", 1)
+                    .attribute("result", "valid")
+                    .capture();
                 match state.mpsc.try_send(Recipe {
                     item_name: recipe.clone(),
                     response_url: Some(payload.response_url),
@@ -604,6 +676,9 @@ async fn handle_command(
                         ).into_response()
                     }
                     Err(e) => {
+                        counter("task.queue.full", 1)
+                            .attribute("task", "recipe")
+                            .capture();
                         error!("Error occurred sending task to generate image: {e}");
                         match e {
                             TrySendError::Full(..) => Json(
@@ -616,6 +691,9 @@ async fn handle_command(
                     }
                 }
             } else {
+                counter("recipe.request", 1)
+                    .attribute("result", "invalid")
+                    .capture();
                 warn!(
                     "User {} tried to get recipe {recipe} but it was invalid",
                     payload.user_id
@@ -636,6 +714,9 @@ async fn handle_command(
                     StatusCode::OK.into_response()
                 }
                 Err(e) => {
+                    counter("task.queue.full", 1)
+                        .attribute("task", "subscriptions")
+                        .capture();
                     error!("Error occurred sending task to generate image: {e}");
                     match e {
                         TrySendError::Full(..) => Json(
@@ -664,9 +745,13 @@ async fn handle_interactions(
     State(state): State<Arc<AppState>>,
     Form(payload): Form<SlackInteractionPayload>,
 ) -> Response {
+    trace!("Received an interaction at /slack/interactions");
     let interaction: SlackInteraction = match serde_json::from_str(&payload.payload) {
         Ok(i) => i,
         Err(e) => {
+            counter("slack.interaction", 1)
+                .attribute("action", "parse_error")
+                .capture();
             error!("Failed to parse interaction payload: {e}");
             return StatusCode::BAD_REQUEST.into_response();
         }
@@ -679,7 +764,11 @@ async fn handle_interactions(
             trigger_id,
             response_url,
         } => {
+            trace!(user_id = %user.id, "Handling BlockActions interaction");
             let actions = &actions[0];
+            counter("slack.interaction", 1)
+                .attribute("action", actions.action_id.as_metric_name())
+                .capture();
             let private_metadata: Option<SubsPageMetadata>;
             let mut page: i64 = 0;
 
@@ -712,6 +801,7 @@ async fn handle_interactions(
             }
             match &actions.action_id {
                 ActionId::RemoveSubscription { value } => {
+                    debug!(user_id = %user.id, subscription_id = %value, "User requested subscription removal");
                     if let Some(view) = view {
                         let id = match value.parse::<i64>() {
                             Ok(id) => id,
@@ -729,6 +819,7 @@ async fn handle_interactions(
                         .await
                         {
                             Ok(..) => {
+                                info!(user_id = %user.id, subscription_id = id, "Subscription removed from database");
                                 trace!("Successfully deleted row from database");
                                 let modal_view = match fetch_and_build_subs_modal_view(
                                     &state.sqlx_pool,
@@ -779,6 +870,7 @@ async fn handle_interactions(
                  TODO: Make the code better and use let Variant(x) = x else {} instead of if let Err(e) blah blah blah
                 */
                 ActionId::SubscribeNewPerson => {
+                    debug!(user_id = %user.id, "User triggered SubscribeNewPerson action, pushing user selection modal");
                     let user_select_block = json!({
                         "type": "input",
                         "label": {
@@ -836,9 +928,11 @@ async fn handle_interactions(
                     if let Some(view) = view {
                         match actions.action_id {
                             ActionId::SubsPageNext => {
+                                debug!(user_id = %user.id, current_page = page, new_page = page + 1, "User navigating to next subscription page");
                                 page += 1;
                             }
                             ActionId::SubsPagePrev => {
+                                debug!(user_id = %user.id, current_page = page, new_page = page - 1, "User navigating to previous subscription page");
                                 page -= 1;
                             }
                             _ => unreachable!(),
@@ -875,6 +969,7 @@ async fn handle_interactions(
                 }
                 ActionId::UserSelect { selected_user } => {
                     if let Some(view) = &mut view {
+                        debug!(user_id = %user.id, selected_user = %selected_user, "User selected a target for subscription");
                         let existing_subscription = query!(
                     "SELECT 1 as exists FROM subscriptions WHERE subscriber_id = $1 AND target_id = $2",
                     user.id,
@@ -976,11 +1071,13 @@ async fn handle_interactions(
                 }
                 ActionId::DeclineSubscription { value }
                 | ActionId::ApproveSubscription { value } => {
+                    debug!(user_id = %user.id, subscriber_id = %value, action = ?actions.action_id, "Processing subscription approval/decline action");
                     let dm_text: String;
                     let completed_text: String;
 
                     match &actions.action_id {
                         ActionId::DeclineSubscription { value } => {
+                            info!(target_id = %user.id, subscriber_id = %value, "User declined a subscription request");
                             dm_text = format!(
                                 "Unfortunately <@{}> has declined your request to track their join/leave updates for the hackclub minecraft server",
                                 user.id
@@ -1002,6 +1099,7 @@ async fn handle_interactions(
                             }
                         }
                         ActionId::ApproveSubscription { value } => {
+                            info!(target_id = %user.id, subscriber_id = %value, "User approved a subscription request");
                             dm_text = format!(
                                 "<@{}> has approved your request to track their join/leave updates on the hackclub minecraft server. You will begin receiving updates when they next join/leave the server.",
                                 user.id
@@ -1106,6 +1204,10 @@ async fn handle_interactions(
             }
         }
         SlackInteraction::ViewSubmission { user, view } => {
+            counter("slack.interaction", 1)
+                .attribute("action", "view_submission")
+                .capture();
+            debug!(user_id = %user.id, "Handling ViewSubmission interaction");
             match view.callback_id {
                 CallbackId::ConfigureSubsModal => (),
                 CallbackId::InputNewSubUser => {
@@ -1464,11 +1566,17 @@ async fn verify_slack_signature(
 
     match my_signature.verify_slice(&slack_signature) {
         Ok(..) => {
+            counter("slack.signature.verification", 1)
+                .attribute("result", "success")
+                .capture();
             trace!("Slack signature verification successful");
             next.run(Request::from_parts(parts, Body::from(request_bytes)))
                 .await
         }
         Err(e) => {
+            counter("slack.signature.verification", 1)
+                .attribute("result", "failure")
+                .capture();
             warn!("Slack signature verification failed: {e}");
             Response::builder()
                 .status(StatusCode::FORBIDDEN)
@@ -1510,10 +1618,12 @@ async fn send_request_dm(
     target_user_id: &str,
     user: &SlackUser,
 ) -> anyhow::Result<()> {
+    trace!(subscriber_id = %user.id, target_user_id = %target_user_id, "Sending subscription request DM");
     let json = json!({
     "users": target_user_id
     });
 
+    debug!(target_user_id = %target_user_id, "Opening DM channel via conversations.open");
     let response = client
         .post("https://slack.com/api/conversations.open")
         .bearer_auth(bot_token)
@@ -1535,12 +1645,14 @@ async fn send_request_dm(
     let json: OpenConversationResponse =
         serde_json::from_slice(&response_bytes).context("Failed to convert the bytes to json")?;
     if !json.ok {
+        error!(target_user_id = %target_user_id, "Slack conversations.open returned non-OK response for subscription request DM");
         return Err(anyhow!(
             "Slack conversations.open API returned a non-OK response"
         ));
     }
 
     let channel = json.channel.id;
+    debug!(target_user_id = %target_user_id, channel_id = %channel, "DM channel opened successfully");
 
     let blocks = json!([
     {
@@ -1621,13 +1733,15 @@ async fn send_request_dm(
         serde_json::from_slice(&res_bytes).context("Failed to convert the bytes to json")?;
     if !json.ok {
         error!(
-            "Slack chat.postMessage API returned a non-OK response. The response was {:#?}",
-            String::from_utf8_lossy(&res_bytes)
+            target_user_id = %target_user_id,
+            response = %String::from_utf8_lossy(&res_bytes),
+            "Slack chat.postMessage API returned a non-OK response for the subscription request DM"
         );
         return Err(anyhow!(
             "Slack chat.postMessage API returned a non-OK response"
         ));
     }
+    info!(subscriber_id = %user.id, target_user_id = %target_user_id, "Subscription approval request DM successfully delivered");
     Ok(())
 }
 
@@ -1636,6 +1750,7 @@ async fn fetch_and_build_subs_modal_view(
     page: i64,
     user_id: String,
 ) -> anyhow::Result<Value> {
+    trace!(user_id = %user_id, page = page, "Fetching subscriptions from database for modal view");
     let subs = match query_as!(
         Subscription,
         "SELECT s.id, s.active, s.target_id, u.mc_usernames
@@ -1650,8 +1765,12 @@ LIMIT 6 OFFSET $2",
     .fetch_all(sqlx_pool)
     .await
     {
-        Ok(subs) => subs,
+        Ok(subs) => {
+            debug!(user_id = %user_id, page = page, count = subs.len(), "Subscriptions fetched from database");
+            subs
+        }
         Err(e) => {
+            error!(error = ?e, user_id = %user_id, page = page, "Failed to fetch subscriptions from database");
             return Err(anyhow!("Failed to fetch subscriptions. Error: {e}"));
         }
     };
