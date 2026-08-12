@@ -199,6 +199,16 @@ impl ActionId {
 }
 
 #[derive(Deserialize)]
+struct MinecraftPlayerData {
+    nick: MinecraftPlayerNick,
+}
+
+#[derive(Deserialize)]
+struct MinecraftPlayerNick {
+    name: String,
+}
+
+#[derive(Deserialize)]
 enum CallbackId {
     #[serde(rename = "configure_subs_modal")]
     ConfigureSubsModal,
@@ -253,7 +263,6 @@ fn main() -> io::Result<()> {
         sentry::ClientOptions::new()
             .dsn(&sentry_url)
             .maybe_release(sentry::release_name!())
-            .send_default_pii(true)
             .enable_logs(true)
             .enable_metrics(true)
             .traces_sample_rate(1.0)
@@ -1275,8 +1284,66 @@ async fn handle_interactions(
                         );
                     }
 
+                    let response_from_hc_api = match state
+                        .client
+                        .get(format!(
+                            "https://api.mc.hackclub.com?slack={target_user_id}"
+                        ))
+                        .bearer_auth(state.hackclub_api_key.clone())
+                        .send()
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(e) => {
+                            error!(error=?e, slack=%target_user_id, user_who_triggered=%user.id, "An error occurred when trying to get the information from the hackclub api.");
+                            return build_inline_error_response(
+                                "users_select",
+                                "Internal: An error occurred when fetching information from the hackclub API about this player. This means I couldn't get the minecraft username which I need.",
+                            );
+                        }
+                    };
+
+                    if response_from_hc_api.status().eq(&StatusCode::NOT_FOUND) {
+                        return build_inline_error_response(
+                            "users_select",
+                            "This player does not play on the hackclub minecraft server. If this is incorrect please ask them to join the server, go through the linking flow and then try again. If this still persists please contact <@U08D22QNUVD>.",
+                        );
+                    } else if !response_from_hc_api.status().is_success() {
+                        error!(status=%response_from_hc_api.status(), target=%target_user_id, trigger_user=%user.id "The hackclub API returned an non-404 error.");
+                        return build_inline_error_response(
+                            "users_select",
+                            "Internal: The API returned an error when fetching information for this player.",
+                        );
+                    }
+
+                    let Ok(response_as_bytes) = response_from_hc_api.bytes() else {
+                        error!(response=?response_from_hc_api, "Failed to convert response to bytes");
+                        return build_inline_error_response(
+                            "users_select",
+                            "Internal: Failed to convert the response from the Hackclub API to bytes?? Weird.",
+                        );
+                    };
+
+                    let minecraft_player_data: Vec<MinecraftPlayerData> =
+                        match serde_json::from_slice(&response_as_bytes) {
+                            Ok(mpd) => mpd,
+                            Err(e) => {
+                                error!(response=?response_from_hc_api, error=?e, "An error occurred when converting the response to MinecraftPlayerData");
+                                return build_inline_error_response(
+                                    "users_select",
+                                    "Internal: I couldn't convert the response from the hackclub API to MinecraftPlayerData. (This is irrelevant to you lol, just know it didnt work)",
+                                );
+                            }
+                        };
+
+                    let mut mc_usernames = Vec::new();
+
+                    for block in minecraft_player_data {
+                        mc_usernames.push(block.nick.name)
+                    }
+
                     if let Err(e) =
-                        query!("INSERT INTO users (slack_id) VALUES ($1) ON CONFLICT (slack_id) DO NOTHING", target_user_id)
+                        query!("INSERT INTO users (slack_id, mc_usernames) VALUES ($1, $2) ON CONFLICT (slack_id) DO NOTHING", target_user_id, &mc_usernames)
                             .execute(&state.sqlx_pool)
                             .await
                     {
