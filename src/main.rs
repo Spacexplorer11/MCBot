@@ -29,7 +29,7 @@ use hmac::{KeyInit, Mac};
 use reqwest::{Client, StatusCode};
 use sentry::integrations::anyhow::capture_anyhow;
 use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
-use sentry::metrics::{counter, distribution};
+use sentry::metrics::{counter, distribution, gauge};
 use sentry::protocol::Unit;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -54,17 +54,20 @@ enum Task {
         user_id: String,
         thread_ts: Option<String>,
         bot_token: Arc<str>,
+        queued_at: std::time::Instant,
     },
     Subscriptions {
         user_id: String,
         trigger_id: String,
         bot_token: Arc<str>,
+        queued_at: std::time::Instant,
     },
     UpdateDMs {
         people: Vec<String>,
         joining: bool,
         slack_and_mc: (String, String),
-        bot_token: String,
+        bot_token: Arc<str>,
+        queued_at: std::time::Instant,
     },
 }
 
@@ -283,11 +286,19 @@ fn main() -> io::Result<()> {
 
     let sentry_url = env::var("SENTRY_URL").expect("SENTRY URL NOT FOUND");
 
+    let release = env::var("REVISION");
+
     // Sentry MUST be initialised before the Tokio runtime starts.
     let _guard = sentry::init(
         sentry::ClientOptions::new()
             .dsn(&sentry_url)
-            .maybe_release(sentry::release_name!())
+            .maybe_release({
+                if release.is_err() {
+                    sentry::release_name!()
+                } else {
+                    Some(release.unwrap().into())
+                }
+            })
             .enable_logs(true)
             .enable_metrics(true)
             .traces_sample_rate(1.0)
@@ -326,6 +337,7 @@ fn main() -> io::Result<()> {
             let task_queue_capacity = 128usize;
             let (queue_input, mut queue_output) = mpsc::channel::<Task>(task_queue_capacity);
             debug!(capacity = task_queue_capacity, "MPSC task queue created");
+            let metrics_queue = queue_input.clone();
 
             let mut client_jar_zip = fetch_client_jar(&client).await;
             let mut recipe_data = RecipeData::default();
@@ -349,6 +361,7 @@ fn main() -> io::Result<()> {
                 .await
                 .expect("Failed to connect to database");
             info!("Connected to the PostgreSQL database");
+            let metrics_pool = sqlx_pool.clone();
 
             let mut flipped_language_mappings = HashMap::new();
 
@@ -387,7 +400,11 @@ fn main() -> io::Result<()> {
                             user_id,
                             thread_ts,
                             bot_token,
+                            queued_at,
                         } => {
+                            distribution("task.queue.delay", queued_at.elapsed().as_millis() as f64)
+                                .unit(Unit::Millisecond)
+                                .capture();
                             let processing_start = std::time::Instant::now();
                             let ctx = SlackMessageContext {
                                 client: &client,
@@ -528,7 +545,11 @@ fn main() -> io::Result<()> {
                             user_id,
                             trigger_id,
                             bot_token,
+                            queued_at,
                         } => {
+                            distribution("task.queue.delay", queued_at.elapsed().as_millis() as f64)
+                                .unit(Unit::Millisecond)
+                                .capture();
                             debug!(user_id = %user_id, "Processing Subscriptions task: fetching and building modal view");
                             let modal_view = match fetch_and_build_subs_modal_view(
                                 &sqlx_pool,
@@ -579,8 +600,12 @@ fn main() -> io::Result<()> {
                             people,
                             joining,
                             slack_and_mc,
-                            bot_token
+                            bot_token,
+                            queued_at,
                         } => {
+                            distribution("task.queue.delay", queued_at.elapsed().as_millis() as f64)
+                                .unit(Unit::Millisecond)
+                                .capture();
                             let text_to_send;
                             if joining {
                                 text_to_send = format!("Your friend <@{}> ({}) just joined the hackclub minecraft server!", slack_and_mc.0, slack_and_mc.1);
@@ -621,6 +646,48 @@ fn main() -> io::Result<()> {
                                 }
                             }
                         }
+                    }
+                }
+            });
+
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+                loop {
+                    interval.tick().await;
+
+                    let depth = task_queue_capacity - metrics_queue.capacity();
+                    gauge("task.queue.depth", depth as f64).capture();
+
+                    match query!("SELECT count(*) AS count FROM subscriptions WHERE active = true")
+                        .fetch_one(&metrics_pool)
+                        .await
+                    {
+                        Ok(row) => {
+                            gauge("subscriptions.count", row.count.unwrap_or(0) as f64)
+                                .attribute("status", "active")
+                                .capture();
+                        }
+                        Err(e) => warn!(
+                            error = ?e,
+                            "Failed to fetch active subscription count for gauge"
+                        ),
+                    }
+
+                    match query!(
+                        "SELECT count(*) AS count FROM subscriptions WHERE active = false"
+                    )
+                    .fetch_one(&metrics_pool)
+                    .await
+                    {
+                        Ok(row) => {
+                            gauge("subscriptions.count", row.count.unwrap_or(0) as f64)
+                                .attribute("status", "pending")
+                                .capture();
+                        }
+                        Err(e) => warn!(
+                            error = ?e,
+                            "Failed to fetch pending subscription count for gauge"
+                        ),
                     }
                 }
             });
@@ -668,7 +735,8 @@ fn main() -> io::Result<()> {
                             SentryHttpLayer::new()
                                 .enable_transaction(),
                         ),
-                );
+                )
+                .layer(axum::middleware::from_fn(logging::metric_response));
 
             let listener = TcpListener::bind("0.0.0.0:4598")
                 .await
@@ -759,7 +827,8 @@ async fn handle_event(
                                             people: subscribed_people,
                                             joining,
                                             slack_and_mc: (slack_id.clone(), username.to_string()),
-                                            bot_token: state.bot_token.clone().to_string()
+                                            bot_token: state.bot_token.clone(),
+                                            queued_at: std::time::Instant::now()
                                         }
                                     ) {
                                         Ok(..) => info!("Successfully sent the update DM's task to the mpsc queue"),
@@ -890,6 +959,7 @@ async fn handle_command(
                     user_id: payload.user_id.clone(),
                     thread_ts: None,
                     bot_token: state.bot_token.clone(),
+                    queued_at: std::time::Instant::now(),
                 }) {
                     Ok(..) => {
                         info!(
@@ -933,6 +1003,7 @@ async fn handle_command(
                 user_id: payload.user_id.clone(),
                 trigger_id: payload.trigger_id,
                 bot_token: state.bot_token.clone(),
+                queued_at: std::time::Instant::now(),
             }) {
                 Ok(..) => {
                     info!("Configuring updates for {}", payload.user_id);
@@ -1209,6 +1280,7 @@ async fn handle_interactions(
                             }
                         };
 
+                        let hackclub_start = std::time::Instant::now();
                         let non_player = match state
                             .client
                             .get(format!(
@@ -1218,8 +1290,18 @@ async fn handle_interactions(
                             .send()
                             .await
                         {
-                            Ok(response) => response.status().eq(&StatusCode::NOT_FOUND),
+                            Ok(response) => {
+                                logging::record_hackclub_api_metric(
+                                    hackclub_start,
+                                    &response.status().as_u16().to_string(),
+                                );
+                                response.status().eq(&StatusCode::NOT_FOUND)
+                            }
                             Err(e) => {
+                                logging::record_hackclub_api_metric(
+                                    hackclub_start,
+                                    "request_error",
+                                );
                                 error!(error=?e, "Failed to check for linked account on hackclub mc API.");
                                 return StatusCode::OK.into_response();
                             }
@@ -1500,6 +1582,7 @@ async fn handle_interactions(
                         );
                     }
 
+                    let hackclub_start = std::time::Instant::now();
                     let response_from_hc_api = match state
                         .client
                         .get(format!(
@@ -1509,8 +1592,15 @@ async fn handle_interactions(
                         .send()
                         .await
                     {
-                        Ok(response) => response,
+                        Ok(response) => {
+                            logging::record_hackclub_api_metric(
+                                hackclub_start,
+                                &response.status().as_u16().to_string(),
+                            );
+                            response
+                        }
                         Err(e) => {
+                            logging::record_hackclub_api_metric(hackclub_start, "request_error");
                             error!(error=?e, slack=%target_user_id, user_who_triggered=%user.id, "An error occurred when trying to get the information from the hackclub api.");
                             return build_inline_error_response(
                                 "users_select",
@@ -1682,6 +1772,7 @@ async fn handle_mcrecipes(
                     user_id: user_id.clone(),
                     thread_ts: Some(event.ts.clone()),
                     bot_token: state.bot_token.clone(),
+                    queued_at: std::time::Instant::now(),
                 }) {
                     Ok(..) => {
                         info!("Started processing recipe for {recipe} from {user_id}");
@@ -1866,6 +1957,7 @@ async fn verify_slack_signature(
 }
 
 async fn send_message(json: &Value, client: &Client, bot_token: &str) -> Response<Body> {
+    let start = std::time::Instant::now();
     match client
         .post("https://slack.com/api/chat.postMessage")
         .bearer_auth(bot_token)
@@ -1873,8 +1965,12 @@ async fn send_message(json: &Value, client: &Client, bot_token: &str) -> Respons
         .send()
         .await
     {
-        Ok(..) => StatusCode::OK.into_response(),
+        Ok(..) => {
+            logging::record_slack_api_metric("chat.postMessage", start, "ok");
+            StatusCode::OK.into_response()
+        }
         Err(e) => {
+            logging::record_slack_api_metric("chat.postMessage", start, "request_error");
             error!("Error occurred sending message: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
@@ -1882,17 +1978,41 @@ async fn send_message(json: &Value, client: &Client, bot_token: &str) -> Respons
 }
 
 async fn legacy_send_message(json: &Value, client: &Client, bot_token: &str) -> anyhow::Result<()> {
-    client
+    let start = std::time::Instant::now();
+    let result = client
         .post("https://slack.com/api/chat.postMessage")
         .bearer_auth(bot_token)
         .json(json)
         .send()
-        .await?;
-    Ok(())
+        .await;
+    match result {
+        Ok(..) => {
+            logging::record_slack_api_metric("chat.postMessage", start, "ok");
+            Ok(())
+        }
+        Err(e) => {
+            logging::record_slack_api_metric("chat.postMessage", start, "request_error");
+            Err(e.into())
+        }
+    }
+}
+
+async fn send_dm(
+    client: &Client,
+    bot_token: &str,
+    target_user_id: &str,
+    text: &str,
+) -> anyhow::Result<()> {
+    let result = send_dm_impl(client, bot_token, target_user_id, text).await;
+    counter("dm.sent", 1)
+        .attribute("kind", "update")
+        .attribute("result", if result.is_ok() { "success" } else { "error" })
+        .capture();
+    result
 }
 
 #[tracing::instrument(name = "dm_sending_pipeline", skip(client, bot_token))]
-async fn send_dm(
+async fn send_dm_impl(
     client: &Client,
     bot_token: &str,
     target_user_id: &str,
@@ -1904,6 +2024,7 @@ async fn send_dm(
     });
 
     debug!(target_user_id = %target_user_id, "Opening DM channel via conversations.open");
+    let open_start = std::time::Instant::now();
     let response = client
         .post("https://slack.com/api/conversations.open")
         .bearer_auth(bot_token)
@@ -1912,7 +2033,17 @@ async fn send_dm(
         .await
         .context(format!(
             "An error occurred when opening a conversation with user {target_user_id}",
-        ))?;
+        ));
+    let response = match response {
+        Ok(response) => {
+            logging::record_slack_api_metric("conversations.open", open_start, "ok");
+            response
+        }
+        Err(e) => {
+            logging::record_slack_api_metric("conversations.open", open_start, "request_error");
+            return Err(e);
+        }
+    };
 
     trace!("Opened conversation with user {target_user_id}");
 
@@ -1935,6 +2066,7 @@ async fn send_dm(
     "text": text
     });
 
+    let message_start = std::time::Instant::now();
     let res = client
         .post("https://slack.com/api/chat.postMessage")
         .bearer_auth(bot_token)
@@ -1943,7 +2075,17 @@ async fn send_dm(
         .await
         .context(format!(
             "An error occurred sending a message to the newly opened DM with {target_user_id}"
-        ))?;
+        ));
+    let res = match res {
+        Ok(res) => {
+            logging::record_slack_api_metric("chat.postMessage", message_start, "ok");
+            res
+        }
+        Err(e) => {
+            logging::record_slack_api_metric("chat.postMessage", message_start, "request_error");
+            return Err(e);
+        }
+    };
 
     let json: Value = res
         .json()
@@ -1970,12 +2112,27 @@ async fn send_request_dm(
     target_user_id: &str,
     user: &WhereIOnlyNeedTheIdField,
 ) -> anyhow::Result<()> {
+    let result = send_request_dm_impl(client, bot_token, target_user_id, user).await;
+    counter("dm.sent", 1)
+        .attribute("kind", "approval_request")
+        .attribute("result", if result.is_ok() { "success" } else { "error" })
+        .capture();
+    result
+}
+
+async fn send_request_dm_impl(
+    client: &Client,
+    bot_token: &str,
+    target_user_id: &str,
+    user: &WhereIOnlyNeedTheIdField,
+) -> anyhow::Result<()> {
     trace!(subscriber_id = %user.id, %target_user_id, "Sending subscription request DM");
     let json = json!({
     "users": target_user_id
     });
 
     debug!(%target_user_id, "Opening DM channel via conversations.open");
+    let open_start = std::time::Instant::now();
     let response = client
         .post("https://slack.com/api/conversations.open")
         .bearer_auth(bot_token)
@@ -1985,7 +2142,17 @@ async fn send_request_dm(
         .context(format!(
             "An error occurred when opening a conversation with user {}",
             user.id
-        ))?;
+        ));
+    let response = match response {
+        Ok(response) => {
+            logging::record_slack_api_metric("conversations.open", open_start, "ok");
+            response
+        }
+        Err(e) => {
+            logging::record_slack_api_metric("conversations.open", open_start, "request_error");
+            return Err(e);
+        }
+    };
 
     trace!("Opened conversation with user {target_user_id}");
 
@@ -2063,6 +2230,7 @@ async fn send_request_dm(
     "blocks": blocks
     });
 
+    let message_start = std::time::Instant::now();
     let res = client
         .post("https://slack.com/api/chat.postMessage")
         .bearer_auth(bot_token)
@@ -2071,7 +2239,17 @@ async fn send_request_dm(
         .await
         .context(format!(
             "An error occurred sending a message to the newly opened DM with {target_user_id}"
-        ))?;
+        ));
+    let res = match res {
+        Ok(res) => {
+            logging::record_slack_api_metric("chat.postMessage", message_start, "ok");
+            res
+        }
+        Err(e) => {
+            logging::record_slack_api_metric("chat.postMessage", message_start, "request_error");
+            return Err(e);
+        }
+    };
 
     let json: Value = res
         .json()
@@ -2332,16 +2510,36 @@ fn build_inline_error_response(field: &str, message: &str) -> Response<Body> {
 }
 
 async fn send_and_log_on_failure(request: reqwest::RequestBuilder, context: &str) {
-    match request.send().await {
-        Ok(response) => match response.json::<Value>().await {
-            Ok(body) => {
-                if body.get("ok") != Some(&json!(true)) {
-                    error!(context, response = ?body, "Slack API call reported failure");
+    let (client, request) = request.build_split();
+    let request = match request {
+        Ok(request) => request,
+        Err(e) => {
+            error!(context, error = ?e, "Failed to build Slack request");
+            return;
+        }
+    };
+    let endpoint = request.url().path().trim_start_matches("/api/").to_string();
+    let start = std::time::Instant::now();
+    match client.execute(request).await {
+        Ok(response) => {
+            logging::record_slack_api_metric(
+                &endpoint,
+                start,
+                &response.status().as_u16().to_string(),
+            );
+            match response.json::<Value>().await {
+                Ok(body) => {
+                    if body.get("ok") != Some(&json!(true)) {
+                        error!(context, response = ?body, "Slack API call reported failure");
+                    }
                 }
+                Err(e) => error!(context, error = ?e, "Failed to parse Slack response as JSON"),
             }
-            Err(e) => error!(context, error = ?e, "Failed to parse Slack response as JSON"),
-        },
-        Err(e) => error!(context, error = ?e, "Request to Slack failed"),
+        }
+        Err(e) => {
+            logging::record_slack_api_metric(&endpoint, start, "request_error");
+            error!(context, error = ?e, "Request to Slack failed");
+        }
     }
 }
 
@@ -2350,23 +2548,41 @@ async fn send_and_log_on_failure_with_return(
     request: reqwest::RequestBuilder,
     context: &str,
 ) -> bool {
+    let (client, request) = request.build_split();
+    let request = match request {
+        Ok(request) => request,
+        Err(e) => {
+            error!(context, error = ?e, "Failed to build Slack request");
+            return true;
+        }
+    };
+    let endpoint = request.url().path().trim_start_matches("/api/").to_string();
+    let start = std::time::Instant::now();
     // error: yes/no
-    match request.send().await {
-        Ok(response) => match response.json::<Value>().await {
-            Ok(body) => {
-                if body.get("ok") != Some(&json!(true)) {
-                    error!(context, response = ?body, "Slack API call reported failure");
+    match client.execute(request).await {
+        Ok(response) => {
+            logging::record_slack_api_metric(
+                &endpoint,
+                start,
+                &response.status().as_u16().to_string(),
+            );
+            match response.json::<Value>().await {
+                Ok(body) => {
+                    if body.get("ok") != Some(&json!(true)) {
+                        error!(context, response = ?body, "Slack API call reported failure");
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Err(e) => {
+                    error!(context, error = ?e, "Failed to parse Slack response as JSON");
                     true
-                } else {
-                    false
                 }
             }
-            Err(e) => {
-                error!(context, error = ?e, "Failed to parse Slack response as JSON");
-                true
-            }
-        },
+        }
         Err(e) => {
+            logging::record_slack_api_metric(&endpoint, start, "request_error");
             error!(context, error = ?e, "Request to Slack failed");
             true
         }

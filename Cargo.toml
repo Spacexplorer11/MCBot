@@ -14,16 +14,11 @@ async_zip = { version = "0.0.18", features = ["full"] }
 image = "0.25.10"
 anyhow = "1.0.103"
 tracing = "0.1"
-opentelemetry = "0.32.0"
-opentelemetry_sdk = { version = "0.32.1", features = ["trace", "rt-tokio"]}
-opentelemetry-otlp = { version = "0.32.0", features = ["http-proto", "reqwest-rustls"] }
-tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"] }
 tokio-util = "0.7.18"
 strsim = "0.11.1"
 regex = "1.13.0"
 chrono = "0.4.39"
-hostname = "0.4.2"
 hmac = "0.13.0"
 sha2 = "0.11.0"
 hex = "0.4.3"
