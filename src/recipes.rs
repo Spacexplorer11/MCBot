@@ -589,7 +589,7 @@ impl RecipeData {
         while let Some(result) = set.join_next().await {
             let item_result = result?;
             let (item, bytes) = item_result?;
-            debug!(item = %item, bytes = bytes.len(), "Wiki fallback texture fetched and stored");
+            debug!(%item, bytes = bytes.len(), "Wiki fallback texture fetched and stored");
             self.items.insert(item, bytes);
         }
 

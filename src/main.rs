@@ -5,6 +5,7 @@ pub mod font;
 pub mod logging;
 pub mod recipes;
 
+use crate::Task::UpdateDMs;
 use crate::{
     Task::{Recipe, Subscriptions},
     data::fetch_client_jar,
@@ -35,6 +36,7 @@ use serde_json::{Value, json};
 use sqlx::{query, query_as};
 use std::time::Duration;
 use std::{collections::HashMap, env, io, sync::Arc};
+use tokio::task::JoinSet;
 use tokio::{
     net::TcpListener,
     sync::{mpsc, mpsc::error::TrySendError},
@@ -57,6 +59,12 @@ enum Task {
         user_id: String,
         trigger_id: String,
         bot_token: Arc<str>,
+    },
+    UpdateDMs {
+        people: Vec<String>,
+        joining: bool,
+        slack_and_mc: (String, String),
+        bot_token: String,
     },
 }
 
@@ -109,14 +117,14 @@ struct SlackInteractionPayload {
 }
 
 #[derive(Deserialize)]
-struct SlackChannel {
+struct WhereIOnlyNeedTheIdField {
     id: String,
 }
 
 #[derive(Deserialize)]
 struct OpenConversationResponse {
     ok: bool,
-    channel: SlackChannel,
+    channel: WhereIOnlyNeedTheIdField,
 }
 
 #[derive(Deserialize)]
@@ -124,14 +132,17 @@ struct OpenConversationResponse {
 enum SlackInteraction {
     #[serde(rename = "block_actions")]
     BlockActions {
-        user: SlackUser,
+        user: WhereIOnlyNeedTheIdField,
         view: Option<SlackView>,
         actions: Vec<SlackActions>,
         trigger_id: String,
         response_url: Option<String>,
     },
     #[serde(rename = "view_submission")]
-    ViewSubmission { user: SlackUser, view: SlackView },
+    ViewSubmission {
+        user: WhereIOnlyNeedTheIdField,
+        view: SlackView,
+    },
 }
 
 #[derive(Deserialize)]
@@ -214,11 +225,6 @@ enum CallbackId {
     ConfigureSubsModal,
     #[serde(rename = "input_new_sub_user")]
     InputNewSubUser,
-}
-
-#[derive(Deserialize)]
-struct SlackUser {
-    id: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -568,6 +574,53 @@ fn main() -> io::Result<()> {
                             )
                                 .await;
                         }
+
+                        UpdateDMs {
+                            people,
+                            joining,
+                            slack_and_mc,
+                            bot_token
+                        } => {
+                            let text_to_send;
+                            if joining {
+                                text_to_send = format!("Your friend <@{}> ({}) just joined the hackclub minecraft server!", slack_and_mc.0, slack_and_mc.1);
+                            }
+                            else {
+                                text_to_send = format!("Your friend <@{}> ({}) just left the hackclub minecraft server!", slack_and_mc.0, slack_and_mc.1);
+                            }
+                            let mut set = JoinSet::new();
+
+
+                            if people.len() > 1 {
+                                for person in people {
+                                    let client = client.clone();
+                                    let bot_token = bot_token.clone();
+                                    let text_to_send = text_to_send.clone();
+                                    set.spawn(async move {
+                                        send_dm(&client, &bot_token, &person, &text_to_send).await
+                                    });
+                                }
+
+                                while let Some(result) = set.join_next().await {
+                                    if let Ok(result) = result {
+                                        if let Err(error) = result {
+                                            capture_anyhow(&error);
+                                            error!(?error, "MANUAL APOLOGY REQUIRED! AN ERROR OCCURRED WHEN SENDING THE UPDATE DM");
+                                        } else {
+                                            info!("Update DM successfully sent!");
+                                        }
+                                    }
+                                }
+                            } else if people.len() == 1 {
+                                match send_dm(&client, &bot_token, &people[0], &text_to_send).await {
+                                    Ok(..) => info!("Update DM successfully sent!"),
+                                    Err(error) => {
+                                        capture_anyhow(&error);
+                                        error!(?error, "MANUAL APOLOGY REQUIRED! AN ERROR OCCURRED WHEN SENDING THE UPDATE DM");
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -656,8 +709,65 @@ async fn handle_event(
                     if let Some(bot_id) = event.bot_id {
                         if bot_id.to_uppercase().eq("B04SB2PQLS1") {
                             match event.username {
-                                UsefulUsernames::Join => StatusCode::OK.into_response(),
-                                UsefulUsernames::Leave => StatusCode::OK.into_response(),
+                                UsefulUsernames::Join | UsefulUsernames::Leave => {
+                                    let text = event.text.split_ascii_whitespace().map(|part| part.to_string()).collect::<Vec<String>>();
+
+                                    let username = text.first().expect("This is a deterministic message. If this has changed then that is requires immediate attention.").replace('*', "");
+
+                                    let slack_id = match query!(
+                                        "SELECT * FROM users WHERE $1 = ANY(mc_usernames)",
+                                        username
+                                    )
+                                        .fetch_optional(&state.sqlx_pool)
+                                        .await
+                                    {
+                                        Ok(row) => {
+                                            if let Some(row) = row {
+                                                row.slack_id
+                                            } else {
+                                                debug!(timestamp=%event.ts, text=%event.text, ?username, "The row could not be found. This is likely expected because... not everyone is in the database.");
+                                                return StatusCode::OK.into_response()
+                                            }
+                                        },
+                                        Err(error) => {
+                                            error!(?error, timestamp=%event.ts, text=%event.text, ?username, "MANUAL APOLOGY REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FOR THE JOIN/LEAVE FROM THE DATABASE.");
+                                            return StatusCode::OK.into_response();
+                                        }
+                                    };
+
+                                    let subscribed_people = match query!(
+                                        "SELECT *
+                                        FROM subscriptions
+                                        WHERE target_id = $1
+                                          AND active = true;",
+                                        slack_id
+                                    )
+                                        .fetch_all(&state.sqlx_pool)
+                                        .await
+                                    {
+                                        Ok(rows) => rows.into_iter().map(|row| row.subscriber_id).collect::<Vec<String>>(),
+                                        Err(error) => {
+                                            error!(?error, timestamp=%event.ts, text=%event.text, ?slack_id, ?username, "MANUAL APOLOGY REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FROM THE DATABASE.");
+                                            return StatusCode::OK.into_response();
+                                        }
+                                    };
+
+                                    let joining = event.text.contains("joined");
+
+                                    match state.mpsc.try_send(
+                                        UpdateDMs {
+                                            people: subscribed_people,
+                                            joining,
+                                            slack_and_mc: (slack_id.clone(), username.to_string()),
+                                            bot_token: state.bot_token.clone().to_string()
+                                        }
+                                    ) {
+                                        Ok(..) => info!("Successfully sent the update DM's task to the mpsc queue"),
+                                        Err(error) => error!(?error, timestamp=%event.ts, text=%event.text, ?slack_id, ?username, "MANUAL APOLOGY REQUIRED. AN ERROR OCCURRED WHEN SENDING THE UPDATE DMS TASK TO THE MPSC QUEUE")
+                                    }
+
+                                    StatusCode::OK.into_response()
+                                },
                                 UsefulUsernames::Nickname => {
                                     let text = event.text.split_ascii_whitespace().map(|part| part.to_string()).collect::<Vec<String>>();
 
@@ -673,7 +783,7 @@ async fn handle_event(
                                     {
                                         Ok(row) => row,
                                         Err(error) => {
-                                            error!(?error, timestamp=%event.ts, text=%event.text, ?old_nick, ?new_nick, "MANUAL INPUT REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FROM THE DATABASE.");
+                                            error!(?error, timestamp=%event.ts, text=%event.text, ?old_nick, ?new_nick, "MANUAL INPUT REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FOR NICKNAME UPDATES FROM THE DATABASE.");
                                             return StatusCode::OK.into_response();
                                         }
                                     };
@@ -979,8 +1089,6 @@ async fn handle_interactions(
                     }
                 }
                 /*
-                 TODO: Add to database on request
-                 TODO: Send DM to subscriber that they accepted
                  TODO: Patrol #minecraft-bridge and send DM's (hammer the index remember)
                  TODO: Make the code better and use let Variant(x) = x else {} instead of if let Err(e) blah blah blah
                 */
@@ -1783,18 +1891,91 @@ async fn legacy_send_message(json: &Value, client: &Client, bot_token: &str) -> 
     Ok(())
 }
 
-async fn send_request_dm(
+#[tracing::instrument(name = "dm_sending_pipeline", skip(client, bot_token))]
+async fn send_dm(
     client: &Client,
     bot_token: &str,
     target_user_id: &str,
-    user: &SlackUser,
+    text: &str,
 ) -> anyhow::Result<()> {
-    trace!(subscriber_id = %user.id, target_user_id = %target_user_id, "Sending subscription request DM");
+    trace!(%target_user_id, "Sending subscription request DM");
     let json = json!({
     "users": target_user_id
     });
 
     debug!(target_user_id = %target_user_id, "Opening DM channel via conversations.open");
+    let response = client
+        .post("https://slack.com/api/conversations.open")
+        .bearer_auth(bot_token)
+        .json(&json)
+        .send()
+        .await
+        .context(format!(
+            "An error occurred when opening a conversation with user {target_user_id}",
+        ))?;
+
+    trace!("Opened conversation with user {target_user_id}");
+
+    let json: OpenConversationResponse = response
+        .json()
+        .await
+        .context("Failed to parse the conversations.open response to json")?;
+    if !json.ok {
+        error!(%target_user_id, "Slack conversations.open returned non-OK response for subscription request DM");
+        return Err(anyhow!(
+            "Slack conversations.open API returned a non-OK response"
+        ));
+    }
+
+    let channel = json.channel.id;
+    debug!(%target_user_id, channel_id = %channel, "DM channel opened successfully");
+
+    let message = json!({
+    "channel": channel,
+    "text": text
+    });
+
+    let res = client
+        .post("https://slack.com/api/chat.postMessage")
+        .bearer_auth(bot_token)
+        .json(&message)
+        .send()
+        .await
+        .context(format!(
+            "An error occurred sending a message to the newly opened DM with {target_user_id}"
+        ))?;
+
+    let json: Value = res
+        .json()
+        .await
+        .context("Failed to convert the chat.postMessage response to json")?;
+
+    if json.get("ok") != Some(&json!(true)) {
+        error!(
+            %target_user_id,
+            ?json,
+            "Slack chat.postMessage API returned a non-OK response for the subscription request DM"
+        );
+        return Err(anyhow!(
+            "Slack chat.postMessage API returned a non-OK response"
+        ));
+    }
+    info!(%target_user_id, "DM successfully delivered");
+    Ok(())
+}
+
+async fn send_request_dm(
+    client: &Client,
+    bot_token: &str,
+    target_user_id: &str,
+    user: &WhereIOnlyNeedTheIdField,
+) -> anyhow::Result<()> {
+    trace!(subscriber_id = %user.id, %target_user_id, "Sending subscription request DM");
+    let json = json!({
+    "users": target_user_id
+    });
+
+    debug!(%target_user_id, "Opening DM channel via conversations.open");
     let response = client
         .post("https://slack.com/api/conversations.open")
         .bearer_auth(bot_token)
@@ -1808,22 +1989,19 @@ async fn send_request_dm(
 
     trace!("Opened conversation with user {target_user_id}");
 
-    let response_bytes = response
-        .bytes()
+    let json: OpenConversationResponse = response
+        .json()
         .await
-        .context("Failed to parse response from slack for conversations.open")?;
-
-    let json: OpenConversationResponse =
-        serde_json::from_slice(&response_bytes).context("Failed to convert the bytes to json")?;
+        .context("Failed to parse the conversations.open response to json")?;
     if !json.ok {
-        error!(target_user_id = %target_user_id, "Slack conversations.open returned non-OK response for subscription request DM");
+        error!(%target_user_id, "Slack conversations.open returned non-OK response for subscription request DM");
         return Err(anyhow!(
             "Slack conversations.open API returned a non-OK response"
         ));
     }
 
     let channel = json.channel.id;
-    debug!(target_user_id = %target_user_id, channel_id = %channel, "DM channel opened successfully");
+    debug!(%target_user_id, channel_id = %channel, "DM channel opened successfully");
 
     let blocks = json!([
     {
@@ -1895,24 +2073,22 @@ async fn send_request_dm(
             "An error occurred sending a message to the newly opened DM with {target_user_id}"
         ))?;
 
-    let res_bytes = res
-        .bytes()
+    let json: Value = res
+        .json()
         .await
-        .context("Failed to parse response from slack for chat.postMessage")?;
+        .context("Failed to convert the chat.postMessage response to json")?;
 
-    let json: OpenConversationResponse =
-        serde_json::from_slice(&res_bytes).context("Failed to convert the bytes to json")?;
-    if !json.ok {
+    if json.get("ok") != Some(&json!(true)) {
         error!(
-            target_user_id = %target_user_id,
-            response = %String::from_utf8_lossy(&res_bytes),
+            %target_user_id,
+            ?json,
             "Slack chat.postMessage API returned a non-OK response for the subscription request DM"
         );
         return Err(anyhow!(
             "Slack chat.postMessage API returned a non-OK response"
         ));
     }
-    info!(subscriber_id = %user.id, target_user_id = %target_user_id, "Subscription approval request DM successfully delivered");
+    info!(subscriber_id = %user.id, %target_user_id, "Subscription approval request DM successfully delivered");
     Ok(())
 }
 
@@ -1985,12 +2161,13 @@ LIMIT 6 OFFSET $2",
         let title = if len > 1 {
             let mut mcusers = String::new();
 
-            let i = 1;
+            let mut i = 1;
 
             for mcuser in &subscription.mc_usernames {
                 if i != len {
                     let mcuser = format!("{mcuser}, ");
-                    mcusers.push_str(&mcuser)
+                    mcusers.push_str(&mcuser);
+                    i += 1
                 } else {
                     mcusers.push_str(mcuser)
                 }
