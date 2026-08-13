@@ -221,14 +221,33 @@ struct SlackUser {
     id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct SlackEvent {
     #[serde(rename = "type")]
-    event_type: String,
+    event_type: SlackEvents,
     channel: String,
     text: String,
-    user: String,
+    user: Option<String>,
     ts: String,
+    bot_id: Option<String>,
+    username: UsefulUsernames,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "PascalCase")]
+enum UsefulUsernames {
+    Join,
+    Leave,
+    Nickname,
+    #[serde(other)]
+    Irrelevant,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+enum SlackEvents {
+    AppMention,
+    Message,
 }
 
 #[derive(Deserialize)]
@@ -628,9 +647,96 @@ async fn handle_event(
         SlackPayload::EventCallback { event } => {
             counter("slack.event", 1)
                 .attribute("type", "event_callback")
+                .attribute("subtype", format!("{:?}", event.event_type))
                 .capture();
-            trace!(event_type = event.event_type, "Received event");
-            send_message(&json!({"channel": event.channel, "text": "Hi! I'm MCBot, made by <@U08D22QNUVD>! :) \nUse /mcrecipe to get crafting recipes!", "thread_ts": event.ts}), &state.client, &state.bot_token).await
+            trace!(event_type = ?event.event_type, ?event, "Received event");
+            match event.event_type {
+              SlackEvents::AppMention => send_message(&json!({"channel": event.channel, "text": "Hi! I'm MCBot, made by <@U08D22QNUVD>! :) \nUse /mcrecipe to get crafting recipes!", "thread_ts": event.ts}), &state.client, &state.bot_token).await,
+                SlackEvents::Message => {
+                    if let Some(bot_id) = event.bot_id {
+                        if bot_id.to_uppercase().eq("B04SB2PQLS1") {
+                            match event.username {
+                                UsefulUsernames::Join => StatusCode::OK.into_response(),
+                                UsefulUsernames::Leave => StatusCode::OK.into_response(),
+                                UsefulUsernames::Nickname => {
+                                    let text = event.text.split_ascii_whitespace().map(|part| part.to_string()).collect::<Vec<String>>();
+                                    
+                                    let old_nick = text.first().expect("This is a deterministic message. If this has changed then that is requires immediate attention.");
+                                    let new_nick = text.last().expect("This is a deterministic message. If this has changed then that is requires immediate attention.");
+                                    
+                                    let row = match query!(
+                                        "SELECT * FROM users WHERE $1 = ANY(mc_usernames)",
+                                        old_nick
+                                    )
+                                        .fetch_one(&state.sqlx_pool)
+                                        .await
+                                    {
+                                        Ok(row) => row,
+                                        Err(error) => {
+                                            error!(?error, timestamp=%event.ts, text=%event.text, ?old_nick, ?new_nick, "MANUAL INPUT REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FROM THE DATABASE.");
+                                            return StatusCode::OK.into_response();
+                                        }
+                                    };
+                                    
+                                    let mut mc_usernames = row.mc_usernames;
+                                    mc_usernames.retain(|user| user != old_nick);
+                                    mc_usernames.push(new_nick.clone());
+                                    
+                                    match query!("UPDATE users SET mc_usernames = $1 WHERE slack_id = $2", &mc_usernames, row.slack_id).execute(&state.sqlx_pool).await {
+                                        Ok(..) => {
+                                            info!(slack=%row.slack_id,"Successfully updated nick from {old_nick} to {new_nick}.");
+                                            counter("nickname.update", 1)
+                                                .capture();
+                                        },
+                                        Err(e) => error!(error=?e, timestamp=%event.ts, text=%event.text, %old_nick, %new_nick, slack=%row.slack_id, "MANUAL INPUT REQUIRED. AN ERROR OCCURRED WHEN UPDATING THE DATABASE IN THE FINAL STEP OF UPDATING A NICKNAME.")
+                                    }
+                                    
+                                    StatusCode::OK.into_response()
+                                    
+                              /* Honestly this took me took long to make so in case I need it in the future I kept it
+                              let response: MinecraftPlayerData = match state.client.get("https://api.mc.hackclub.com")
+                                    .header("User-Agent", "MCBot")
+                                    .bearer_auth(state.hackclub_api_key.clone())
+                                    .send()
+                                    .await {
+                                        Ok(res) => match res.status() {
+                                            StatusCode::OK => match res.json().await {
+                                                Ok(mpd) => mpd,
+                                                Err(e) => {
+                                                    error!(error=?e, timestamp=%event.ts, text=%event.text, "MANUAL INPUT REQUIRED. AN ERROR OCCURRED WHEN CONVERTING THE RESPONSE FROM HACKCLUB API TO MINECRAFTPLAYERDATA.");
+                                                    return StatusCode::OK.into_response()
+                                                }
+                                            }
+                                            StatusCode::TOO_MANY_REQUESTS => {
+                                                error!(timestamp=%event.ts, text=%event.text, response=?res, "MANUAL INPUT REQUIRED. YOU HIT THE RATELIMT FOR THE HACKCLUB API");
+                                                return StatusCode::OK.into_response()
+                                            }
+                                            StatusCode::NOT_FOUND => {
+                                                error!(timestamp=%event.ts, text=%event.text, response=?res, "MANUAL INPUT REQUIRED. THE API COULDN'T FIND THIS NICK EVEN THO IT SHOULD BE ABLE TO BE FOUND.");
+                                                return StatusCode::OK.into_response()
+                                            }
+                                            _ => {
+                                                error!(status=?res.status(), timestamp=%event.ts, text=%event.text, response=?res, "MANUAL INPUT REQUIRED. THE HACKCLUB API RETURNED AN ERROR STATUS CODE.");
+                                                return StatusCode::OK.into_response()
+                                            }
+                                        }
+                                    Err(e) => {
+                                        error!(error=?e, timestamp=%event.ts, text=%event.text, "MANUAL INPUT REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE SLACK ID FROM HACKCLUB API.");
+                                        return StatusCode::OK.into_response()
+                                    }
+                                    }; */
+                                },
+                                UsefulUsernames::Irrelevant => StatusCode::OK.into_response()
+                            }
+                        } else {
+                            StatusCode::OK.into_response()
+                        }
+                    }
+                    else {
+                        StatusCode::OK.into_response()
+                    }
+                }
+            }
         }
     }
 }
@@ -997,7 +1103,7 @@ async fn handle_interactions(
 
                         let non_player = match state
                             .client
-                            .get(format!("https://api.mc.hackclub.com?slack={selected_user}"))
+                            .get(format!("https://api.mc.hackclub.com/player?slack={selected_user}"))
                             .bearer_auth(state.hackclub_api_key.clone())
                             .send()
                             .await
@@ -1287,7 +1393,7 @@ async fn handle_interactions(
                     let response_from_hc_api = match state
                         .client
                         .get(format!(
-                            "https://api.mc.hackclub.com?slack={target_user_id}"
+                            "https://api.mc.hackclub.com/player?slack={target_user_id}"
                         ))
                         .bearer_auth(state.hackclub_api_key.clone())
                         .send()
@@ -1309,32 +1415,26 @@ async fn handle_interactions(
                             "This player does not play on the hackclub minecraft server. If this is incorrect please ask them to join the server, go through the linking flow and then try again. If this still persists please contact <@U08D22QNUVD>.",
                         );
                     } else if !response_from_hc_api.status().is_success() {
-                        error!(status=%response_from_hc_api.status(), target=%target_user_id, trigger_user=%user.id "The hackclub API returned an non-404 error.");
+                        error!(status=%response_from_hc_api.status(), target=%target_user_id, trigger_user=%user.id, "The hackclub API returned an non-404 error.");
                         return build_inline_error_response(
                             "users_select",
                             "Internal: The API returned an error when fetching information for this player.",
                         );
                     }
 
-                    let Ok(response_as_bytes) = response_from_hc_api.bytes() else {
-                        error!(response=?response_from_hc_api, "Failed to convert response to bytes");
-                        return build_inline_error_response(
-                            "users_select",
-                            "Internal: Failed to convert the response from the Hackclub API to bytes?? Weird.",
-                        );
+                    let minecraft_player_data: Vec<MinecraftPlayerData> = match response_from_hc_api
+                        .json()
+                        .await
+                    {
+                        Ok(mpd) => mpd,
+                        Err(e) => {
+                            error!(error=?e, "An error occurred when converting the response to MinecraftPlayerData");
+                            return build_inline_error_response(
+                                "users_select",
+                                "Internal: I couldn't convert the response from the hackclub API to MinecraftPlayerData. (This is irrelevant to you lol, just know it didnt work)",
+                            );
+                        }
                     };
-
-                    let minecraft_player_data: Vec<MinecraftPlayerData> =
-                        match serde_json::from_slice(&response_as_bytes) {
-                            Ok(mpd) => mpd,
-                            Err(e) => {
-                                error!(response=?response_from_hc_api, error=?e, "An error occurred when converting the response to MinecraftPlayerData");
-                                return build_inline_error_response(
-                                    "users_select",
-                                    "Internal: I couldn't convert the response from the hackclub API to MinecraftPlayerData. (This is irrelevant to you lol, just know it didnt work)",
-                                );
-                            }
-                        };
 
                     let mut mc_usernames = Vec::new();
 
@@ -1441,6 +1541,14 @@ async fn handle_mcrecipes(
         }
 
         SlackPayload::EventCallback { event } => {
+            let user_id = if let Some(user_id) = event.user {
+                user_id.clone()
+            } else if let Some(bot_id) = event.bot_id {
+                bot_id.clone()
+            } else {
+                error!(event=?event, "No user/bot id was found in this event.");
+                return StatusCode::OK.into_response();
+            };
             let cleaned_text = match event.text.strip_prefix("<@U0A5X0FV9V4>") {
                 Some(str) => str.to_string(),
                 None => return StatusCode::OK.into_response(),
@@ -1461,14 +1569,13 @@ async fn handle_mcrecipes(
                     item_name: recipe.clone(),
                     response_url: None,
                     channel_id: event.channel.clone(),
-                    user_id: event.user.clone(),
+                    user_id: user_id.clone(),
                     thread_ts: Some(event.ts.clone()),
                     bot_token: state.bot_token.clone(),
                 }) {
                     Ok(..) => {
                         info!(
-                            "Started processing recipe for {} from {}",
-                            recipe, event.user
+                            "Started processing recipe for {recipe} from {user_id}"
                         );
                         send_message(
                             &json!({"channel": event.channel, "thread_ts": event.ts, "text": format!("This bot now uses <@U0B8ER7U1S5>'s backend for responses, as it has been replaced by it. You can also use /mcrecipe to get the recipe!\nGathering images and sewing 'em up, hang on a second! {assumption_text}")}),
@@ -1498,8 +1605,7 @@ async fn handle_mcrecipes(
                 }
             } else {
                 warn!(
-                    "User {} tried to get recipe {recipe} but it was invalid",
-                    event.user
+                    "User {user_id} tried to get recipe {recipe} but it was invalid"
                 );
                 send_message(
                     &json!({"channel": event.channel, "thread_ts": event.ts, "text": "Sorry your recipe was invalid."}),
