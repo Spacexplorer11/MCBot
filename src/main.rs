@@ -660,10 +660,10 @@ async fn handle_event(
                                 UsefulUsernames::Leave => StatusCode::OK.into_response(),
                                 UsefulUsernames::Nickname => {
                                     let text = event.text.split_ascii_whitespace().map(|part| part.to_string()).collect::<Vec<String>>();
-                                    
+
                                     let old_nick = text.first().expect("This is a deterministic message. If this has changed then that is requires immediate attention.");
                                     let new_nick = text.last().expect("This is a deterministic message. If this has changed then that is requires immediate attention.");
-                                    
+
                                     let row = match query!(
                                         "SELECT * FROM users WHERE $1 = ANY(mc_usernames)",
                                         old_nick
@@ -677,11 +677,11 @@ async fn handle_event(
                                             return StatusCode::OK.into_response();
                                         }
                                     };
-                                    
+
                                     let mut mc_usernames = row.mc_usernames;
                                     mc_usernames.retain(|user| user != old_nick);
                                     mc_usernames.push(new_nick.clone());
-                                    
+
                                     match query!("UPDATE users SET mc_usernames = $1 WHERE slack_id = $2", &mc_usernames, row.slack_id).execute(&state.sqlx_pool).await {
                                         Ok(..) => {
                                             info!(slack=%row.slack_id,"Successfully updated nick from {old_nick} to {new_nick}.");
@@ -690,9 +690,9 @@ async fn handle_event(
                                         },
                                         Err(e) => error!(error=?e, timestamp=%event.ts, text=%event.text, %old_nick, %new_nick, slack=%row.slack_id, "MANUAL INPUT REQUIRED. AN ERROR OCCURRED WHEN UPDATING THE DATABASE IN THE FINAL STEP OF UPDATING A NICKNAME.")
                                     }
-                                    
+
                                     StatusCode::OK.into_response()
-                                    
+
                               /* Honestly this took me took long to make so in case I need it in the future I kept it
                               let response: MinecraftPlayerData = match state.client.get("https://api.mc.hackclub.com")
                                     .header("User-Agent", "MCBot")
@@ -1103,7 +1103,9 @@ async fn handle_interactions(
 
                         let non_player = match state
                             .client
-                            .get(format!("https://api.mc.hackclub.com/player?slack={selected_user}"))
+                            .get(format!(
+                                "https://api.mc.hackclub.com/player?slack={selected_user}"
+                            ))
                             .bearer_auth(state.hackclub_api_key.clone())
                             .send()
                             .await
@@ -1574,9 +1576,7 @@ async fn handle_mcrecipes(
                     bot_token: state.bot_token.clone(),
                 }) {
                     Ok(..) => {
-                        info!(
-                            "Started processing recipe for {recipe} from {user_id}"
-                        );
+                        info!("Started processing recipe for {recipe} from {user_id}");
                         send_message(
                             &json!({"channel": event.channel, "thread_ts": event.ts, "text": format!("This bot now uses <@U0B8ER7U1S5>'s backend for responses, as it has been replaced by it. You can also use /mcrecipe to get the recipe!\nGathering images and sewing 'em up, hang on a second! {assumption_text}")}),
                             &state.client,
@@ -1604,9 +1604,7 @@ async fn handle_mcrecipes(
                     }
                 }
             } else {
-                warn!(
-                    "User {user_id} tried to get recipe {recipe} but it was invalid"
-                );
+                warn!("User {user_id} tried to get recipe {recipe} but it was invalid");
                 send_message(
                     &json!({"channel": event.channel, "thread_ts": event.ts, "text": "Sorry your recipe was invalid."}),
                     &state.client,
