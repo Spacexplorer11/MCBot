@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE subscriptions SET active = true WHERE target_id = $1 AND subscriber_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cc684f506e32baf287b313e6e6ad0aa2cf6902f60990269d63a0b574815255bf"
+}

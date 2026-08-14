@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT * FROM users WHERE $1 = ANY(mc_usernames)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "slack_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "slack_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "mc_usernames",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "mc_usernames"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "c6f630733988a258e2efdc2865904302bf77e7b65a1d8d7532c75d834ae4f639"
+}
