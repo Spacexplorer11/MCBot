@@ -246,7 +246,12 @@ struct SlackEvent {
     user: Option<String>,
     ts: String,
     bot_id: Option<String>,
+    #[serde(default = "useless_username")]
     username: UsefulUsernames,
+}
+
+fn useless_username() -> UsefulUsernames {
+    UsefulUsernames::Irrelevant
 }
 
 #[derive(Deserialize, Debug)]
@@ -303,6 +308,7 @@ fn main() -> io::Result<()> {
                 if release.is_err() {
                     sentry::release_name!()
                 } else {
+                    #[allow(clippy::unnecessary_unwrap)]
                     Some(release.unwrap().into())
                 }
             })
@@ -613,15 +619,13 @@ fn main() -> io::Result<()> {
                             distribution("task.queue.delay", queued_at.elapsed().as_millis() as f64)
                                 .unit(Unit::Millisecond)
                                 .capture();
-                            let text_to_send;
-                            if joining {
-                                text_to_send = format!("Your friend <@{}> ({}) just joined the hackclub minecraft server!", slack_and_mc.0, slack_and_mc.1);
-                            }
-                            else {
-                                text_to_send = format!("Your friend <@{}> ({}) just left the hackclub minecraft server!", slack_and_mc.0, slack_and_mc.1);
-                            }
-                            let mut set = JoinSet::new();
+                            let text_to_send = if joining {
+                                format!("Your friend <@{}> ({}) just joined the hackclub minecraft server!", slack_and_mc.0, slack_and_mc.1)
+                            } else {
+                                format!("Your friend <@{}> ({}) just left the hackclub minecraft server!", slack_and_mc.0, slack_and_mc.1)
+                            };
 
+                            let mut set = JoinSet::new();
 
                             if people.len() > 1 {
                                 for person in people {
@@ -800,7 +804,7 @@ async fn handle_event(
                                             if let Some(row) = row {
                                                 row.slack_id
                                             } else {
-                                                debug!(timestamp=%event.ts, text=%event.text, ?username, "The row could not be found. This is likely expected because... not everyone is in the database.");
+                                                debug!(timestamp=%event.ts, text=%event.text, ?username, "The user for join/leave row could not be found. This is likely expected because... not everyone is in the database.");
                                                 return StatusCode::OK.into_response()
                                             }
                                         },
@@ -854,10 +858,17 @@ async fn handle_event(
                                         "SELECT * FROM users WHERE $1 = ANY(mc_usernames)",
                                         old_nick
                                     )
-                                        .fetch_one(&state.sqlx_pool)
+                                        .fetch_optional(&state.sqlx_pool)
                                         .await
                                     {
-                                        Ok(row) => row,
+                                        Ok(row) => {
+                                            if let Some(row) = row {
+                                                row
+                                            } else {
+                                                debug!(timestamp=%event.ts, text=%event.text, ?old_nick, ?new_nick, "The nickname row could not be found. This is likely expected because... not everyone is in the database.");
+                                                return StatusCode::OK.into_response()
+                                            }
+                                        },
                                         Err(error) => {
                                             error!(?error, timestamp=%event.ts, text=%event.text, ?old_nick, ?new_nick, "MANUAL INPUT REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FOR NICKNAME UPDATES FROM THE DATABASE.");
                                             return StatusCode::OK.into_response();
@@ -1746,7 +1757,7 @@ async fn handle_interactions(
                                         Result<UsersSelectMetadata, serde_json::Error>,
                                     > = None;
                                     if let Some(ref private_metadata) = view.private_metadata {
-                                        metadata = Some(serde_json::from_str(&private_metadata));
+                                        metadata = Some(serde_json::from_str(private_metadata));
                                     } else {
                                         warn!(
                                             "The private metadata could not be found when submitting the input new user modal so therefore the underlying subscriptions view could not be updated"
@@ -2128,7 +2139,7 @@ async fn send_dm_impl(
     target_user_id: &str,
     text: &str,
 ) -> anyhow::Result<()> {
-    trace!(%target_user_id, "Sending subscription request DM");
+    trace!(%target_user_id, "Sending DM");
     let json = json!({
     "users": target_user_id
     });
