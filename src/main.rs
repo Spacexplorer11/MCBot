@@ -104,6 +104,13 @@ struct SubsPageMetadata {
     page_size: i64,
 }
 
+#[derive(Deserialize, Serialize)]
+struct UsersSelectMetadata {
+    hash: String,
+    view_id: String,
+    page: i64,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 enum SlackPayload {
@@ -1159,64 +1166,79 @@ async fn handle_interactions(
                         StatusCode::BAD_REQUEST.into_response()
                     }
                 }
-                /*
-                 TODO: Patrol #minecraft-bridge and send DM's (hammer the index remember)
-                 TODO: Make the code better and use let Variant(x) = x else {} instead of if let Err(e) blah blah blah
-                */
                 ActionId::SubscribeNewPerson => {
-                    debug!(user_id = %user.id, "User triggered SubscribeNewPerson action, pushing user selection modal");
-                    let user_select_block = json!({
-                        "type": "input",
-                        "label": {
-                            "type": "plain_text",
-                            "text": "Select the user you wish to subscribe to:"
-                        },
-                        "element": {
-                            "type": "users_select",
-                            "placeholder": {
+                    if let Some(view) = view {
+                        debug!(user_id = %user.id, "User triggered SubscribeNewPerson action, pushing user selection modal");
+                        let user_select_block = json!({
+                            "type": "input",
+                            "label": {
                                 "type": "plain_text",
-                                "text": "Select a user",
-                                "emoji": true
+                                "text": "Select the user you wish to subscribe to:"
                             },
-                            "action_id": "users_select"
-                        },
-                        "dispatch_action": true,
-                        "hint": {
-                            "type": "plain_text",
-                            "text": "How this works: After selecting and confirming the user, a DM will be sent which asks for approval from the user you selected. Their decision will be relayed back to you via a DM and if it's a yes, you will automatically start receiving DM updates when the join/leave the hackclub minecraft server."
-                        },
-                        "block_id": "users_select"
-                    });
-
-                    let json = json!({
-                        "view": {
-                            "type": "modal",
-                            "callback_id": "input_new_sub_user",
-                            "title": {
+                            "element": {
+                                "type": "users_select",
+                                "placeholder": {
+                                    "type": "plain_text",
+                                    "text": "Select a user",
+                                    "emoji": true
+                                },
+                                "action_id": "users_select"
+                            },
+                            "dispatch_action": true,
+                            "hint": {
                                 "type": "plain_text",
-                                "text": "New Subscription",
-                                "emoji": true
+                                "text": "How this works: After selecting and confirming the user, a DM will be sent which asks for approval from the user you selected. Their decision will be relayed back to you via a DM and if it's a yes, you will automatically start receiving DM updates when the join/leave the hackclub minecraft server."
                             },
-                            "submit": {
-                                "type": "plain_text",
-                                "text": "Confirm"
+                            "block_id": "users_select"
+                        });
+
+                        let metadata = UsersSelectMetadata {
+                            hash: view.hash,
+                            view_id: view.id,
+                            page,
+                        };
+
+                        let metadata_as_str = serde_json::to_string(&metadata).unwrap_or_else(|error| {
+                            warn!(?error, "An error occurred when converting the UsersSelectMetadata to string");
+                            "".to_string()
+                        });
+
+                        let json = json!({
+                            "view": {
+                                "type": "modal",
+                                "private_metadata": metadata_as_str,
+                                "callback_id": "input_new_sub_user",
+                                "title": {
+                                    "type": "plain_text",
+                                    "text": "New Subscription",
+                                    "emoji": true
+                                },
+                                "submit": {
+                                    "type": "plain_text",
+                                    "text": "Confirm"
+                                },
+                                "blocks": [user_select_block]
                             },
-                            "blocks": [user_select_block]
-                        },
-                        "trigger_id": trigger_id
-                    });
+                            "trigger_id": trigger_id
+                        });
 
-                    send_and_log_on_failure(
-                        state
-                            .client
-                            .post("https://slack.com/api/views.push")
-                            .bearer_auth(state.bot_token.clone())
-                            .json(&json),
-                        "Pushing an input view",
-                    )
-                    .await;
+                        send_and_log_on_failure(
+                            state
+                                .client
+                                .post("https://slack.com/api/views.push")
+                                .bearer_auth(state.bot_token.clone())
+                                .json(&json),
+                            "Pushing an input view",
+                        )
+                        .await;
 
-                    StatusCode::OK.into_response()
+                        StatusCode::OK.into_response()
+                    } else {
+                        error!(
+                            "SLACK'S API HAS CLEARLY CHANGED AS A VIEW IS EXPECTED HERE. (WHEN INITIATING THE NEW PERSON SUBSCRIPTION FLOW)"
+                        );
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
                 }
                 ActionId::SubsPageNext | ActionId::SubsPagePrev => {
                     if let Some(view) = view {
@@ -1354,6 +1376,7 @@ async fn handle_interactions(
                                     "type": "plain_text",
                                     "text": "Confirm"
                                 },
+                                "private_metadata": view.private_metadata.clone().unwrap_or_default(),
                                 "blocks": view.blocks
                             },
                             "hash": view.hash,
@@ -1378,7 +1401,37 @@ async fn handle_interactions(
                 }
                 ActionId::DeclineSubscription { value }
                 | ActionId::ApproveSubscription { value } => {
-                    debug!(user_id = %user.id, subscriber_id = %value, action = ?actions.action_id, "Processing subscription approval/decline action");
+                    debug!(%user.id, subscriber_id = %value, action = ?actions.action_id, "Processing subscription approval/decline action");
+                    if query!(
+                        "SELECT * FROM subscriptions WHERE target_id = $1 AND subscriber_id = $2",
+                        user.id,
+                        value
+                    )
+                    .fetch_optional(&state.sqlx_pool)
+                    .await
+                    .is_ok_and(|result| result.is_none())
+                    {
+                        return if let Some(response_url) = response_url {
+                            send_and_log_on_failure(
+                                state
+                                    .client
+                                    .post(response_url)
+                                    .bearer_auth(state.bot_token.clone())
+                                    .json(&json!({
+                                    "replace_original": true,
+                                    "text": format!("This request has expired. Please ask <@{}> to send a request again.", user.id)
+                                })),
+                                "Replacing the request DM with the completed message",
+                            )
+                                .await;
+                            StatusCode::OK.into_response()
+                        } else {
+                            error!(
+                                "URGENT ERROR. SLACK HAS CHANGED THEIR API RESPONSE SHAPE AND HAS NOT GIVEN A RESPONSE URL FOR RESPONDING TO THE BUTTON CLICK IN A MESSAGE. THIS HAS ORIGINATED FROM THE DECLINE/APPROVE SUBSCRIPTION BRANCH IN THE BLOCK ACTIONS MATCH STATEMENT."
+                            );
+                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        };
+                    }
                     let dm_text: String;
                     let completed_text: String;
 
@@ -1689,6 +1742,63 @@ async fn handle_interactions(
                             {
                                 Ok(_) => {
                                     debug!("Request DM delivered on attempt {attempt}");
+                                    let mut metadata: Option<
+                                        Result<UsersSelectMetadata, serde_json::Error>,
+                                    > = None;
+                                    if let Some(ref private_metadata) = view.private_metadata {
+                                        metadata = Some(serde_json::from_str(&private_metadata));
+                                    } else {
+                                        warn!(
+                                            "The private metadata could not be found when submitting the input new user modal so therefore the underlying subscriptions view could not be updated"
+                                        );
+                                    }
+                                    if let Some(Ok(metadata)) = metadata {
+                                        let modal_view = match fetch_and_build_subs_modal_view(
+                                            &state.sqlx_pool,
+                                            metadata.page,
+                                            user.id.clone(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(view) => {
+                                                counter("subscriptions.modal", 1)
+                                                    .attribute("result", "opened")
+                                                    .capture();
+                                                trace!(
+                                                    "Subscriptions modal view built successfully"
+                                                );
+                                                view
+                                            }
+
+                                            Err(e) => {
+                                                counter("subscriptions.modal", 1)
+                                                    .attribute("result", "error")
+                                                    .capture();
+                                                capture_anyhow(&e);
+                                                error!(
+                                                    error = ?e,
+                                                    "An error occurred fetching and building the modal view"
+                                                );
+
+                                                continue;
+                                            }
+                                        };
+
+                                        let json = json!({
+                                            "hash": metadata.hash,
+                                            "view_id": metadata.view_id,
+                                            "view": modal_view
+                                        });
+
+                                        send_and_log_on_failure(state.client.post("https://slack.com/api/views.update")
+                                            .bearer_auth(state.bot_token.clone())
+                                            .json(&json), "Updating the subscriptions modal view after submission of the new subscription modal").await
+                                    } else if let Some(Err(error)) = metadata {
+                                        warn!(
+                                            ?error,
+                                            "The private metadata could not be parsed when submitting the input new user modal so therefore the underlying subscriptions view could not be updated"
+                                        );
+                                    }
                                     return;
                                 }
                                 Err(e) => {
@@ -1701,8 +1811,8 @@ async fn handle_interactions(
                         // All retries exhausted — roll back the row so the user can retry
                         error!(
                             subscriber_id = %user.id,
-                            target_id = %target_user_id,
-                            error = ?last_err,
+                            %target_user_id,
+                            ?last_err,
                             "Approval DM failed after 5 attempts; removing subscription row for retry"
                         );
                         if let Err(e) = query!(
