@@ -475,7 +475,7 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
                                             json!({
                                                 "response_type": "ephemeral",
                                                 "text": format!(
-                                                    "Uh oh, something went wrong! Please try again! If this persists, please contact @Akaalroop on Slack or email akaal@akaalroop.com. Error: {e}"
+                                                    "Uh oh, something went wrong! Please try again! If this persists, please contact @Akaalroop on Slack or email akaal@akaalroop.com. Error: {error}"
                                                 )
                                             })
                                         };
@@ -505,7 +505,7 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
                                             }
                                         }
                                     } else if let Some(thread_ts) = thread_ts {
-                                        let polite_msg = if e
+                                        let polite_msg = if error
                                             .to_string()
                                             .eq("Unable to convert the json to MCRecipe type")
                                         {
@@ -519,7 +519,7 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
                                                 "channel": channel_id,
                                                 "thread_ts": thread_ts,
                                                 "text": format!(
-                                                    "Uh oh, something went wrong! Please try again! If this persists, please contact @Akaalroop on Slack or email akaal@akaalroop.com. Error: {e}"
+                                                    "Uh oh, something went wrong! Please try again! If this persists, please contact @Akaalroop on Slack or email akaal@akaalroop.com. Error: {error}"
                                                 )
                                             })
                                         };
