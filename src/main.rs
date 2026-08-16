@@ -591,10 +591,7 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
                                         .capture();
                                     capture_anyhow(&error);
                                     error!(
-?error, 
-                                        "An error occurred fetching and building the modal view"
-                                    );
-
+?error, "An error occurred fetching and building the modal view");
                                     continue;
                                 }
                             };
