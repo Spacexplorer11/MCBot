@@ -451,7 +451,6 @@ fn main() -> io::Result<()> {
                                             .to_string()
                                             .eq("Unable to convert the json to MCRecipe type")
                                         {
-                                        
 warn!("Recipe could not be processed because it was not a crafting recipe");
 } else {                                    error!(
                                         ?error,
@@ -475,7 +474,7 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
                                             json!({
                                                 "response_type": "ephemeral",
                                                 "text": format!(
-                                                    "Uh oh, something went wrong! Please try again! If this persists, please contact @Akaalroop on Slack or email akaal@akaalroop.com. Error: {error}"
+                                                    "Uh oh, something went wrong! Please try again! If this persists, please contact <@U08D22QNUVD> or email akaal@akaalroop.com. Error: {error}"
                                                 )
                                             })
                                         };
@@ -512,14 +511,14 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
                                             json!({
                                                 "channel": channel_id,
                                                 "thread_ts": thread_ts,
-                                                "text": "Uh oh, that type of recipe isn't supported! This bot currently only supports crafting recipes. If that was supposed to work, please contact @Akaalroop or email akaal@akaalroop.com"
+                                                "text": "Uh oh, that type of recipe isn't supported! This bot currently only supports crafting recipes. If that was supposed to work, please contact <@U08D22QNUVD> or email akaal@akaalroop.com"
                                             })
                                         } else {
                                             json!({
                                                 "channel": channel_id,
                                                 "thread_ts": thread_ts,
                                                 "text": format!(
-                                                    "Uh oh, something went wrong! Please try again! If this persists, please contact @Akaalroop on Slack or email akaal@akaalroop.com. Error: {error}"
+                                                    "Uh oh, something went wrong! Please try again! If this persists, please contact <@U08D22QNUVD> or email akaal@akaalroop.com. Error: {error}"
                                                 )
                                             })
                                         };
@@ -2626,7 +2625,7 @@ LIMIT 6 OFFSET $2",
 fn build_inline_error_response(field: &str, message: &str) -> Response<Body> {
     let mut message = message.to_string();
     if message.to_lowercase().contains("internal") {
-        message.push_str(" Please try again. If this persists, please contact the @Akaalroop on slack or email akaal@akaalroop.com");
+        message.push_str(" Please try again. If this persists, please contact <@U08D22QNUVD> or email akaal@akaalroop.com");
     }
     Json(json!({
         "response_action": "errors",
