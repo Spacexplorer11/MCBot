@@ -442,27 +442,34 @@ fn main() -> io::Result<()> {
                                     debug!(item_name = %item_name, user_id = %user_id, channel_id = %channel_id, "Recipe successfully processed");
                                 }
 
-                                Err(e) => {
+                                Err(error) => {
                                     counter("recipe.processed", 1)
                                         .attribute("result", "error")
                                         .capture();
-                                    capture_anyhow(&e);
-                                    error!(
-                                        error = ?e,
-                                        item_name = %item_name,
-                                        user_id = %user_id,
+                                    capture_anyhow(&error);
+                                    if error
+                                            .to_string()
+                                            .eq("Unable to convert the json to MCRecipe type")
+                                        {
+                                        
+warn!("Recipe could not be processed because it was not a crafting recipe");
+} else {                                    error!(
+                                        ?error,
+                                        %item_name,
+                                        %user_id,
                                         "Failed to fulfil recipe task processing pipeline"
                                     );
-                                    warn!(item_name = %item_name, user_id = %user_id, "Sending user-friendly error message to Slack");
+                                    }
+                                    warn!(%item_name, %user_id, "Sending user-friendly error message to Slack");
 
                                     if let Some(response_url) = response_url {
-                                        let polite_msg = if e
+                                        let polite_msg = if error
                                             .to_string()
                                             .eq("Unable to convert the json to MCRecipe type")
                                         {
                                             json!({
                                                 "response_type": "ephemeral",
-                                                "text": "Uh oh, that type of recipe isn't supported! This bot currently only supports crafting recipes. If that was supposed to work, please contact @Akaalroop or email akaal@akaalroop.com"
+                                                "text": "Uh oh, that type of recipe isn't supported! This bot currently only supports crafting recipes. If that was supposed to work, please contact <@U08D22QNUVD> or email akaal@akaalroop.com"
                                             })
                                         } else {
                                             json!({
@@ -524,10 +531,10 @@ fn main() -> io::Result<()> {
                                         )
                                             .await;
 
-                                        if response.is_err() {
+                                        if let Err(error) = response{
                                             for _ in 0..=3 {
                                                 error!(
-                                                    error = ?response.err().unwrap(),
+                                                    ?error,
                                                     "The generic error message failed to send to the user"
                                                 );
 
@@ -579,13 +586,13 @@ fn main() -> io::Result<()> {
                                     view
                                 }
 
-                                Err(e) => {
+                                Err(error) => {
                                     counter("subscriptions.modal", 1)
                                         .attribute("result", "error")
                                         .capture();
-                                    capture_anyhow(&e);
+                                    capture_anyhow(&error);
                                     error!(
-                                        error = ?e,
+?error, 
                                         "An error occurred fetching and building the modal view"
                                     );
 
