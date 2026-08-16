@@ -1353,7 +1353,8 @@ async fn handle_interactions(
                             None
                         };
 
-view.blocks.retain(|v| v.get("type") != Some(&json!("alert")));
+                        view.blocks
+                            .retain(|v| v.get("type") != Some(&json!("alert")));
 
                         if let Some(alert_text) = alert_text {
                             let alert_block = json!({
@@ -1366,8 +1367,7 @@ view.blocks.retain(|v| v.get("type") != Some(&json!("alert")));
                                 "level": "error"
                             });
                             view.blocks.insert(0, alert_block);
-
-}
+                        }
 
                         let json = json!({
                             "view": {
