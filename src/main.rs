@@ -820,6 +820,9 @@ async fn handle_event(
                                     let text = event.text.split_ascii_whitespace().map(|part| part.to_string()).collect::<Vec<String>>();
 
                                     let username = text.first().expect("This is a deterministic message. If this has changed then that is requires immediate attention.").replace('*', "");
+                                    let joining = event.text.contains("joined");
+
+                                    debug!(timestamp = %event.ts, %username, joining, "Processing join/leave notification, looking up subscriber's slack id");
 
                                     let query_start = std::time::Instant::now();
                                     let user_lookup_result = query!(
@@ -849,6 +852,8 @@ async fn handle_event(
                                         }
                                     };
 
+                                    debug!(timestamp = %event.ts, %username, %slack_id, "Found subscriber's slack id, looking up active subscriptions");
+
                                     let query_start = std::time::Instant::now();
                                     let subscribed_people_result = query!(
                                         "SELECT *
@@ -872,8 +877,6 @@ async fn handle_event(
                                         }
                                     };
 
-                                    let joining = event.text.contains("joined");
-
                                     match state.mpsc.try_send(
                                         UpdateDMs {
                                             people: subscribed_people,
@@ -894,6 +897,8 @@ async fn handle_event(
 
                                     let old_nick = text.first().expect("This is a deterministic message. If this has changed then that is requires immediate attention.");
                                     let new_nick = text.last().expect("This is a deterministic message. If this has changed then that is requires immediate attention.");
+
+                                    debug!(timestamp = %event.ts, %old_nick, %new_nick, "Processing nickname change notification, looking up user by old mc username");
 
                                     let query_start = std::time::Instant::now();
                                     let nickname_row_result = query!(
@@ -926,6 +931,8 @@ async fn handle_event(
                                     let mut mc_usernames = row.mc_usernames;
                                     mc_usernames.retain(|user| user != old_nick);
                                     mc_usernames.push(new_nick.clone());
+
+                                    debug!(timestamp = %event.ts, %old_nick, %new_nick, slack = %row.slack_id, "Found user row, updating mc_usernames");
 
                                     let query_start = std::time::Instant::now();
                                     let nickname_update_result = query!("UPDATE users SET mc_usernames = $1 WHERE slack_id = $2", &mc_usernames, row.slack_id).execute(&state.sqlx_pool).await;
