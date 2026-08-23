@@ -75,5 +75,7 @@ pub fn record_db_query_metric(query: &str, start: Instant, result: &str) {
         .capture();
     distribution("db.query.duration", start.elapsed().as_millis() as f64)
         .unit(Unit::Millisecond)
+        .attribute("query", query.to_string())
+        .attribute("result", result.to_string())
         .capture();
 }
