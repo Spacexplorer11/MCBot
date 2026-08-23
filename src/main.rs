@@ -363,7 +363,9 @@ fn main() -> io::Result<()> {
             {
                 Ok(()) => info!("All startup assets loaded successfully"),
                 Err(e) => {
-                    capture_anyhow(&e);
+                    // No capture_anyhow here: this is a fatal startup panic, and Sentry's panic
+                    // hook already reports it (the `{e:?}` panic message carries the full anyhow
+                    // chain), so an explicit capture would just double-report the same failure.
                     panic!("Failed to fetch recipes: {e:?}");
                 }
             }
@@ -446,13 +448,16 @@ fn main() -> io::Result<()> {
                                     counter("recipe.processed", 1)
                                         .attribute("result", "error")
                                         .capture();
-                                    capture_anyhow(&error);
                                     if error
                                             .to_string()
                                             .eq("Unable to convert the json to MCRecipe type")
                                         {
+// Expected: user asked for a non-crafting item. No capture_anyhow — this isn't a bug.
 warn!("Recipe could not be processed because it was not a crafting recipe");
-} else {                                    error!(
+} else {
+                                    capture_anyhow(&error);
+                                    error!(
+                                        already_reported = true,
                                         ?error,
                                         %item_name,
                                         %user_id,
@@ -591,7 +596,7 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
                                         .capture();
                                     capture_anyhow(&error);
                                     error!(
-?error, "An error occurred fetching and building the modal view");
+already_reported = true, ?error, "An error occurred fetching and building the modal view");
                                     continue;
                                 }
                             };
@@ -644,7 +649,7 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
                                     if let Ok(result) = result {
                                         if let Err(error) = result {
                                             capture_anyhow(&error);
-                                            error!(?error, "MANUAL APOLOGY REQUIRED! AN ERROR OCCURRED WHEN SENDING THE UPDATE DM");
+                                            error!(already_reported = true, ?error, "MANUAL APOLOGY REQUIRED! AN ERROR OCCURRED WHEN SENDING THE UPDATE DM");
                                         } else {
                                             info!("Update DM successfully sent!");
                                         }
@@ -655,7 +660,7 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
                                     Ok(..) => info!("Update DM successfully sent!"),
                                     Err(error) => {
                                         capture_anyhow(&error);
-                                        error!(?error, "MANUAL APOLOGY REQUIRED! AN ERROR OCCURRED WHEN SENDING THE UPDATE DM");
+                                        error!(already_reported = true, ?error, "MANUAL APOLOGY REQUIRED! AN ERROR OCCURRED WHEN SENDING THE UPDATE DM");
                                     }
                                 }
                             }
@@ -665,17 +670,24 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
             });
 
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+                let mut interval = tokio::time::interval(Duration::from_secs(5 * 60));
                 loop {
                     interval.tick().await;
 
                     let depth = task_queue_capacity - metrics_queue.capacity();
                     gauge("task.queue.depth", depth as f64).capture();
 
-                    match query!("SELECT count(*) AS count FROM subscriptions WHERE active = true")
-                        .fetch_one(&metrics_pool)
-                        .await
-                    {
+                    let query_start = std::time::Instant::now();
+                    let active_count_result =
+                        query!("SELECT count(*) AS count FROM subscriptions WHERE active = true")
+                            .fetch_one(&metrics_pool)
+                            .await;
+                    logging::record_db_query_metric(
+                        "subscriptions_active_count",
+                        query_start,
+                        if active_count_result.is_ok() { "ok" } else { "error" },
+                    );
+                    match active_count_result {
                         Ok(row) => {
                             gauge("subscriptions.count", row.count.unwrap_or(0) as f64)
                                 .attribute("status", "active")
@@ -687,12 +699,18 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
                         ),
                     }
 
-                    match query!(
+                    let query_start = std::time::Instant::now();
+                    let pending_count_result = query!(
                         "SELECT count(*) AS count FROM subscriptions WHERE active = false"
                     )
                     .fetch_one(&metrics_pool)
-                    .await
-                    {
+                    .await;
+                    logging::record_db_query_metric(
+                        "subscriptions_pending_count",
+                        query_start,
+                        if pending_count_result.is_ok() { "ok" } else { "error" },
+                    );
+                    match pending_count_result {
                         Ok(row) => {
                             gauge("subscriptions.count", row.count.unwrap_or(0) as f64)
                                 .attribute("status", "pending")
@@ -733,10 +751,13 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
             let uptime_router =
                 axum::Router::new().route("/status/uptime", get(uptime));
 
-            let router = axum::Router::new()
+            // Sentry Hub binding + transaction creation apply only to the Slack-facing routes.
+            // /status/uptime is excluded so a health-check monitor polling it doesn't burn a
+            // full Sentry transaction on every ping — it still gets the http.requests metric via
+            // the metric_response middleware applied to the whole router below.
+            let instrumented_router = axum::Router::new()
                 .merge(mcbot_router)
                 .merge(mcrecipes_router)
-                .merge(uptime_router)
                 .layer(
                     ServiceBuilder::new()
                         // Bind a Sentry Hub to each request so errors
@@ -749,7 +770,11 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
                             SentryHttpLayer::new()
                                 .enable_transaction(),
                         ),
-                )
+                );
+
+            let router = axum::Router::new()
+                .merge(instrumented_router)
+                .merge(uptime_router)
                 .layer(axum::middleware::from_fn(logging::metric_response));
 
             let listener = TcpListener::bind("0.0.0.0:4598")
@@ -796,12 +821,19 @@ async fn handle_event(
 
                                     let username = text.first().expect("This is a deterministic message. If this has changed then that is requires immediate attention.").replace('*', "");
 
-                                    let slack_id = match query!(
+                                    let query_start = std::time::Instant::now();
+                                    let user_lookup_result = query!(
                                         "SELECT * FROM users WHERE $1 = ANY(mc_usernames)",
                                         username
                                     )
                                         .fetch_optional(&state.sqlx_pool)
-                                        .await
+                                        .await;
+                                    logging::record_db_query_metric(
+                                        "users_lookup_by_mc_username_join_leave",
+                                        query_start,
+                                        if user_lookup_result.is_ok() { "ok" } else { "error" },
+                                    );
+                                    let slack_id = match user_lookup_result
                                     {
                                         Ok(row) => {
                                             if let Some(row) = row {
@@ -817,7 +849,8 @@ async fn handle_event(
                                         }
                                     };
 
-                                    let subscribed_people = match query!(
+                                    let query_start = std::time::Instant::now();
+                                    let subscribed_people_result = query!(
                                         "SELECT *
                                         FROM subscriptions
                                         WHERE target_id = $1
@@ -825,8 +858,13 @@ async fn handle_event(
                                         slack_id
                                     )
                                         .fetch_all(&state.sqlx_pool)
-                                        .await
-                                    {
+                                        .await;
+                                    logging::record_db_query_metric(
+                                        "subscriptions_lookup_by_target",
+                                        query_start,
+                                        if subscribed_people_result.is_ok() { "ok" } else { "error" },
+                                    );
+                                    let subscribed_people = match subscribed_people_result {
                                         Ok(rows) => rows.into_iter().map(|row| row.subscriber_id).collect::<Vec<String>>(),
                                         Err(error) => {
                                             error!(?error, timestamp=%event.ts, text=%event.text, ?slack_id, ?username, "MANUAL APOLOGY REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FROM THE DATABASE.");
@@ -857,12 +895,19 @@ async fn handle_event(
                                     let old_nick = text.first().expect("This is a deterministic message. If this has changed then that is requires immediate attention.");
                                     let new_nick = text.last().expect("This is a deterministic message. If this has changed then that is requires immediate attention.");
 
-                                    let row = match query!(
+                                    let query_start = std::time::Instant::now();
+                                    let nickname_row_result = query!(
                                         "SELECT * FROM users WHERE $1 = ANY(mc_usernames)",
                                         old_nick
                                     )
                                         .fetch_optional(&state.sqlx_pool)
-                                        .await
+                                        .await;
+                                    logging::record_db_query_metric(
+                                        "users_lookup_by_mc_username_nickname",
+                                        query_start,
+                                        if nickname_row_result.is_ok() { "ok" } else { "error" },
+                                    );
+                                    let row = match nickname_row_result
                                     {
                                         Ok(row) => {
                                             if let Some(row) = row {
@@ -882,7 +927,14 @@ async fn handle_event(
                                     mc_usernames.retain(|user| user != old_nick);
                                     mc_usernames.push(new_nick.clone());
 
-                                    match query!("UPDATE users SET mc_usernames = $1 WHERE slack_id = $2", &mc_usernames, row.slack_id).execute(&state.sqlx_pool).await {
+                                    let query_start = std::time::Instant::now();
+                                    let nickname_update_result = query!("UPDATE users SET mc_usernames = $1 WHERE slack_id = $2", &mc_usernames, row.slack_id).execute(&state.sqlx_pool).await;
+                                    logging::record_db_query_metric(
+                                        "users_update_nickname",
+                                        query_start,
+                                        if nickname_update_result.is_ok() { "ok" } else { "error" },
+                                    );
+                                    match nickname_update_result {
                                         Ok(..) => {
                                             info!(slack=%row.slack_id,"Successfully updated nick from {old_nick} to {new_nick}.");
                                             counter("nickname.update", 1)
@@ -1127,14 +1179,24 @@ async fn handle_interactions(
                                 return StatusCode::OK.into_response();
                             }
                         };
-                        match query!(
+                        let query_start = std::time::Instant::now();
+                        let remove_subscription_result = query!(
                             "DELETE FROM subscriptions WHERE id = $1 and subscriber_id = $2",
                             id,
                             user.id
                         )
                         .execute(&state.sqlx_pool)
-                        .await
-                        {
+                        .await;
+                        logging::record_db_query_metric(
+                            "subscriptions_delete_by_id",
+                            query_start,
+                            if remove_subscription_result.is_ok() {
+                                "ok"
+                            } else {
+                                "error"
+                            },
+                        );
+                        match remove_subscription_result {
                             Ok(..) => {
                                 info!(user_id = %user.id, subscription_id = id, "Subscription removed from database");
                                 trace!("Successfully deleted row from database");
@@ -1300,6 +1362,7 @@ async fn handle_interactions(
                 ActionId::UserSelect { selected_user } => {
                     if let Some(view) = &mut view {
                         debug!(user_id = %user.id, selected_user = %selected_user, "User selected a target for subscription");
+                        let query_start = std::time::Instant::now();
                         let existing_subscription = query!(
                     "SELECT 1 as exists FROM subscriptions WHERE subscriber_id = $1 AND target_id = $2",
                     user.id,
@@ -1307,6 +1370,15 @@ async fn handle_interactions(
                     )
                             .fetch_optional(&state.sqlx_pool)
                             .await;
+                        logging::record_db_query_metric(
+                            "subscriptions_exists_check_block_action",
+                            query_start,
+                            if existing_subscription.is_ok() {
+                                "ok"
+                            } else {
+                                "error"
+                            },
+                        );
 
                         let existing_subscription = match existing_subscription {
                             Ok(row) => row.is_some(),
@@ -1408,15 +1480,24 @@ async fn handle_interactions(
                 ActionId::DeclineSubscription { value }
                 | ActionId::ApproveSubscription { value } => {
                     debug!(%user.id, subscriber_id = %value, action = ?actions.action_id, "Processing subscription approval/decline action");
-                    if query!(
+                    let query_start = std::time::Instant::now();
+                    let approval_request_lookup = query!(
                         "SELECT * FROM subscriptions WHERE target_id = $1 AND subscriber_id = $2",
                         user.id,
                         value
                     )
                     .fetch_optional(&state.sqlx_pool)
-                    .await
-                    .is_ok_and(|result| result.is_none())
-                    {
+                    .await;
+                    logging::record_db_query_metric(
+                        "subscriptions_exists_check_approval",
+                        query_start,
+                        if approval_request_lookup.is_ok() {
+                            "ok"
+                        } else {
+                            "error"
+                        },
+                    );
+                    if approval_request_lookup.is_ok_and(|result| result.is_none()) {
                         return if let Some(response_url) = response_url {
                             send_and_log_on_failure(
                                 state
@@ -1452,14 +1533,24 @@ async fn handle_interactions(
                                 "Successfully declined request to track join/leave updates for the hackclub minecraft server from <@{value}>"
                             );
 
-                            if let Err(e) = query!(
+                            let query_start = std::time::Instant::now();
+                            let decline_delete_result = query!(
                         "DELETE FROM subscriptions WHERE target_id = $1 AND subscriber_id = $2",
                         user.id,
                         value
                     )
                                 .execute(&state.sqlx_pool)
-                                .await
-                            {
+                                .await;
+                            logging::record_db_query_metric(
+                                "subscriptions_delete_decline",
+                                query_start,
+                                if decline_delete_result.is_ok() {
+                                    "ok"
+                                } else {
+                                    "error"
+                                },
+                            );
+                            if let Err(e) = decline_delete_result {
                                 error!(error=?e, "An error occurred when deleting a subscription row from the database where the target_id was {} and the subscriber_id was {value}", user.id);
                                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                             }
@@ -1474,14 +1565,24 @@ async fn handle_interactions(
                                 "Successfully notified <@{value}> that you have approved their request!"
                             );
 
-                            if let Err(e) = query!(
+                            let query_start = std::time::Instant::now();
+                            let approve_update_result = query!(
                         "UPDATE subscriptions SET active = true WHERE target_id = $1 AND subscriber_id = $2",
                         user.id,
                         value
                     )
                                 .execute(&state.sqlx_pool)
-                                .await
-                            {
+                                .await;
+                            logging::record_db_query_metric(
+                                "subscriptions_activate_approve",
+                                query_start,
+                                if approve_update_result.is_ok() {
+                                    "ok"
+                                } else {
+                                    "error"
+                                },
+                            );
+                            if let Err(e) = approve_update_result {
                                 error!(error=?e, "An error occurred when setting a subscription to active from the database where the target_id was {} and the subscriber_id was {value}", user.id);
                                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                             }
@@ -1615,6 +1716,7 @@ async fn handle_interactions(
                             }
                         };
 
+                    let query_start = std::time::Instant::now();
                     let existing_subscription = query!(
                     "SELECT 1 as exists FROM subscriptions WHERE subscriber_id = $1 AND target_id = $2",
                     user.id,
@@ -1622,6 +1724,15 @@ async fn handle_interactions(
                     )
                         .fetch_optional(&state.sqlx_pool)
                         .await;
+                    logging::record_db_query_metric(
+                        "subscriptions_exists_check_view_submission",
+                        query_start,
+                        if existing_subscription.is_ok() {
+                            "ok"
+                        } else {
+                            "error"
+                        },
+                    );
 
                     let existing_subscription = match existing_subscription {
                         Ok(row) => row.is_some(),
@@ -1701,11 +1812,21 @@ async fn handle_interactions(
                         mc_usernames.push(block.nick.name)
                     }
 
-                    if let Err(e) =
+                    let query_start = std::time::Instant::now();
+                    let insert_user_result =
                         query!("INSERT INTO users (slack_id, mc_usernames) VALUES ($1, $2) ON CONFLICT (slack_id) DO NOTHING", target_user_id, &mc_usernames)
                             .execute(&state.sqlx_pool)
-                            .await
-                    {
+                            .await;
+                    logging::record_db_query_metric(
+                        "users_insert",
+                        query_start,
+                        if insert_user_result.is_ok() {
+                            "ok"
+                        } else {
+                            "error"
+                        },
+                    );
+                    if let Err(e) = insert_user_result {
                         error!("Failed to insert user into database: {e}");
                         return build_inline_error_response(
                             "users_select",
@@ -1713,14 +1834,24 @@ async fn handle_interactions(
                         );
                     }
 
-                    if let Err(e) = query!(
+                    let query_start = std::time::Instant::now();
+                    let insert_subscription_result = query!(
                         "INSERT INTO subscriptions (subscriber_id, target_id) VALUES ($1, $2)",
                         user.id,
                         target_user_id
                     )
                     .execute(&state.sqlx_pool)
-                    .await
-                    {
+                    .await;
+                    logging::record_db_query_metric(
+                        "subscriptions_insert",
+                        query_start,
+                        if insert_subscription_result.is_ok() {
+                            "ok"
+                        } else {
+                            "error"
+                        },
+                    );
+                    if let Err(e) = insert_subscription_result {
                         error!("Failed to insert new subscription: {e}");
                         return build_inline_error_response(
                             "users_select",
@@ -1782,6 +1913,7 @@ async fn handle_interactions(
                                                     .capture();
                                                 capture_anyhow(&e);
                                                 error!(
+                                                    already_reported = true,
                                                     error = ?e,
                                                     "An error occurred fetching and building the modal view"
                                                 );
@@ -1821,14 +1953,24 @@ async fn handle_interactions(
                             ?last_err,
                             "Approval DM failed after 5 attempts; removing subscription row for retry"
                         );
-                        if let Err(e) = query!(
+                        let query_start = std::time::Instant::now();
+                        let rollback_delete_result = query!(
                             "DELETE FROM subscriptions WHERE subscriber_id = $1 AND target_id = $2",
                             user.id,
                             target_user_id
                         )
                         .execute(&state.sqlx_pool)
-                        .await
-                        {
+                        .await;
+                        logging::record_db_query_metric(
+                            "subscriptions_delete_rollback",
+                            query_start,
+                            if rollback_delete_result.is_ok() {
+                                "ok"
+                            } else {
+                                "error"
+                            },
+                        );
+                        if let Err(e) = rollback_delete_result {
                             // Worst case: stuck row. Log everything needed to clean up manually.
                             error!(
                                 subscriber_id = %user.id,
@@ -1945,6 +2087,10 @@ async fn verify_slack_signature(
     let request_bytes = match axum::body::to_bytes(body, 1024 * 16).await {
         Ok(bytes) => bytes,
         Err(e) => {
+            counter("slack.signature.verification", 1)
+                .attribute("result", "failure")
+                .attribute("reason", "body_read_error")
+                .capture();
             error!("Failed to read request body: {e}");
             return Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -1957,6 +2103,10 @@ async fn verify_slack_signature(
             let ts = match ts.to_str() {
                 Ok(s) => s,
                 Err(..) => {
+                    counter("slack.signature.verification", 1)
+                        .attribute("result", "failure")
+                        .attribute("reason", "invalid_timestamp")
+                        .capture();
                     error!("Slack request timestamp header not a string");
                     return Response::builder()
                         .status(StatusCode::UNAUTHORIZED)
@@ -1967,6 +2117,10 @@ async fn verify_slack_signature(
             let ts = match ts.parse::<i64>() {
                 Ok(s) => s,
                 Err(..) => {
+                    counter("slack.signature.verification", 1)
+                        .attribute("result", "failure")
+                        .attribute("reason", "invalid_timestamp")
+                        .capture();
                     error!("Slack request timestamp header not a number");
                     return Response::builder()
                         .status(StatusCode::UNAUTHORIZED)
@@ -1977,6 +2131,10 @@ async fn verify_slack_signature(
             let now = Utc::now().timestamp();
             let allowed_skew = 60 * 5;
             if ts < now - allowed_skew || ts > now + allowed_skew {
+                counter("slack.signature.verification", 1)
+                    .attribute("result", "failure")
+                    .attribute("reason", "timestamp_expired")
+                    .capture();
                 error!("Slack request timestamp is too old");
                 return Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
@@ -1986,6 +2144,10 @@ async fn verify_slack_signature(
             ts.to_string()
         }
         None => {
+            counter("slack.signature.verification", 1)
+                .attribute("result", "failure")
+                .attribute("reason", "missing_timestamp_header")
+                .capture();
             error!("Slack request timestamp header not found");
             return Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
@@ -1997,6 +2159,10 @@ async fn verify_slack_signature(
         Some(sig) => match sig.to_str() {
             Ok(s) => s,
             Err(..) => {
+                counter("slack.signature.verification", 1)
+                    .attribute("result", "failure")
+                    .attribute("reason", "invalid_signature_format")
+                    .capture();
                 error!("Slack signature header not a string");
                 return Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
@@ -2005,6 +2171,10 @@ async fn verify_slack_signature(
             }
         },
         None => {
+            counter("slack.signature.verification", 1)
+                .attribute("result", "failure")
+                .attribute("reason", "missing_signature_header")
+                .capture();
             error!("Slack signature header not found");
             return Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
@@ -2016,6 +2186,10 @@ async fn verify_slack_signature(
     let request_string = match str::from_utf8(request_bytes.as_ref()) {
         Ok(s) => s,
         Err(e) => {
+            counter("slack.signature.verification", 1)
+                .attribute("result", "failure")
+                .attribute("reason", "invalid_body_encoding")
+                .capture();
             error!("Slack request body not valid utf-8: {e}");
             return Response::builder()
                 .status(StatusCode::BAD_REQUEST)
@@ -2034,6 +2208,10 @@ async fn verify_slack_signature(
         Some(str) => match hex::decode(str) {
             Ok(hex) => hex,
             Err(..) => {
+                counter("slack.signature.verification", 1)
+                    .attribute("result", "failure")
+                    .attribute("reason", "invalid_signature_format")
+                    .capture();
                 error!("Slack request signature not valid hex");
                 return Response::builder()
                     .status(StatusCode::FORBIDDEN)
@@ -2042,6 +2220,10 @@ async fn verify_slack_signature(
             }
         },
         None => {
+            counter("slack.signature.verification", 1)
+                .attribute("result", "failure")
+                .attribute("reason", "invalid_signature_format")
+                .capture();
             error!("Slack request signature didn't begin with v0=");
             return Response::builder()
                 .status(StatusCode::FORBIDDEN)
@@ -2054,6 +2236,7 @@ async fn verify_slack_signature(
         Ok(..) => {
             counter("slack.signature.verification", 1)
                 .attribute("result", "success")
+                .attribute("reason", "success")
                 .capture();
             trace!("Slack signature verification successful");
             next.run(Request::from_parts(parts, Body::from(request_bytes)))
@@ -2062,6 +2245,7 @@ async fn verify_slack_signature(
         Err(e) => {
             counter("slack.signature.verification", 1)
                 .attribute("result", "failure")
+                .attribute("reason", "hmac_mismatch")
                 .capture();
             warn!("Slack signature verification failed: {e}");
             Response::builder()
@@ -2392,7 +2576,8 @@ async fn fetch_and_build_subs_modal_view(
     user_id: String,
 ) -> anyhow::Result<Value> {
     trace!(user_id = %user_id, page = page, "Fetching subscriptions from database for modal view");
-    let subs = match query_as!(
+    let query_start = std::time::Instant::now();
+    let subs_result = query_as!(
         Subscription,
         "SELECT s.id, s.active, s.target_id, u.mc_usernames
 FROM subscriptions AS s
@@ -2404,8 +2589,13 @@ LIMIT 6 OFFSET $2",
         page * 5
     )
     .fetch_all(sqlx_pool)
-    .await
-    {
+    .await;
+    logging::record_db_query_metric(
+        "subscriptions_fetch_page",
+        query_start,
+        if subs_result.is_ok() { "ok" } else { "error" },
+    );
+    let subs = match subs_result {
         Ok(subs) => {
             debug!(user_id = %user_id, page = page, count = subs.len(), "Subscriptions fetched from database");
             subs

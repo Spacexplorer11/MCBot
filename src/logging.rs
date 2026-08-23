@@ -9,16 +9,26 @@ pub fn initialise_logging() {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,mcbot=debug"));
 
-    // Copied straight from Sentry's docs
-    let sentry_layer =
-        sentry::integrations::tracing::layer().event_filter(|md| match *md.level() {
-            // Capture error and warn level events as both logs and events in Sentry
-            tracing::Level::ERROR | tracing::Level::WARN => EventFilter::Event | EventFilter::Log,
+    // Adapted from Sentry's docs:
+    // - Only ERROR auto-escalates to a Sentry Issue (Event). WARN is common for expected/
+    //   recoverable conditions (missing .env, stale client.jar cache, etc.) and shouldn't page
+    //   on every occurrence — it's still captured as a log/breadcrumb.
+    // - Call sites that already report the full picture via `capture_anyhow` (exception chain +
+    //   backtrace) tag their accompanying error!() with `already_reported = true` so this layer
+    //   doesn't also create a second, lower-fidelity Sentry Event for the same failure.
+    let sentry_layer = sentry::integrations::tracing::layer().event_filter(|md| {
+        if md.fields().field("already_reported").is_some() {
+            return EventFilter::Breadcrumb | EventFilter::Log;
+        }
+        match *md.level() {
+            // Capture error level events as both logs and events in Sentry
+            tracing::Level::ERROR => EventFilter::Event | EventFilter::Log,
             // Ignore trace level events, as they're too verbose
             tracing::Level::TRACE => EventFilter::Ignore,
             // Capture everything else as both a breadcrumb and a log
             _ => EventFilter::Breadcrumb | EventFilter::Log,
-        });
+        }
+    });
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
@@ -54,6 +64,16 @@ pub fn record_hackclub_api_metric(start: Instant, result: &str) {
         .attribute("result", result.to_string())
         .capture();
     distribution("hackclub.api.duration", start.elapsed().as_millis() as f64)
+        .unit(Unit::Millisecond)
+        .capture();
+}
+
+pub fn record_db_query_metric(query: &str, start: Instant, result: &str) {
+    counter("db.query", 1)
+        .attribute("query", query.to_string())
+        .attribute("result", result.to_string())
+        .capture();
+    distribution("db.query.duration", start.elapsed().as_millis() as f64)
         .unit(Unit::Millisecond)
         .capture();
 }
