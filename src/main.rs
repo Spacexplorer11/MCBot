@@ -456,7 +456,7 @@ fn main() -> io::Result<()> {
                             thread_ts,
                             bot_token,
                             queued_at,
-                            hub,
+                            hub: _,
                             parent_span,
                         } => {
                             // Continues the enqueuing request's trace as a new, linked
@@ -469,7 +469,7 @@ fn main() -> io::Result<()> {
                                     parent_span,
                                 ),
                             );
-                            hub.configure_scope(|scope| scope.set_span(Some(transaction.clone().into())));
+                            Hub::current().configure_scope(|scope| scope.set_span(Some(transaction.clone().into())));
                             let _txn_guard = FinishTransactionOnDrop(Some(transaction));
 
                             distribution("task.queue.delay", queued_at.elapsed().as_millis() as f64)
@@ -636,7 +636,7 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
                             trigger_id,
                             bot_token,
                             queued_at,
-                            hub,
+                            hub: _,
                             parent_span,
                         } => {
                             let transaction = sentry::start_transaction(
@@ -646,7 +646,7 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
                                     parent_span,
                                 ),
                             );
-                            hub.configure_scope(|scope| scope.set_span(Some(transaction.clone().into())));
+                            Hub::current().configure_scope(|scope| scope.set_span(Some(transaction.clone().into())));
                             let _txn_guard = FinishTransactionOnDrop(Some(transaction));
 
                             distribution("task.queue.delay", queued_at.elapsed().as_millis() as f64)
@@ -701,7 +701,7 @@ already_reported = true, ?error, "An error occurred fetching and building the mo
                             slack_and_mc,
                             bot_token,
                             queued_at,
-                            hub,
+                            hub: _,
                             parent_span,
                         } => {
                             let transaction = sentry::start_transaction(
@@ -711,7 +711,7 @@ already_reported = true, ?error, "An error occurred fetching and building the mo
                                     parent_span,
                                 ),
                             );
-                            hub.configure_scope(|scope| scope.set_span(Some(transaction.clone().into())));
+                            Hub::current().configure_scope(|scope| scope.set_span(Some(transaction.clone().into())));
                             let _txn_guard = FinishTransactionOnDrop(Some(transaction));
 
                             distribution("task.queue.delay", queued_at.elapsed().as_millis() as f64)
