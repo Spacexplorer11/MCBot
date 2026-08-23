@@ -503,13 +503,19 @@ fn main() -> io::Result<()> {
                                     counter("recipe.processed", 1)
                                         .attribute("result", "error")
                                         .capture();
-                                    if error
-                                            .to_string()
-                                            .eq("Unable to convert the json to MCRecipe type")
-                                        {
+                                    let is_unsupported_recipe_type = error
+                                        .to_string()
+                                        .eq("Unable to convert the json to MCRecipe type");
+                                    let is_rate_limited =
+                                        error.to_string().starts_with("Slack rate-limited");
+                                    if is_unsupported_recipe_type {
 // Expected: user asked for a non-crafting item. No capture_anyhow — this isn't a bug.
 warn!("Recipe could not be processed because it was not a crafting recipe");
-} else {
+} else if is_rate_limited {
+                                        // Expected under load: Slack itself rejected the send.
+                                        // No capture_anyhow — this isn't a bug in our code.
+                                        warn!(%item_name, %user_id, "Recipe image failed to send because Slack rate-limited the request");
+                                    } else {
                                     capture_anyhow(&error);
                                     error!(
                                         already_reported = true,
@@ -522,13 +528,15 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
                                     warn!(%item_name, %user_id, "Sending user-friendly error message to Slack");
 
                                     if let Some(response_url) = response_url {
-                                        let polite_msg = if error
-                                            .to_string()
-                                            .eq("Unable to convert the json to MCRecipe type")
-                                        {
+                                        let polite_msg = if is_unsupported_recipe_type {
                                             json!({
                                                 "response_type": "ephemeral",
                                                 "text": "Uh oh, that type of recipe isn't supported! This bot currently only supports crafting recipes. If that was supposed to work, please contact <@U08D22QNUVD> or email akaal@akaalroop.com"
+                                            })
+                                        } else if is_rate_limited {
+                                            json!({
+                                                "response_type": "ephemeral",
+                                                "text": "Whoa, lots of people are using MCBot right now! Please try again in a moment."
                                             })
                                         } else {
                                             json!({
@@ -564,14 +572,17 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
                                             }
                                         }
                                     } else if let Some(thread_ts) = thread_ts {
-                                        let polite_msg = if error
-                                            .to_string()
-                                            .eq("Unable to convert the json to MCRecipe type")
-                                        {
+                                        let polite_msg = if is_unsupported_recipe_type {
                                             json!({
                                                 "channel": channel_id,
                                                 "thread_ts": thread_ts,
                                                 "text": "Uh oh, that type of recipe isn't supported! This bot currently only supports crafting recipes. If that was supposed to work, please contact <@U08D22QNUVD> or email akaal@akaalroop.com"
+                                            })
+                                        } else if is_rate_limited {
+                                            json!({
+                                                "channel": channel_id,
+                                                "thread_ts": thread_ts,
+                                                "text": "Whoa, lots of people are using MCBot right now! Please try again in a moment."
                                             })
                                         } else {
                                             json!({

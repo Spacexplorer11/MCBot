@@ -505,9 +505,30 @@ impl RecipeData {
                 .send()
                 .await?;
 
+            let status = response.status();
+            let response_json: Value = response.json().await?;
+
+            // Slack rate-limits either via HTTP 429 or a 200 with `"ok": false`. Without this
+            // check, a rate-limited response just falls through to the "ts" lookup below and
+            // fails with a misleading "Missing ts" error, indistinguishable from a real bug.
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || response_json.get("ok").and_then(Value::as_bool) == Some(false)
+            {
+                let slack_error = response_json
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                counter("recipe.image", 1)
+                    .attribute("result", "rate_limited")
+                    .capture();
+                warn!(item = %result.get_item(), %slack_error, %status, "Slack rejected the postMessage request (rate limited or otherwise not ok)");
+                return Err(anyhow!(
+                    "Slack rate-limited the postMessage request (error: {slack_error})"
+                ));
+            }
+
             trace!("Successfully sent the file link, saving precious compute time!");
 
-            let response_json: Value = response.json().await?;
             let message_ts = response_json
                 .get("ts")
                 .context("Missing ts in postMessage response")?
