@@ -859,7 +859,9 @@ async fn handle_event(
                                             }
                                         },
                                         Err(error) => {
-                                            error!(?error, timestamp=%event.ts, text=%event.text, ?username, "MANUAL APOLOGY REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FOR THE JOIN/LEAVE FROM THE DATABASE.");
+                                            let error = anyhow::Error::from(error);
+                                            capture_anyhow(&error);
+                                            error!(already_reported = true, ?error, timestamp=%event.ts, text=%event.text, ?username, "MANUAL APOLOGY REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FOR THE JOIN/LEAVE FROM THE DATABASE.");
                                             return StatusCode::OK.into_response();
                                         }
                                     };
@@ -884,7 +886,9 @@ async fn handle_event(
                                     let subscribed_people = match subscribed_people_result {
                                         Ok(rows) => rows.into_iter().map(|row| row.subscriber_id).collect::<Vec<String>>(),
                                         Err(error) => {
-                                            error!(?error, timestamp=%event.ts, text=%event.text, ?slack_id, ?username, "MANUAL APOLOGY REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FROM THE DATABASE.");
+                                            let error = anyhow::Error::from(error);
+                                            capture_anyhow(&error);
+                                            error!(already_reported = true, ?error, timestamp=%event.ts, text=%event.text, ?slack_id, ?username, "MANUAL APOLOGY REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FROM THE DATABASE.");
                                             return StatusCode::OK.into_response();
                                         }
                                     };
@@ -899,7 +903,11 @@ async fn handle_event(
                                         }
                                     ) {
                                         Ok(..) => info!("Successfully sent the update DM's task to the mpsc queue"),
-                                        Err(error) => error!(?error, timestamp=%event.ts, text=%event.text, ?slack_id, ?username, "MANUAL APOLOGY REQUIRED. AN ERROR OCCURRED WHEN SENDING THE UPDATE DMS TASK TO THE MPSC QUEUE")
+                                        Err(error) => {
+                                            let error = anyhow::Error::from(error);
+                                            capture_anyhow(&error);
+                                            error!(already_reported = true, ?error, timestamp=%event.ts, text=%event.text, ?slack_id, ?username, "MANUAL APOLOGY REQUIRED. AN ERROR OCCURRED WHEN SENDING THE UPDATE DMS TASK TO THE MPSC QUEUE")
+                                        }
                                     }
 
                                     StatusCode::OK.into_response()
@@ -935,7 +943,9 @@ async fn handle_event(
                                             }
                                         },
                                         Err(error) => {
-                                            error!(?error, timestamp=%event.ts, text=%event.text, ?old_nick, ?new_nick, "MANUAL INPUT REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FOR NICKNAME UPDATES FROM THE DATABASE.");
+                                            let error = anyhow::Error::from(error);
+                                            capture_anyhow(&error);
+                                            error!(already_reported = true, ?error, timestamp=%event.ts, text=%event.text, ?old_nick, ?new_nick, "MANUAL INPUT REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FOR NICKNAME UPDATES FROM THE DATABASE.");
                                             return StatusCode::OK.into_response();
                                         }
                                     };
@@ -959,7 +969,11 @@ async fn handle_event(
                                             counter("nickname.update", 1)
                                                 .capture();
                                         },
-                                        Err(e) => error!(error=?e, timestamp=%event.ts, text=%event.text, %old_nick, %new_nick, slack=%row.slack_id, "MANUAL INPUT REQUIRED. AN ERROR OCCURRED WHEN UPDATING THE DATABASE IN THE FINAL STEP OF UPDATING A NICKNAME.")
+                                        Err(e) => {
+                                            let e = anyhow::Error::from(e);
+                                            capture_anyhow(&e);
+                                            error!(already_reported = true, error=?e, timestamp=%event.ts, text=%event.text, %old_nick, %new_nick, slack=%row.slack_id, "MANUAL INPUT REQUIRED. AN ERROR OCCURRED WHEN UPDATING THE DATABASE IN THE FINAL STEP OF UPDATING A NICKNAME.")
+                                        }
                                     }
 
                                     StatusCode::OK.into_response()
