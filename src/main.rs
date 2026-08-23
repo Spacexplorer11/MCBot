@@ -31,7 +31,7 @@ use sentry::integrations::anyhow::capture_anyhow;
 use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
 use sentry::metrics::{counter, distribution, gauge};
 use sentry::protocol::Unit;
-use sentry::{Hub, SentryFutureExt};
+use sentry::{Hub, SentryFutureExt, TransactionContext, TransactionOrSpan};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{query, query_as};
@@ -56,12 +56,16 @@ enum Task {
         thread_ts: Option<String>,
         bot_token: Arc<str>,
         queued_at: std::time::Instant,
+        hub: Arc<Hub>,
+        parent_span: Option<TransactionOrSpan>,
     },
     Subscriptions {
         user_id: String,
         trigger_id: String,
         bot_token: Arc<str>,
         queued_at: std::time::Instant,
+        hub: Arc<Hub>,
+        parent_span: Option<TransactionOrSpan>,
     },
     UpdateDMs {
         people: Vec<String>,
@@ -69,7 +73,31 @@ enum Task {
         slack_and_mc: (String, String),
         bot_token: Arc<str>,
         queued_at: std::time::Instant,
+        hub: Arc<Hub>,
+        parent_span: Option<TransactionOrSpan>,
     },
+}
+
+/// Captures the enqueuing request's Hub (for breadcrumb continuity) and its active
+/// span/transaction (so the task's later processing can continue the same Sentry trace
+/// instead of showing up as a disconnected event).
+fn capture_task_context() -> (Arc<Hub>, Option<TransactionOrSpan>) {
+    let hub = Hub::current();
+    let parent_span = hub.configure_scope(|scope| scope.get_span());
+    (hub, parent_span)
+}
+
+/// Transactions aren't sent to Sentry until `finish()` is called, and there's no `Drop`
+/// impl to do it automatically. This guarantees it happens on every exit path (including
+/// early `return`s inside a task's processing) without having to call it manually at each one.
+struct FinishTransactionOnDrop(Option<sentry::Transaction>);
+
+impl Drop for FinishTransactionOnDrop {
+    fn drop(&mut self) {
+        if let Some(transaction) = self.0.take() {
+            transaction.finish();
+        }
+    }
 }
 
 struct Subscription {
@@ -406,10 +434,16 @@ fn main() -> io::Result<()> {
 
             tokio::spawn(async move {
                 while let Some(task) = queue_output.recv().await {
-                    // Each task gets its own Hub, forked fresh from the current one, so its
-                    // breadcrumbs/events don't bleed into (or get buried under) whatever other
+                    // Fork this task's Hub from the *enqueuing request's* Hub (not the
+                    // background thread's own), so it inherits that request's breadcrumbs
+                    // (e.g. "signature verified", "command matched") instead of starting
+                    // blank, and so its breadcrumbs/events don't bleed into whatever other
                     // tasks this long-lived background loop processes before or after it.
-                    // Without this, every task shares one Hub for the whole process lifetime.
+                    let task_hub = match &task {
+                        Recipe { hub, .. } | Subscriptions { hub, .. } | UpdateDMs { hub, .. } => {
+                            hub.clone()
+                        }
+                    };
                     async {
                     trace!("Received task in async thread");
 
@@ -422,7 +456,22 @@ fn main() -> io::Result<()> {
                             thread_ts,
                             bot_token,
                             queued_at,
+                            hub,
+                            parent_span,
                         } => {
+                            // Continues the enqueuing request's trace as a new, linked
+                            // transaction, so Sentry shows this async processing as connected
+                            // to the HTTP request that triggered it instead of a bare event.
+                            let transaction = sentry::start_transaction(
+                                TransactionContext::continue_from_span(
+                                    "task.recipe",
+                                    "queue.process",
+                                    parent_span,
+                                ),
+                            );
+                            hub.configure_scope(|scope| scope.set_span(Some(transaction.clone().into())));
+                            let _txn_guard = FinishTransactionOnDrop(Some(transaction));
+
                             distribution("task.queue.delay", queued_at.elapsed().as_millis() as f64)
                                 .unit(Unit::Millisecond)
                                 .capture();
@@ -576,7 +625,19 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
                             trigger_id,
                             bot_token,
                             queued_at,
+                            hub,
+                            parent_span,
                         } => {
+                            let transaction = sentry::start_transaction(
+                                TransactionContext::continue_from_span(
+                                    "task.subscriptions",
+                                    "queue.process",
+                                    parent_span,
+                                ),
+                            );
+                            hub.configure_scope(|scope| scope.set_span(Some(transaction.clone().into())));
+                            let _txn_guard = FinishTransactionOnDrop(Some(transaction));
+
                             distribution("task.queue.delay", queued_at.elapsed().as_millis() as f64)
                                 .unit(Unit::Millisecond)
                                 .capture();
@@ -629,7 +690,19 @@ already_reported = true, ?error, "An error occurred fetching and building the mo
                             slack_and_mc,
                             bot_token,
                             queued_at,
+                            hub,
+                            parent_span,
                         } => {
+                            let transaction = sentry::start_transaction(
+                                TransactionContext::continue_from_span(
+                                    "task.update_dms",
+                                    "queue.process",
+                                    parent_span,
+                                ),
+                            );
+                            hub.configure_scope(|scope| scope.set_span(Some(transaction.clone().into())));
+                            let _txn_guard = FinishTransactionOnDrop(Some(transaction));
+
                             distribution("task.queue.delay", queued_at.elapsed().as_millis() as f64)
                                 .unit(Unit::Millisecond)
                                 .capture();
@@ -676,7 +749,7 @@ already_reported = true, ?error, "An error occurred fetching and building the mo
                         }
                     }
                     }
-                    .bind_hub(Hub::new_from_top(Hub::current()))
+                    .bind_hub(Hub::new_from_top(&task_hub))
                     .await;
                 }
             });
@@ -893,13 +966,16 @@ async fn handle_event(
                                         }
                                     };
 
+                                    let (hub, parent_span) = capture_task_context();
                                     match state.mpsc.try_send(
                                         UpdateDMs {
                                             people: subscribed_people,
                                             joining,
                                             slack_and_mc: (slack_id.clone(), username.to_string()),
                                             bot_token: state.bot_token.clone(),
-                                            queued_at: std::time::Instant::now()
+                                            queued_at: std::time::Instant::now(),
+                                            hub,
+                                            parent_span,
                                         }
                                     ) {
                                         Ok(..) => info!("Successfully sent the update DM's task to the mpsc queue"),
@@ -1058,6 +1134,7 @@ async fn handle_command(
                 counter("recipe.request", 1)
                     .attribute("result", "valid")
                     .capture();
+                let (hub, parent_span) = capture_task_context();
                 match state.mpsc.try_send(Recipe {
                     item_name: recipe.clone(),
                     response_url: Some(payload.response_url),
@@ -1066,6 +1143,8 @@ async fn handle_command(
                     thread_ts: None,
                     bot_token: state.bot_token.clone(),
                     queued_at: std::time::Instant::now(),
+                    hub,
+                    parent_span,
                 }) {
                     Ok(..) => {
                         info!(
@@ -1105,11 +1184,14 @@ async fn handle_command(
             }
         }
         "/mc-subs-config" => {
+            let (hub, parent_span) = capture_task_context();
             match state.mpsc.try_send(Subscriptions {
                 user_id: payload.user_id.clone(),
                 trigger_id: payload.trigger_id,
                 bot_token: state.bot_token.clone(),
                 queued_at: std::time::Instant::now(),
+                hub,
+                parent_span,
             }) {
                 Ok(..) => {
                     info!("Configuring updates for {}", payload.user_id);
@@ -2060,6 +2142,7 @@ async fn handle_mcrecipes(
                 &state.flipped_language_mappings,
             );
             if is_recipe_valid {
+                let (hub, parent_span) = capture_task_context();
                 match state.mpsc.try_send(Recipe {
                     item_name: recipe.clone(),
                     response_url: None,
@@ -2068,6 +2151,8 @@ async fn handle_mcrecipes(
                     thread_ts: Some(event.ts.clone()),
                     bot_token: state.bot_token.clone(),
                     queued_at: std::time::Instant::now(),
+                    hub,
+                    parent_span,
                 }) {
                     Ok(..) => {
                         info!("Started processing recipe for {recipe} from {user_id}");
