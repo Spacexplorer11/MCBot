@@ -31,6 +31,7 @@ use sentry::integrations::anyhow::capture_anyhow;
 use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
 use sentry::metrics::{counter, distribution, gauge};
 use sentry::protocol::Unit;
+use sentry::{Hub, SentryFutureExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{query, query_as};
@@ -405,6 +406,11 @@ fn main() -> io::Result<()> {
 
             tokio::spawn(async move {
                 while let Some(task) = queue_output.recv().await {
+                    // Each task gets its own Hub, forked fresh from the current one, so its
+                    // breadcrumbs/events don't bleed into (or get buried under) whatever other
+                    // tasks this long-lived background loop processes before or after it.
+                    // Without this, every task shares one Hub for the whole process lifetime.
+                    async {
                     trace!("Received task in async thread");
 
                     match task {
@@ -597,7 +603,7 @@ warn!("Recipe could not be processed because it was not a crafting recipe");
                                     capture_anyhow(&error);
                                     error!(
 already_reported = true, ?error, "An error occurred fetching and building the modal view");
-                                    continue;
+                                    return;
                                 }
                             };
 
@@ -640,9 +646,12 @@ already_reported = true, ?error, "An error occurred fetching and building the mo
                                     let client = client.clone();
                                     let bot_token = bot_token.clone();
                                     let text_to_send = text_to_send.clone();
-                                    set.spawn(async move {
-                                        send_dm(&client, &bot_token, &person, &text_to_send).await
-                                    });
+                                    set.spawn(
+                                        async move {
+                                            send_dm(&client, &bot_token, &person, &text_to_send).await
+                                        }
+                                        .bind_hub(Hub::current()),
+                                    );
                                 }
 
                                 while let Some(result) = set.join_next().await {
@@ -666,6 +675,9 @@ already_reported = true, ?error, "An error occurred fetching and building the mo
                             }
                         }
                     }
+                    }
+                    .bind_hub(Hub::new_from_top(Hub::current()))
+                    .await;
                 }
             });
 
@@ -1873,6 +1885,10 @@ async fn handle_interactions(
 
                     let target_user_id = target_user_id.clone();
 
+                    // Detached from the request: bind this request's Hub explicitly so the
+                    // (possibly multi-second, due to retries) background work still reports
+                    // breadcrumbs/errors under the right request context instead of whatever
+                    // Hub happens to be current on the executing thread once we've returned.
                     tokio::spawn(async move {
                         let mut last_err = None;
                         for attempt in 1..=5 {
@@ -1986,7 +2002,7 @@ async fn handle_interactions(
                                 "MANUAL CLEANUP NEEDED: failed to remove stuck subscription row"
                             );
                         }
-                    });
+                    }.bind_hub(Hub::current()));
                 }
             }
             StatusCode::OK.into_response()
