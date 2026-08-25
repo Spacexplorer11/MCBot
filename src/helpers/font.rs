@@ -71,20 +71,20 @@ impl MinecraftFont {
     #[tracing::instrument(
         name = "fetching_font_character_pipeline",
     skip(self),
-    fields(index = %index, character = %character)
+    fields(%index, %character)
     )]
     pub fn get_character_image(&self, index: usize, character: String) -> Result<DynamicImage> {
-        trace!(character = %character, index = index, "Looking up character image");
+        trace!(%character, index, "Looking up character image");
         let line = &self.bitmap[index];
         for (i, bit) in line.chars().enumerate() {
             if bit.to_string().eq(&character) {
                 let x = i * 8;
                 let y = index * 8; // The images/letters/characters idk what are 8 x 8px
-                debug!(character = %character, x = x, y = y, "Found character in font");
+                debug!(%character, x = x, y = y, "Found character in font");
                 return Ok(self.image.crop_imm(x as u32, y as u32, 8, 8));
             }
         }
-        warn!(character = %character, index = index, "Character not found in font");
+        warn!(%character, index, "Character not found in font");
         counter("font.character.missing", 1).capture();
         Err(anyhow::anyhow!("Character not found in font"))
     }

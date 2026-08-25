@@ -1,5 +1,5 @@
-use crate::SlackMessageContext;
-use crate::font::MinecraftFont;
+use super::SlackMessageContext;
+use crate::helpers::font::MinecraftFont;
 use anyhow::{Context, Result, anyhow};
 use async_zip::tokio::read::seek::ZipFileReader;
 use image::{DynamicImage, ImageFormat, imageops};
@@ -37,6 +37,8 @@ enum MCRecipe {
         material: String,
         result: RecipeResult,
     },
+    #[serde(other)]
+    Unsupported,
 }
 
 #[derive(Deserialize)]
@@ -180,7 +182,7 @@ impl RecipeData {
                 .read_to_end_checked(&mut item_png_bytes)
                 .await
                 .context(format!("Failed to convert image {item}"))?;
-            trace!(item = %item, bytes = item_png_bytes.len(), "Loaded item texture into memory");
+            trace!(%item, bytes = item_png_bytes.len(), "Loaded item texture into memory");
             self.items.insert(item, item_png_bytes);
         }
         info!(
@@ -200,7 +202,7 @@ impl RecipeData {
             let tag_values: RecipeTag =
                 serde_json::from_str(&tag_value_string).context("Unable to convert tag to json")?;
 
-            trace!(tag = %tag, values_count = tag_values.values.len(), "Loaded tag into memory");
+            trace!(%tag, values_count = tag_values.values.len(), "Loaded tag into memory");
             self.tags.insert(tag, tag_values.values);
         }
         info!(total_tags = self.tags.len(), "Saved tags to tags map");
@@ -223,6 +225,7 @@ impl RecipeData {
 
         let raw_lang: HashMap<String, String> =
             serde_json::from_str(&language_map_string).context("Unable to parse en-us.json")?;
+        drop(language_map_string);
 
         for (key, value) in raw_lang {
             if key.starts_with("item.minecraft.") {
@@ -268,12 +271,12 @@ impl RecipeData {
         ctx: SlackMessageContext<'_>,
         client_jar_zip: &mut ZipFileReader<BufReader<File>>,
     ) -> Result<()> {
-        trace!(item_name = %item_name, user_id = %ctx.user_id, channel_id = %ctx.channel_id, "Entering recipe processing pipeline");
+        trace!(%item_name, user_id = %ctx.user_id, channel_id = %ctx.channel_id, "Entering recipe processing pipeline");
         let recipe_index = self
             .valid_recipes
             .get(item_name)
             .context("Somehow the recipe doesn't exist in the valid recipes map even tho it was previously validated")?;
-        debug!(item_name = %item_name, recipe_index = %recipe_index, "Found recipe index in valid recipes map");
+        debug!(%item_name, %recipe_index, "Found recipe index in valid recipes map");
         let mut recipe = client_jar_zip
             .reader_with_entry(*recipe_index)
             .await
@@ -286,12 +289,12 @@ impl RecipeData {
 
         let recipe_json: MCRecipe = serde_json::from_str(&recipe_string)
             .context("Unable to convert the json to MCRecipe type")?;
-        trace!(item_name = %item_name, "Recipe JSON parsed successfully");
+        trace!(%item_name, "Recipe JSON parsed successfully");
 
         drop(recipe);
         drop(recipe_string);
 
-        debug!(item_name = %item_name, "Dispatching recipe to type-specific handler");
+        debug!(%item_name, "Dispatching recipe to type-specific handler");
         match recipe_json {
             MCRecipe::Shaped {
                 key,
@@ -356,7 +359,7 @@ impl RecipeData {
                     }
                 }
 
-                debug!(item_name = %item_name, placement_count = items_placement.len(), "Shaped recipe parsed, sending to image generator");
+                debug!(%item_name, placement_count = items_placement.len(), "Shaped recipe parsed, sending to image generator");
                 Self::make_and_send_image_to_slack(self, ctx, &result, items_placement).await?
             }
             MCRecipe::Shapeless {
@@ -368,12 +371,11 @@ impl RecipeData {
                     .capture();
                 let mut items_to_place = Vec::new();
                 for ingredient in ingredients {
-                    let item: &str;
                     let ingredient = match ingredient {
                         RecipeIngredient::Single(ingredient) => ingredient,
                         RecipeIngredient::Multiple(ingredient) => ingredient[0].clone(),
                     };
-                    if ingredient.starts_with("#minecraft:") {
+                    let item: &str = if ingredient.starts_with("#minecraft:") {
                         let tag = ingredient.strip_prefix("#minecraft:").unwrap();
 
                         let mut tag_possible_items =
@@ -388,17 +390,17 @@ impl RecipeData {
                                 .get(tag)
                                 .context("Unable to find nested tag in tags")?;
                         }
-                        item = tag_possible_items[0]
+                        tag_possible_items[0]
                             .as_str()
                             .strip_prefix("minecraft:")
-                            .context("The loop failed somehow or the item doesn't begin with 'minecraft:'")?;
+                            .context("The loop failed somehow or the item doesn't begin with 'minecraft:'")?
                     } else {
-                        item = ingredient.strip_prefix("minecraft:").unwrap_or(" ");
-                    }
+                        ingredient.strip_prefix("minecraft:").unwrap_or(" ")
+                    };
                     items_to_place.push(item.to_string());
                 }
 
-                debug!(item_name = %item_name, ingredients_count = items_to_place.len(), "Shapeless recipe parsed, sending to image generator");
+                debug!(%item_name, ingredients_count = items_to_place.len(), "Shapeless recipe parsed, sending to image generator");
                 Self::make_and_send_image_to_slack(self, ctx, &result, items_to_place).await?
             }
             MCRecipe::Transmute {
@@ -459,12 +461,16 @@ impl RecipeData {
                 }
                 items_to_place.push(item.to_string());
 
-                debug!(item_name = %item_name, ingredients_count = items_to_place.len(), "Transmute recipe parsed, sending to image generator");
+                debug!(%item_name, ingredients_count = items_to_place.len(), "Transmute recipe parsed, sending to image generator");
                 Self::make_and_send_image_to_slack(self, ctx, &result, items_to_place).await?
+            }
+            MCRecipe::Unsupported => {
+                warn!(%item_name, user = %ctx.user_id, channel = %ctx.channel_id, "Unsupported recipe was asked for");
+                return Err(anyhow!("Unsupported recipe"));
             }
         }
 
-        info!(item_name = %item_name, "Recipe pipeline completed successfully");
+        info!(%item_name, "Recipe pipeline completed successfully");
         Ok(())
     }
 
@@ -803,7 +809,7 @@ impl RecipeData {
         counter("recipe.image", 1)
             .attribute("result", "generated")
             .capture();
-        info!(item = %result.get_item(), permalink = %permalink, "Recipe image uploaded to Slack and permalink cached");
+        info!(item = %result.get_item(), %permalink, "Recipe image uploaded to Slack and permalink cached");
         trace!("Added the permalink to the array of recipe links");
 
         Ok(())
@@ -821,13 +827,13 @@ pub fn validate_recipe(
         counter("recipe.validation", 1)
             .attribute("result", "exact")
             .capture();
-        debug!(recipe = %recipe, "Exact recipe match found");
+        debug!(%recipe, "Exact recipe match found");
         (true, "".to_string(), recipe)
     } else if let Some(closest_recipe) = fix_recipe_typo(valid_recipes, &recipe) {
         counter("recipe.validation", 1)
             .attribute("result", "typo_corrected")
             .capture();
-        info!(input = %recipe, closest = %closest_recipe, "Typo correction applied to recipe input");
+        info!(input = %recipe, %closest_recipe, "Typo correction applied to recipe input");
         (
             true,
             format!("Assumed you meant {closest_recipe}"),
@@ -837,7 +843,7 @@ pub fn validate_recipe(
         counter("recipe.validation", 1)
             .attribute("result", "invalid")
             .capture();
-        warn!(recipe = %recipe, "Recipe input did not match any known crafting recipe");
+        warn!(%recipe, "Recipe input did not match any known crafting recipe");
         (false, "Invalid recipe".to_string(), recipe)
     }
 }
@@ -889,7 +895,7 @@ async fn fallback_fetch_from_wiki(
     lang_mapped_item: String,
 ) -> Result<(String, Vec<u8>)> {
     let url = format!("https://minecraft.wiki/images/Invicon_{lang_mapped_item}.png");
-    debug!(item = %item, lang_mapped_item = %lang_mapped_item, url = %url, "Fetching missing item texture from Minecraft Wiki");
+    debug!(%item, %lang_mapped_item, %url, "Fetching missing item texture from Minecraft Wiki");
     let response = client
         .get(&url)
         .header("User-Agent", "MCBot")
@@ -901,10 +907,10 @@ async fn fallback_fetch_from_wiki(
             .attribute("result", "failure")
             .capture();
         let status = response.status().as_u16();
-        warn!(item = %item, lang_mapped_item = %lang_mapped_item, status = %status, "Wiki returned non-success status for item texture");
+        warn!(%item, %lang_mapped_item, %status, "Wiki returned non-success status for item texture");
         return Err(anyhow!("Failed to get image from wiki: {}", status));
     }
-    trace!(item = %item, "Wiki responded successfully, reading bytes");
+    trace!(%item, "Wiki responded successfully, reading bytes");
     let item_bytes = response
         .bytes()
         .await
@@ -913,6 +919,6 @@ async fn fallback_fetch_from_wiki(
     counter("wiki.fetch", 1)
         .attribute("result", "success")
         .capture();
-    debug!(item = %item, bytes = item_bytes.len(), "Successfully fetched item texture from wiki");
+    debug!(%item, bytes = item_bytes.len(), "Successfully fetched item texture from wiki");
     Ok((item, item_bytes))
 }
