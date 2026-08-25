@@ -1166,12 +1166,12 @@ async fn handle_command(
                             json!({"response_type": "ephemeral", "text": format!("Gathering images and sewing 'em up, hang on a second! {assumption_text}")}),
                         ).into_response()
                     }
-                    Err(e) => {
+                    Err(error) => {
                         counter("task.queue.full", 1)
                             .attribute("task", "recipe")
                             .capture();
-                        error!("Error occurred sending task to generate image: {e}");
-                        match e {
+                        error!(?error, "Error occurred sending task to generate image");
+                        match error {
                             TrySendError::Full(..) => Json(
                                 json!({"response_type": "ephemeral", "text": "Too many people have requested recipes at the moment. Please try again later."}),
                             ).into_response(),
@@ -1186,8 +1186,9 @@ async fn handle_command(
                     .attribute("result", "invalid")
                     .capture();
                 warn!(
-                    "User {} tried to get recipe {recipe} but it was invalid",
-                    payload.user_id
+                    user_id = %payload.user_id,
+                    %recipe,
+                    "User tried to get an invalid recipe"
                 );
                 Json(
                     json!({"response_type": "ephemeral", "text": format!("Sorry your recipe {recipe} was invalid.")}),
@@ -1208,12 +1209,12 @@ async fn handle_command(
                     info!("Configuring updates for {}", payload.user_id);
                     StatusCode::OK.into_response()
                 }
-                Err(e) => {
+                Err(error) => {
                     counter("task.queue.full", 1)
                         .attribute("task", "subscriptions")
                         .capture();
-                    error!("Error occurred sending task to generate image: {e}");
-                    match e {
+                    error!(?error, "Error occurred sending task to generate image");
+                    match error {
                         TrySendError::Full(..) => Json(
                             json!({"response_type": "ephemeral", "text": "Too many people are using MCBot at the moment. Please try again later."}),
                         ).into_response(),
@@ -1243,11 +1244,11 @@ async fn handle_interactions(
     trace!("Received an interaction at /slack/interactions");
     let interaction: SlackInteraction = match serde_json::from_str(&payload.payload) {
         Ok(i) => i,
-        Err(e) => {
+        Err(error) => {
             counter("slack.interaction", 1)
                 .attribute("action", "parse_error")
                 .capture();
-            error!("Failed to parse interaction payload: {e}");
+            error!(?error, "Failed to parse interaction payload");
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
@@ -1301,7 +1302,7 @@ async fn handle_interactions(
                         let id = match value.parse::<i64>() {
                             Ok(id) => id,
                             Err(..) => {
-                                error!("Failed to parse id as i64 (id = {value})");
+                                error!(%value, "Failed to parse id as i64");
                                 return StatusCode::OK.into_response();
                             }
                         };
@@ -1508,8 +1509,8 @@ async fn handle_interactions(
 
                         let existing_subscription = match existing_subscription {
                             Ok(row) => row.is_some(),
-                            Err(e) => {
-                                error!("Failed to check for existing subscription: {e}");
+                            Err(error) => {
+                                error!(?error, "Failed to check for existing subscription");
                                 return StatusCode::OK.into_response();
                             }
                         };
@@ -1862,8 +1863,8 @@ async fn handle_interactions(
 
                     let existing_subscription = match existing_subscription {
                         Ok(row) => row.is_some(),
-                        Err(e) => {
-                            error!("Failed to check for existing subscription: {e}");
+                        Err(error) => {
+                            error!(?error, "Failed to check for existing subscription");
                             return build_inline_error_response(
                                 "users_select",
                                 "Internal error: failed to check for existing subscription.",
@@ -1952,8 +1953,8 @@ async fn handle_interactions(
                             "error"
                         },
                     );
-                    if let Err(e) = insert_user_result {
-                        error!("Failed to insert user into database: {e}");
+                    if let Err(error) = insert_user_result {
+                        error!(?error, "Failed to insert user into database");
                         return build_inline_error_response(
                             "users_select",
                             "Internal error: Failed to insert user into database.",
@@ -1977,8 +1978,8 @@ async fn handle_interactions(
                             "error"
                         },
                     );
-                    if let Err(e) = insert_subscription_result {
-                        error!("Failed to insert new subscription: {e}");
+                    if let Err(error) = insert_subscription_result {
+                        error!(?error, "Failed to insert new subscription");
                         return build_inline_error_response(
                             "users_select",
                             "Internal error: failed to create new subscription in database.",
@@ -2173,9 +2174,9 @@ async fn handle_mcrecipes(
                             &state.bot_token
                         ).await
                     }
-                    Err(e) => {
-                        error!("Error occurred sending task to generate image: {e}");
-                        match e {
+                    Err(error) => {
+                        error!(?error, "Error occurred sending task to generate image");
+                        match error {
                             TrySendError::Full(..) => {
                                 send_message(
                                     &json!({"channel": event.channel, "thread_ts": event.ts, "text": "Too many people have requested recipes at the moment. Please try again later."}),
@@ -2194,7 +2195,7 @@ async fn handle_mcrecipes(
                     }
                 }
             } else {
-                warn!("User {user_id} tried to get recipe {recipe} but it was invalid");
+                warn!(%user_id, %recipe, "User tried to get an invalid recipe");
                 send_message(
                     &json!({"channel": event.channel, "thread_ts": event.ts, "text": "Sorry your recipe was invalid."}),
                     &state.client,
@@ -2219,12 +2220,12 @@ async fn verify_slack_signature(
 
     let request_bytes = match axum::body::to_bytes(body, 1024 * 16).await {
         Ok(bytes) => bytes,
-        Err(e) => {
+        Err(error) => {
             counter("slack.signature.verification", 1)
                 .attribute("result", "failure")
                 .attribute("reason", "body_read_error")
                 .capture();
-            error!("Failed to read request body: {e}");
+            error!(?error, "Failed to read request body");
             return Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body("Failed to read request body".into())
@@ -2318,12 +2319,12 @@ async fn verify_slack_signature(
 
     let request_string = match str::from_utf8(request_bytes.as_ref()) {
         Ok(s) => s,
-        Err(e) => {
+        Err(error) => {
             counter("slack.signature.verification", 1)
                 .attribute("result", "failure")
                 .attribute("reason", "invalid_body_encoding")
                 .capture();
-            error!("Slack request body not valid utf-8: {e}");
+            error!(?error, "Slack request body not valid utf-8");
             return Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body("Slack request body not valid utf-8".into())
@@ -2375,12 +2376,12 @@ async fn verify_slack_signature(
             next.run(Request::from_parts(parts, Body::from(request_bytes)))
                 .await
         }
-        Err(e) => {
+        Err(error) => {
             counter("slack.signature.verification", 1)
                 .attribute("result", "failure")
                 .attribute("reason", "hmac_mismatch")
                 .capture();
-            warn!("Slack signature verification failed: {e}");
+            warn!(?error, "Slack signature verification failed");
             Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body("Slack signature verification failed".into())
@@ -2402,9 +2403,9 @@ async fn send_message(json: &Value, client: &Client, bot_token: &str) -> Respons
             logging::record_slack_api_metric("chat.postMessage", start, "ok");
             StatusCode::OK.into_response()
         }
-        Err(e) => {
+        Err(error) => {
             logging::record_slack_api_metric("chat.postMessage", start, "request_error");
-            error!("Error occurred sending message: {e}");
+            error!(?error, "Error occurred sending message");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
