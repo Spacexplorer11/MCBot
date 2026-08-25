@@ -43,9 +43,9 @@ pub struct AppState {
     client: Client,
     bot_token: Arc<str>,
     mpsc: mpsc::Sender<Task>,
-    valid_recipes: HashMap<String, usize>,
+    valid_recipes: Arc<HashMap<Box<str>, usize>>,
     sqlx_pool: sqlx::PgPool,
-    flipped_language_mappings: HashMap<String, String>,
+    flipped_language_mappings: Arc<HashMap<Box<str>, Box<str>>>,
     hackclub_api_key: Arc<str>,
 }
 
@@ -54,9 +54,9 @@ impl AppState {
         client: Client,
         bot_token: Arc<str>,
         mpsc: mpsc::Sender<Task>,
-        valid_recipes: HashMap<String, usize>,
+        valid_recipes: Arc<HashMap<Box<str>, usize>>,
         sqlx_pool: sqlx::PgPool,
-        flipped_language_mappings: HashMap<String, String>,
+        flipped_language_mappings: Arc<HashMap<Box<str>, Box<str>>>,
         hackclub_api_key: Arc<str>,
     ) -> AppState {
         AppState {
@@ -76,8 +76,8 @@ pub struct MCRecipesAppState {
     client: Client,
     bot_token: Arc<str>,
     mpsc: mpsc::Sender<Task>,
-    valid_recipes: HashMap<String, usize>,
-    flipped_language_mappings: HashMap<String, String>,
+    valid_recipes: Arc<HashMap<Box<str>, usize>>,
+    flipped_language_mappings: Arc<HashMap<Box<str>, Box<str>>>,
 }
 
 impl MCRecipesAppState {
@@ -85,8 +85,8 @@ impl MCRecipesAppState {
         client: Client,
         bot_token: Arc<str>,
         mpsc: mpsc::Sender<Task>,
-        valid_recipes: HashMap<String, usize>,
-        flipped_language_mappings: HashMap<String, String>,
+        valid_recipes: Arc<HashMap<Box<str>, usize>>,
+        flipped_language_mappings: Arc<HashMap<Box<str>, Box<str>>>,
     ) -> MCRecipesAppState {
         MCRecipesAppState {
             client,

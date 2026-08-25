@@ -43,7 +43,7 @@ enum MCRecipe {
 
 #[derive(Deserialize)]
 struct RecipeTag {
-    values: Vec<String>,
+    values: Box<[Box<str>]>,
 }
 
 #[derive(Deserialize)]
@@ -67,7 +67,7 @@ impl RecipeResult {
             .expect("Result doesn't start with 'minecraft:'")
     }
 
-    fn get_pretty_item(&self, language_mappings: &HashMap<String, String>) -> String {
+    fn get_pretty_item(&self, language_mappings: &HashMap<Box<str>, Box<str>>) -> String {
         language_mappings
             .get(
                 self.id
@@ -81,18 +81,18 @@ impl RecipeResult {
 
 #[derive(Default)]
 pub struct RecipeData {
-    items: HashMap<String, Vec<u8>>,
-    tags: HashMap<String, Vec<String>>,
-    language_mappings: HashMap<String, String>,
-    pub valid_recipes: HashMap<String, usize>,
+    items: HashMap<Box<str>, Box<[u8]>>,
+    tags: HashMap<Box<str>, Box<[Box<str>]>>,
+    language_mappings: Arc<HashMap<Box<str>, Box<str>>>,
+    pub valid_recipes: Arc<HashMap<Box<str>, usize>>,
     font: MinecraftFont,
-    recipe_links: HashMap<String, String>,
+    recipe_links: HashMap<Box<str>, Box<str>>,
     crafting_table_gui: DynamicImage,
 }
 
 impl RecipeData {
-    pub fn language_mappings(&self) -> HashMap<String, String> {
-        self.language_mappings.clone()
+    pub fn language_mappings(&self) -> &HashMap<Box<str>, Box<str>> {
+        &self.language_mappings
     }
 
     #[tracing::instrument(name = "fetching_on_startup_pipeline", skip(self, client_jar_zip))]
@@ -102,6 +102,7 @@ impl RecipeData {
     ) -> Result<()> {
         let mut temp_items_map = HashMap::new();
         let mut temp_recipe_tags = HashMap::new();
+        let mut temp_valid_recipes = HashMap::new();
         let mut language_map_index: Option<usize> = None;
         let mut font_indexes: Vec<Option<usize>> = Vec::new();
 
@@ -120,9 +121,10 @@ impl RecipeData {
                     .unwrap()
                     .strip_suffix(".json")
                     .unwrap()
-                    .to_string();
+                    .to_string()
+                    .into_boxed_str();
 
-                self.valid_recipes.insert(recipe_name, i);
+                temp_valid_recipes.insert(recipe_name, i);
             } else if filename.eq("assets/minecraft/textures/gui/container/crafting_table.png") {
                 // Get the crafting table GUI image from the jar
                 let item_name = filename
@@ -130,7 +132,8 @@ impl RecipeData {
                     .unwrap()
                     .strip_suffix(".png")
                     .unwrap()
-                    .to_string();
+                    .to_string()
+                    .into_boxed_str();
                 temp_items_map.insert(item_name, i);
             } else if filename.eq("assets/minecraft/lang/en_us.json") {
                 language_map_index = Some(i); // Get the language mapping file's index
@@ -147,7 +150,8 @@ impl RecipeData {
                     .unwrap()
                     .strip_suffix(".png")
                     .unwrap()
-                    .to_string();
+                    .to_string()
+                    .into_boxed_str();
 
                 temp_items_map.insert(item_name, i);
             } else if filename.starts_with("data/minecraft/tags/item")
@@ -160,7 +164,8 @@ impl RecipeData {
                     .unwrap()
                     .strip_suffix(".json")
                     .unwrap()
-                    .to_string();
+                    .to_string()
+                    .into_boxed_str();
 
                 temp_recipe_tags.insert(tag_name, i);
             }
@@ -168,7 +173,7 @@ impl RecipeData {
         info!("Saved recipes to recipe map");
         trace!("Saved the relevant things to their temporary maps");
         debug!(
-            recipe_count = self.valid_recipes.len(),
+            recipe_count = temp_valid_recipes.len(),
             item_count = temp_items_map.len(),
             tag_count = temp_recipe_tags.len(),
             "Jar index scan complete"
@@ -183,7 +188,7 @@ impl RecipeData {
                 .await
                 .context(format!("Failed to convert image {item}"))?;
             trace!(%item, bytes = item_png_bytes.len(), "Loaded item texture into memory");
-            self.items.insert(item, item_png_bytes);
+            self.items.insert(item, item_png_bytes.into());
         }
         info!(
             total_items = self.items.len(),
@@ -227,15 +232,19 @@ impl RecipeData {
             serde_json::from_str(&language_map_string).context("Unable to parse en-us.json")?;
         drop(language_map_string);
 
+        let mut language_mappings = HashMap::new();
         for (key, value) in raw_lang {
             if key.starts_with("item.minecraft.") {
                 let item_id = key.strip_prefix("item.minecraft.").unwrap().to_string();
-                self.language_mappings.insert(item_id, value);
+                language_mappings.insert(item_id.into_boxed_str(), value.into_boxed_str());
             } else if key.starts_with("block.minecraft.") {
                 let block_id = key.strip_prefix("block.minecraft.").unwrap().to_string();
-                self.language_mappings.insert(block_id, value);
+                language_mappings.insert(block_id.into_boxed_str(), value.into_boxed_str());
             }
         }
+
+        self.language_mappings = Arc::new(language_mappings);
+        self.valid_recipes = Arc::new(temp_valid_recipes);
         info!(
             mappings_count = self.language_mappings.len(),
             "Saved language mappings to language mappings map"
@@ -320,8 +329,7 @@ impl RecipeData {
                     }
 
                     for char in part.chars() {
-                        let item;
-                        if !char.is_whitespace() {
+                        let item = if !char.is_whitespace() {
                             let item_or_tag: &String = match key
                                 .get(char.to_string().as_str())
                                 .context("Character key missing from recipe definition")?
@@ -345,17 +353,16 @@ impl RecipeData {
                                         .get(tag)
                                         .context("Unable to find nested tag in tags")?;
                                 }
-                                item = tag_possible_items[0]
-                                    .as_str()
+                                tag_possible_items[0]
                                     .strip_prefix("minecraft:")
-                                    .context("The loop failed somehow or the item doesn't begin with 'minecraft:'")?;
+                                    .context("The loop failed somehow or the item doesn't begin with 'minecraft:'")?
                             } else {
-                                item = item_or_tag.strip_prefix("minecraft:").unwrap_or(" ");
+                                item_or_tag.strip_prefix("minecraft:").unwrap_or(" ")
                             }
                         } else {
-                            item = " ";
-                        }
-                        items_placement.push(item.to_string());
+                            " "
+                        };
+                        items_placement.push(item.into());
                     }
                 }
 
@@ -390,14 +397,13 @@ impl RecipeData {
                                 .get(tag)
                                 .context("Unable to find nested tag in tags")?;
                         }
-                        tag_possible_items[0]
-                            .as_str()
-                            .strip_prefix("minecraft:")
-                            .context("The loop failed somehow or the item doesn't begin with 'minecraft:'")?
+                        tag_possible_items[0].strip_prefix("minecraft:").context(
+                            "The loop failed somehow or the item doesn't begin with 'minecraft:'",
+                        )?
                     } else {
                         ingredient.strip_prefix("minecraft:").unwrap_or(" ")
                     };
-                    items_to_place.push(item.to_string());
+                    items_to_place.push(item.into());
                 }
 
                 debug!(%item_name, ingredients_count = items_to_place.len(), "Shapeless recipe parsed, sending to image generator");
@@ -412,8 +418,7 @@ impl RecipeData {
                     .attribute("type", "transmute")
                     .capture();
                 let mut items_to_place = Vec::new();
-                let mut item: &str;
-                if input.starts_with("#minecraft:") {
+                let mut item = if input.starts_with("#minecraft:") {
                     let tag = input.strip_prefix("#minecraft:").unwrap();
 
                     let mut tag_possible_items =
@@ -428,14 +433,13 @@ impl RecipeData {
                             .get(tag)
                             .context("Unable to find nested tag in tags")?;
                     }
-                    item = tag_possible_items[0]
-                        .as_str()
+                    tag_possible_items[0]
                         .strip_prefix("minecraft:")
-                        .context("The item doesn't begin with 'minecraft:'")?;
+                        .context("The item doesn't begin with 'minecraft:'")?
                 } else {
-                    item = input.strip_prefix("minecraft:").unwrap_or(" ");
-                }
-                items_to_place.push(item.to_string());
+                    input.strip_prefix("minecraft:").unwrap_or(" ")
+                };
+                items_to_place.push(item.to_string().into_boxed_str());
 
                 if material.starts_with("#minecraft:") {
                     let tag = material.strip_prefix("#minecraft:").unwrap();
@@ -453,13 +457,12 @@ impl RecipeData {
                             .context("Unable to find nested tag in tags")?;
                     }
                     item = tag_possible_items[0]
-                        .as_str()
                         .strip_prefix("minecraft:")
                         .context("The item doesn't begin with 'minecraft:'")?;
                 } else {
                     item = material.strip_prefix("minecraft:").unwrap_or(" ");
                 }
-                items_to_place.push(item.to_string());
+                items_to_place.push(item.into());
 
                 debug!(%item_name, ingredients_count = items_to_place.len(), "Transmute recipe parsed, sending to image generator");
                 Self::make_and_send_image_to_slack(self, ctx, &result, items_to_place).await?
@@ -478,7 +481,7 @@ impl RecipeData {
         &mut self,
         ctx: SlackMessageContext<'_>,
         result: &RecipeResult,
-        recipe_ingredients: Vec<String>,
+        recipe_ingredients: Vec<Box<str>>,
     ) -> Result<()> {
         trace!(item = %result.get_item(), ingredients_count = recipe_ingredients.len(), "Entering make_and_send_image_to_slack");
         let recipe_link = self.recipe_links.get(result.get_item());
@@ -523,7 +526,10 @@ impl RecipeData {
 
             let is_valid = ctx
                 .client
-                .head(recipe_link)
+                .head(
+                    reqwest::Url::parse(recipe_link.as_ref())
+                        .context("Recipe URL could not be parsed")?,
+                )
                 .send()
                 .await?
                 .status()
@@ -560,7 +566,7 @@ impl RecipeData {
 
         let mut missing_items = HashSet::new();
         for item in &recipe_ingredients {
-            if !self.items.contains_key(item) && !item.eq(" ") {
+            if !self.items.contains_key(item) && !item.as_ref().eq(" ") {
                 missing_items.insert(item.to_string());
             }
         }
@@ -574,19 +580,18 @@ impl RecipeData {
             trace!("All item textures present in local cache, no wiki fetches needed");
         }
 
-        let language_mappings = Arc::new(self.language_mappings.clone());
-
         let mut set = JoinSet::new();
         for item in missing_items {
             counter("recipe.image", 1)
                 .attribute("result", "wiki_fetch")
                 .capture();
-            let lang_mappings = language_mappings.clone();
+            let lang_mappings = self.language_mappings.clone();
             let client = ctx.client.clone();
             set.spawn(async move {
                 let lang_mapped_item = lang_mappings
                     .get(item.as_str())
-                    .unwrap_or(&item)
+                    .map(|item| item.to_string())
+                    .unwrap_or_else(|| item.clone())
                     .replace(' ', "_");
                 fallback_fetch_from_wiki(client, item.clone(), lang_mapped_item.clone()).await
             });
@@ -596,7 +601,7 @@ impl RecipeData {
             let item_result = result?;
             let (item, bytes) = item_result?;
             debug!(%item, bytes = bytes.len(), "Wiki fallback texture fetched and stored");
-            self.items.insert(item, bytes);
+            self.items.insert(item.into_boxed_str(), bytes.into());
         }
 
         let mut i = 0;
@@ -606,7 +611,7 @@ impl RecipeData {
                 let cell_y = grid_origin_y + (row * cell_size);
 
                 if recipe_ingredients.get(i).is_some()
-                    && !recipe_ingredients.get(i).unwrap().eq(" ")
+                    && !recipe_ingredients.get(i).unwrap().as_ref().eq(" ")
                 {
                     let item_bytes = match self.items.get(&recipe_ingredients[i]) {
                         Some(bytes) => bytes,
@@ -801,11 +806,10 @@ impl RecipeData {
             .get("permalink")
             .context("Unable to find the 'permalink' key in the response")?
             .as_str()
-            .context("Unable to convert the 'permalink' key to a string")?
-            .to_string();
+            .context("Unable to convert the 'permalink' key to a string")?;
 
         self.recipe_links
-            .insert(result.get_item().to_string(), permalink.clone());
+            .insert(result.get_item().into(), permalink.into());
         counter("recipe.image", 1)
             .attribute("result", "generated")
             .capture();
@@ -818,9 +822,9 @@ impl RecipeData {
 
 pub fn validate_recipe(
     recipe: &str,
-    valid_recipes: &HashMap<String, usize>,
-    flipped_language_mappings: &HashMap<String, String>,
-) -> (bool, String, String) {
+    valid_recipes: &HashMap<Box<str>, usize>,
+    flipped_language_mappings: &HashMap<Box<str>, Box<str>>,
+) -> (bool, Box<str>, Box<str>) {
     trace!(raw_input = %recipe, "Validating recipe input");
     let recipe = fix_recipe(recipe, flipped_language_mappings);
     if valid_recipes.contains_key(&recipe) {
@@ -828,7 +832,7 @@ pub fn validate_recipe(
             .attribute("result", "exact")
             .capture();
         debug!(%recipe, "Exact recipe match found");
-        (true, "".to_string(), recipe)
+        (true, "".into(), recipe)
     } else if let Some(closest_recipe) = fix_recipe_typo(valid_recipes, &recipe) {
         counter("recipe.validation", 1)
             .attribute("result", "typo_corrected")
@@ -836,24 +840,24 @@ pub fn validate_recipe(
         info!(input = %recipe, %closest_recipe, "Typo correction applied to recipe input");
         (
             true,
-            format!("Assumed you meant {closest_recipe}"),
-            closest_recipe.clone(),
+            format!("Assumed you meant {closest_recipe}").into_boxed_str(),
+            closest_recipe.into(),
         )
     } else {
         counter("recipe.validation", 1)
             .attribute("result", "invalid")
             .capture();
         warn!(%recipe, "Recipe input did not match any known crafting recipe");
-        (false, "Invalid recipe".to_string(), recipe)
+        (false, "Invalid recipe".into(), recipe)
     }
 }
 
 fn fix_recipe_typo<'a>(
-    valid_recipes: &'a HashMap<String, usize>,
+    valid_recipes: &'a HashMap<Box<str>, usize>,
     recipe_to_fix: &str,
-) -> Option<&'a String> {
+) -> Option<&'a str> {
     let mut lowest_distance = usize::MAX;
-    let mut closest_recipe: Option<&String> = None;
+    let mut closest_recipe: Option<&str> = None;
     for recipe in valid_recipes.keys() {
         let distance = levenshtein(recipe, recipe_to_fix);
 
@@ -866,7 +870,7 @@ fn fix_recipe_typo<'a>(
     closest_recipe
 }
 
-fn fix_recipe(recipe: &str, flipped_language_mappings: &HashMap<String, String>) -> String {
+fn fix_recipe(recipe: &str, flipped_language_mappings: &HashMap<Box<str>, Box<str>>) -> Box<str> {
     let mut recipe = recipe;
     if recipe.starts_with(" ") {
         recipe = recipe.strip_prefix(" ").unwrap()
@@ -876,13 +880,13 @@ fn fix_recipe(recipe: &str, flipped_language_mappings: &HashMap<String, String>)
     }
     // Matches any whitespace (\s), dashes (\-), forward slashes (/), or backslashes (\\)
     let re = Regex::new(r"[\s\-/\\]+").unwrap();
-
     let fixed_recipe = re
         .replace_all(recipe.to_lowercase().as_str(), "_")
-        .into_owned();
+        .as_ref()
+        .into();
 
     if let Some(mapped_recipe) = flipped_language_mappings.get(&fixed_recipe) {
-        mapped_recipe.to_string()
+        mapped_recipe.to_owned()
     } else {
         fixed_recipe
     }

@@ -45,7 +45,7 @@ pub type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 
 pub enum Task {
     Recipe {
-        item_name: String,
+        item_name: Box<str>,
         response_url: Option<String>,
         channel_id: String,
         user_id: String,
@@ -159,8 +159,9 @@ fn main() -> io::Result<()> {
 
             for (key, value) in recipe_data.language_mappings() {
                 let value = value.to_lowercase().replace(' ', "_");
-                flipped_language_mappings.insert(value, key);
+                flipped_language_mappings.insert(value.into_boxed_str(), key.clone());
             }
+            let flipped_language_mappings = Arc::new(flipped_language_mappings);
 
             let state = Arc::new(handlers::AppState::new(
                 Client::new(),
@@ -202,7 +203,7 @@ fn main() -> io::Result<()> {
 
                             match recipe_data
                                 .process_recipe(
-                                    item_name.as_str(),
+                                    item_name.as_ref(),
                                     ctx,
                                     &mut client_jar_zip,
                                 )
