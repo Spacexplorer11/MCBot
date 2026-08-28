@@ -1,5 +1,5 @@
 use super::AppState;
-use crate::{Task::UpdateDMs, helpers::messages::send_message, logging, capture_task_context};
+use crate::{Task::UpdateDMs, capture_task_context, helpers::messages::send_message, logging};
 use axum::{
     Json,
     body::Body,
@@ -7,8 +7,8 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sentry::metrics::counter;
 use sentry::integrations::anyhow::capture_anyhow;
+use sentry::metrics::counter;
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::query;
@@ -72,7 +72,7 @@ pub async fn handle_event(
             info!("Url Verification challenge received");
             Json(json!({"challenge": challenge})).into_response()
         }
-        
+
         SlackPayload::EventCallback { event } => {
             counter("slack.event", 1)
                 .attribute("type", "event_callback")
@@ -87,12 +87,12 @@ pub async fn handle_event(
                             match event.username {
                                 UsefulUsernames::Join | UsefulUsernames::Leave => {
                                     let text = event.text.split_ascii_whitespace().map(|part| part.to_string()).collect::<Vec<String>>();
-                                    
+
                                     let username = text.first().expect("This is a deterministic message. If this has changed then that is requires immediate attention.").replace('*', "");
                                     let joining = event.text.contains("joined");
-                                    
+
                                     debug!(timestamp = %event.ts, %username, joining, "Processing join/leave notification, looking up subscriber's slack id");
-                                    
+
                                     let query_start = std::time::Instant::now();
                                     let user_lookup_result = query!(
                                         "SELECT * FROM users WHERE $1 = ANY(mc_usernames)",
@@ -122,9 +122,9 @@ pub async fn handle_event(
                                             return StatusCode::OK.into_response();
                                         }
                                     };
-                                    
+
                                     debug!(timestamp = %event.ts, %username, %slack_id, "Found subscriber's slack id, looking up active subscriptions");
-                                    
+
                                     let query_start = std::time::Instant::now();
                                     let subscribed_people_result = query!(
                                         "SELECT *
@@ -149,7 +149,7 @@ pub async fn handle_event(
                                             return StatusCode::OK.into_response();
                                         }
                                     };
-                                    
+
                                     let (hub, parent_span) = capture_task_context();
                                     match state.mpsc.try_send(
                                         UpdateDMs {
@@ -169,17 +169,17 @@ pub async fn handle_event(
                                             error!(already_reported = true, ?error, timestamp=%event.ts, text=%event.text, ?slack_id, ?username, "MANUAL APOLOGY REQUIRED. AN ERROR OCCURRED WHEN SENDING THE UPDATE DMS TASK TO THE MPSC QUEUE")
                                         }
                                     }
-                                    
+
                                     StatusCode::OK.into_response()
                                 },
                                 UsefulUsernames::Nickname => {
                                     let text = event.text.split_ascii_whitespace().map(|part| part.to_string()).collect::<Vec<String>>();
-                                    
+
                                     let old_nick = text.first().expect("This is a deterministic message. If this has changed then that is requires immediate attention.");
                                     let new_nick = text.last().expect("This is a deterministic message. If this has changed then that is requires immediate attention.");
-                                    
+
                                     debug!(timestamp = %event.ts, %old_nick, %new_nick, "Processing nickname change notification, looking up user by old mc username");
-                                    
+
                                     let query_start = std::time::Instant::now();
                                     let nickname_row_result = query!(
                                         "SELECT * FROM users WHERE $1 = ANY(mc_usernames)",
@@ -209,13 +209,13 @@ pub async fn handle_event(
                                             return StatusCode::OK.into_response();
                                         }
                                     };
-                                    
+
                                     let mut mc_usernames = row.mc_usernames;
                                     mc_usernames.retain(|user| user != old_nick);
                                     mc_usernames.push(new_nick.clone());
-                                    
+
                                     debug!(timestamp = %event.ts, %old_nick, %new_nick, slack = %row.slack_id, "Found user row, updating mc_usernames");
-                                    
+
                                     let query_start = std::time::Instant::now();
                                     let nickname_update_result = query!("UPDATE users SET mc_usernames = $1 WHERE slack_id = $2", &mc_usernames, row.slack_id).execute(&state.sqlx_pool).await;
                                     logging::record_db_query_metric(
@@ -235,9 +235,9 @@ pub async fn handle_event(
                                             error!(already_reported = true, error=?e, timestamp=%event.ts, text=%event.text, %old_nick, %new_nick, slack=%row.slack_id, "MANUAL INPUT REQUIRED. AN ERROR OCCURRED WHEN UPDATING THE DATABASE IN THE FINAL STEP OF UPDATING A NICKNAME.")
                                         }
                                     }
-                                    
+
                                     StatusCode::OK.into_response()
-                                    
+
                                     /* Honestly this took me took long to make so in case I need it in the future I kept it
                                     let response: MinecraftPlayerData = match state.client.get("https://api.mc.hackclub.com")
                                           .header("User-Agent", "MCBot")

@@ -1,5 +1,5 @@
-use anyhow::{Context, anyhow};
 use crate::logging;
+use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::query_as;
@@ -36,8 +36,8 @@ LIMIT 6 OFFSET $2",
         user_id,
         page * 5
     )
-        .fetch_all(sqlx_pool)
-        .await;
+    .fetch_all(sqlx_pool)
+    .await;
     logging::record_db_query_metric(
         "subscriptions_fetch_page",
         query_start,
@@ -53,11 +53,11 @@ LIMIT 6 OFFSET $2",
             return Err(anyhow!("Failed to fetch subscriptions. Error: {e}"));
         }
     };
-    
+
     let metadata = SubsPageMetadata { page, page_size: 5 };
-    
+
     let mut blocks: Vec<Value> = Vec::new();
-    
+
     blocks.push(json!({"type": "section", "text": {"type": "mrkdwn", "text": "Configure your update subscriptions below"}})); // Title
     blocks.push(json!({"type": "divider"}));
     blocks.push(json!({
@@ -87,14 +87,14 @@ LIMIT 6 OFFSET $2",
         "emoji": true
     }
     }));
-    
+
     for subscription in &subs[..subs.len().min(6)] {
         let len = subscription.mc_usernames.len();
         let title = if len > 1 {
             let mut mcusers = String::new();
-            
+
             let mut i = 1;
-            
+
             for mcuser in &subscription.mc_usernames {
                 if i != len {
                     let mcuser = format!("{mcuser}, ");
@@ -104,7 +104,7 @@ LIMIT 6 OFFSET $2",
                     mcusers.push_str(mcuser)
                 }
             }
-            
+
             format!("<@{}> *({})*", subscription.target_id, mcusers)
         } else {
             format!(
@@ -171,13 +171,13 @@ LIMIT 6 OFFSET $2",
             }))
         }
     }
-    
+
     blocks.push(json!({
         "type": "divider"
     }));
-    
+
     let mut pagination_buttons: Vec<Value> = Vec::new();
-    
+
     if page > 0 && !subs.is_empty() {
         pagination_buttons.push(json!(
             {
@@ -192,7 +192,7 @@ LIMIT 6 OFFSET $2",
             }
         ));
     }
-    
+
     if subs.len() > 5 {
         pagination_buttons.push(json!(
             {
@@ -207,7 +207,7 @@ LIMIT 6 OFFSET $2",
             }
         ));
     }
-    
+
     if !pagination_buttons.is_empty() {
         blocks.push(json!({
             "type": "actions",
@@ -218,7 +218,7 @@ LIMIT 6 OFFSET $2",
             "type": "divider"
         }));
     }
-    
+
     blocks.push(json!({
                             "type": "section",
                             "text": {
@@ -226,7 +226,7 @@ LIMIT 6 OFFSET $2",
                             "text": "*What is this?*\n This feature allows you to subscribe to DM updates when the player you choose joins/leaves the hackclub minecraft server."
                         }
                         }));
-    
+
     Ok(json!(
                     {
 	"type": "modal",

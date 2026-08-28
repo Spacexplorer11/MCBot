@@ -1,9 +1,9 @@
 use super::MCRecipesAppState;
 use crate::Task::Recipe;
+use crate::capture_task_context;
 use crate::handlers::events::SlackPayload;
 use crate::handlers::recipes::validate_recipe;
 use crate::helpers::messages::send_message;
-use crate::capture_task_context;
 use axum::{
     Json,
     body::Body,
@@ -26,7 +26,7 @@ pub async fn handle_mcrecipes(
             info!("Url Verification challenge received for MCRecipes");
             Json(json!({"challenge": challenge})).into_response()
         }
-        
+
         SlackPayload::EventCallback { event } => {
             let user_id = if let Some(user_id) = event.user {
                 user_id.clone()
@@ -44,7 +44,7 @@ pub async fn handle_mcrecipes(
                 return Json(
                     json!({"response_type": "ephemeral", "text": "You didn't enter a recipe!"}),
                 )
-                    .into_response();
+                .into_response();
             }
             let (is_recipe_valid, assumption_text, recipe) = validate_recipe(
                 &cleaned_text,

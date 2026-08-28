@@ -18,7 +18,7 @@ pub fn build_inline_error_response(field: &str, message: &str) -> Response<Body>
             field: message
         }
     }))
-        .into_response()
+    .into_response()
 }
 
 pub async fn send_and_log_on_failure(request: reqwest::RequestBuilder, context: &str) {

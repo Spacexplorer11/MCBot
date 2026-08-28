@@ -11,8 +11,6 @@ use axum::{
     routing::{get, post},
 };
 use dotenvy::dotenv;
-use reqwest::Client;
-use sentry::{Hub, SentryFutureExt, TransactionContext, TransactionOrSpan};
 use handlers::{
     SlackMessageContext, commands::handle_command, events::handle_event,
     interactions::handle_interactions, mcrecipes::handle_mcrecipes, recipes::RecipeData,
@@ -26,6 +24,8 @@ use helpers::{
     slack_signature_verifier::verify_slack_signature,
     subs_modal_builder::fetch_and_build_subs_modal_view,
 };
+use reqwest::Client;
+use sentry::{Hub, SentryFutureExt, TransactionContext, TransactionOrSpan};
 use sentry::{
     integrations::{
         anyhow::capture_anyhow,
@@ -279,7 +279,7 @@ fn main() -> io::Result<()> {
                                         .capture();
                                     let is_unsupported_recipe_type = error
                                         .to_string()
-                                        .eq("Unable to convert the json to MCRecipe type");
+                                        .eq("Unsupported recipe");
                                     let is_rate_limited =
                                         error.to_string().starts_with("Slack rate-limited");
                                     if is_unsupported_recipe_type {

@@ -12,7 +12,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sentry::{integrations::anyhow::capture_anyhow, metrics::counter, SentryFutureExt, Hub};
+use sentry::{Hub, SentryFutureExt, integrations::anyhow::capture_anyhow, metrics::counter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::query;
@@ -163,7 +163,7 @@ pub async fn handle_interactions(
                 .capture();
             let private_metadata: Option<SubsPageMetadata>;
             let mut page: i64 = 0;
-            
+
             if let Some(view) = &view {
                 #[allow(clippy::single_match)]
                 match view.callback_id {
@@ -208,8 +208,8 @@ pub async fn handle_interactions(
                             id,
                             user.id
                         )
-                            .execute(&state.sqlx_pool)
-                            .await;
+                        .execute(&state.sqlx_pool)
+                        .await;
                         logging::record_db_query_metric(
                             "subscriptions_delete_by_id",
                             query_start,
@@ -228,7 +228,7 @@ pub async fn handle_interactions(
                                     page,
                                     user.id,
                                 )
-                                    .await
+                                .await
                                 {
                                     Ok(json) => json,
                                     Err(e) => {
@@ -249,7 +249,7 @@ pub async fn handle_interactions(
                                         .json(&json),
                                     "Updating the view after a subscription was removed",
                                 )
-                                    .await;
+                                .await;
                                 StatusCode::OK.into_response()
                             }
                             Err(e) => {
@@ -290,18 +290,18 @@ pub async fn handle_interactions(
                             },
                             "block_id": "users_select"
                         });
-                        
+
                         let metadata = UsersSelectMetadata {
                             hash: view.hash,
                             view_id: view.id,
                             page,
                         };
-                        
+
                         let metadata_as_str = serde_json::to_string(&metadata).unwrap_or_else(|error| {
                             warn!(?error, "An error occurred when converting the UsersSelectMetadata to string");
                             "".to_string()
                         });
-                        
+
                         let json = json!({
                             "view": {
                                 "type": "modal",
@@ -320,7 +320,7 @@ pub async fn handle_interactions(
                             },
                             "trigger_id": trigger_id
                         });
-                        
+
                         send_and_log_on_failure(
                             state
                                 .client
@@ -329,8 +329,8 @@ pub async fn handle_interactions(
                                 .json(&json),
                             "Pushing an input view",
                         )
-                            .await;
-                        
+                        .await;
+
                         StatusCode::OK.into_response()
                     } else {
                         error!(
@@ -375,7 +375,7 @@ pub async fn handle_interactions(
                                 .json(&json),
                             "Updating the view after a page change",
                         )
-                            .await;
+                        .await;
                         StatusCode::OK.into_response()
                     } else {
                         error!("View not found when required for changing the page");
@@ -402,7 +402,7 @@ pub async fn handle_interactions(
                                 "error"
                             },
                         );
-                        
+
                         let existing_subscription = match existing_subscription {
                             Ok(row) => row.is_some(),
                             Err(error) => {
@@ -410,7 +410,7 @@ pub async fn handle_interactions(
                                 return StatusCode::OK.into_response();
                             }
                         };
-                        
+
                         let hackclub_start = std::time::Instant::now();
                         let non_player = match state
                             .client
@@ -437,7 +437,7 @@ pub async fn handle_interactions(
                                 return StatusCode::OK.into_response();
                             }
                         };
-                        
+
                         let alert_text = if existing_subscription {
                             Some("You are already subscribed to this person".to_string())
                         } else if non_player {
@@ -447,10 +447,10 @@ pub async fn handle_interactions(
                         } else {
                             None
                         };
-                        
+
                         view.blocks
                             .retain(|v| v.get("type") != Some(&json!("alert")));
-                        
+
                         if let Some(alert_text) = alert_text {
                             let alert_block = json!({
                                 "type": "alert",
@@ -463,7 +463,7 @@ pub async fn handle_interactions(
                             });
                             view.blocks.insert(0, alert_block);
                         }
-                        
+
                         let json = json!({
                             "view": {
                                 "type": "modal",
@@ -483,7 +483,7 @@ pub async fn handle_interactions(
                             "hash": view.hash,
                             "view_id": view.id
                         });
-                        
+
                         send_and_log_on_failure(
                             state
                                 .client
@@ -492,8 +492,8 @@ pub async fn handle_interactions(
                                 .json(&json),
                             "Updating the view after a user was selected",
                         )
-                            .await;
-                        
+                        .await;
+
                         StatusCode::OK.into_response()
                     } else {
                         error!("View not found when required for the user select block action");
@@ -509,8 +509,8 @@ pub async fn handle_interactions(
                         user.id,
                         value
                     )
-                        .fetch_optional(&state.sqlx_pool)
-                        .await;
+                    .fetch_optional(&state.sqlx_pool)
+                    .await;
                     logging::record_db_query_metric(
                         "subscriptions_exists_check_approval",
                         query_start,
@@ -544,7 +544,7 @@ pub async fn handle_interactions(
                     }
                     let dm_text: String;
                     let completed_text: String;
-                    
+
                     match &actions.action_id {
                         ActionId::DeclineSubscription { value } => {
                             info!(target_id = %user.id, subscriber_id = %value, "User declined a subscription request");
@@ -555,7 +555,7 @@ pub async fn handle_interactions(
                             completed_text = format!(
                                 "Successfully declined request to track join/leave updates for the hackclub minecraft server from <@{value}>"
                             );
-                            
+
                             let query_start = std::time::Instant::now();
                             let decline_delete_result = query!(
                         "DELETE FROM subscriptions WHERE target_id = $1 AND subscriber_id = $2",
@@ -587,7 +587,7 @@ pub async fn handle_interactions(
                             completed_text = format!(
                                 "Successfully notified <@{value}> that you have approved their request!"
                             );
-                            
+
                             let query_start = std::time::Instant::now();
                             let approve_update_result = query!(
                         "UPDATE subscriptions SET active = true WHERE target_id = $1 AND subscriber_id = $2",
@@ -612,11 +612,11 @@ pub async fn handle_interactions(
                         }
                         _ => unreachable!(),
                     }
-                    
+
                     let json = json!({
                         "users": value
                     });
-                    
+
                     let Ok(response) = state
                         .client
                         .post("https://slack.com/api/conversations.open")
@@ -630,11 +630,11 @@ pub async fn handle_interactions(
                         );
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     };
-                    
+
                     let Ok(response_bytes) = response.bytes().await else {
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     };
-                    
+
                     let Ok(json): serde_json::error::Result<OpenConversationResponse> =
                         serde_json::from_slice(&response_bytes)
                     else {
@@ -643,14 +643,14 @@ pub async fn handle_interactions(
                     if !json.ok {
                         error!("Slack conversations.open API returned a non-OK response");
                     }
-                    
+
                     let dm_channel = json.channel.id;
-                    
+
                     let json = json!({
                         "text": dm_text,
                         "channel": dm_channel
                     });
-                    
+
                     if send_and_log_on_failure_with_return(
                         state
                             .client
@@ -659,11 +659,11 @@ pub async fn handle_interactions(
                             .json(&json),
                         "Sending the DM to reply with the decision",
                     )
-                        .await
+                    .await
                     {
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
-                    
+
                     if let Some(response_url) = response_url {
                         send_and_log_on_failure(
                             state
@@ -676,14 +676,14 @@ pub async fn handle_interactions(
                                 })),
                             "Replacing the request DM with the completed message",
                         )
-                            .await;
+                        .await;
                     } else {
                         error!(
                             "URGENT ERROR. SLACK HAS CHANGED THEIR API RESPONSE SHAPE AND HAS NOT GIVEN A RESPONSE URL FOR RESPONDING TO THE BUTTON CLICK IN A MESSAGE. THIS HAS ORIGINATED FROM THE DECLINE/APPROVE SUBSCRIPTION BRANCH IN THE BLOCK ACTIONS MATCH STATEMENT."
                         );
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
-                    
+
                     StatusCode::OK.into_response()
                 }
                 ActionId::Other => {
@@ -711,7 +711,7 @@ pub async fn handle_interactions(
                             );
                         }
                     };
-                    
+
                     let users_select_state = match view_state.values.get("users_select") {
                         Some(user_select_state) => user_select_state,
                         None => {
@@ -722,7 +722,7 @@ pub async fn handle_interactions(
                             );
                         }
                     };
-                    
+
                     let target_user_id =
                         match users_select_state.get("users_select").map(|s| match s {
                             // this is cuz the object is first its block id: users_select and then its action id, which I aptly named... users_select
@@ -738,7 +738,7 @@ pub async fn handle_interactions(
                                 );
                             }
                         };
-                    
+
                     let query_start = std::time::Instant::now();
                     let existing_subscription = query!(
                     "SELECT 1 as exists FROM subscriptions WHERE subscriber_id = $1 AND target_id = $2",
@@ -756,7 +756,7 @@ pub async fn handle_interactions(
                             "error"
                         },
                     );
-                    
+
                     let existing_subscription = match existing_subscription {
                         Ok(row) => row.is_some(),
                         Err(error) => {
@@ -767,14 +767,14 @@ pub async fn handle_interactions(
                             );
                         }
                     };
-                    
+
                     if existing_subscription {
                         return build_inline_error_response(
                             "users_select",
                             "You are already subscribed to this user!",
                         );
                     }
-                    
+
                     let hackclub_start = std::time::Instant::now();
                     let response_from_hc_api = match state
                         .client
@@ -801,7 +801,7 @@ pub async fn handle_interactions(
                             );
                         }
                     };
-                    
+
                     if response_from_hc_api.status().eq(&StatusCode::NOT_FOUND) {
                         return build_inline_error_response(
                             "users_select",
@@ -814,7 +814,7 @@ pub async fn handle_interactions(
                             "Internal: The API returned an error when fetching information for this player.",
                         );
                     }
-                    
+
                     let minecraft_player_data: Vec<MinecraftPlayerData> = match response_from_hc_api
                         .json()
                         .await
@@ -828,13 +828,13 @@ pub async fn handle_interactions(
                             );
                         }
                     };
-                    
+
                     let mut mc_usernames = Vec::new();
-                    
+
                     for block in minecraft_player_data {
                         mc_usernames.push(block.nick.name)
                     }
-                    
+
                     let query_start = std::time::Instant::now();
                     let insert_user_result =
                         query!("INSERT INTO users (slack_id, mc_usernames) VALUES ($1, $2) ON CONFLICT (slack_id) DO NOTHING", target_user_id, &mc_usernames)
@@ -856,15 +856,15 @@ pub async fn handle_interactions(
                             "Internal error: Failed to insert user into database.",
                         );
                     }
-                    
+
                     let query_start = std::time::Instant::now();
                     let insert_subscription_result = query!(
                         "INSERT INTO subscriptions (subscriber_id, target_id) VALUES ($1, $2)",
                         user.id,
                         target_user_id
                     )
-                        .execute(&state.sqlx_pool)
-                        .await;
+                    .execute(&state.sqlx_pool)
+                    .await;
                     logging::record_db_query_metric(
                         "subscriptions_insert",
                         query_start,
@@ -881,14 +881,14 @@ pub async fn handle_interactions(
                             "Internal error: failed to create new subscription in database.",
                         );
                     }
-                    
+
                     info!(
                         "Added new subscription ({}) for {}",
                         target_user_id, user.id
                     );
-                    
+
                     let target_user_id = target_user_id.clone();
-                    
+
                     // Detached from the request: bind this request's Hub explicitly so the
                     // (possibly multi-second, due to retries) background work still reports
                     // breadcrumbs/errors under the right request context instead of whatever
@@ -933,7 +933,7 @@ pub async fn handle_interactions(
                                                 );
                                                 view
                                             }
-                                            
+
                                             Err(e) => {
                                                 counter("subscriptions.modal", 1)
                                                     .attribute("result", "error")
@@ -944,17 +944,17 @@ pub async fn handle_interactions(
                                                     error = ?e,
                                                     "An error occurred fetching and building the modal view"
                                                 );
-                                                
+
                                                 continue;
                                             }
                                         };
-                                        
+
                                         let json = json!({
                                             "hash": metadata.hash,
                                             "view_id": metadata.view_id,
                                             "view": modal_view
                                         });
-                                        
+
                                         send_and_log_on_failure(state.client.post("https://slack.com/api/views.update")
                                                                     .bearer_auth(state.bot_token.clone())
                                                                     .json(&json), "Updating the subscriptions modal view after submission of the new subscription modal").await

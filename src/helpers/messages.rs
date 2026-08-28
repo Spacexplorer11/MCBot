@@ -34,7 +34,11 @@ pub async fn send_message(json: &Value, client: &Client, bot_token: &str) -> Res
     }
 }
 
-pub async fn legacy_send_message(json: &Value, client: &Client, bot_token: &str) -> anyhow::Result<()> {
+pub async fn legacy_send_message(
+    json: &Value,
+    client: &Client,
+    bot_token: &str,
+) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let result = client
         .post("https://slack.com/api/chat.postMessage")
@@ -79,7 +83,7 @@ pub async fn send_dm_impl(
     let json = json!({
     "users": target_user_id
     });
-    
+
     debug!(target_user_id = %target_user_id, "Opening DM channel via conversations.open");
     let open_start = std::time::Instant::now();
     let response = client
@@ -101,9 +105,9 @@ pub async fn send_dm_impl(
             return Err(e);
         }
     };
-    
+
     trace!("Opened conversation with user {target_user_id}");
-    
+
     let json: OpenConversationResponse = response
         .json()
         .await
@@ -114,15 +118,15 @@ pub async fn send_dm_impl(
             "Slack conversations.open API returned a non-OK response"
         ));
     }
-    
+
     let channel = json.channel.id;
     debug!(%target_user_id, channel_id = %channel, "DM channel opened successfully");
-    
+
     let message = json!({
     "channel": channel,
     "text": text
     });
-    
+
     let message_start = std::time::Instant::now();
     let res = client
         .post("https://slack.com/api/chat.postMessage")
@@ -143,12 +147,12 @@ pub async fn send_dm_impl(
             return Err(e);
         }
     };
-    
+
     let json: Value = res
         .json()
         .await
         .context("Failed to convert the chat.postMessage response to json")?;
-    
+
     if json.get("ok") != Some(&json!(true)) {
         error!(
             %target_user_id,
@@ -187,7 +191,7 @@ pub async fn send_request_dm_impl(
     let json = json!({
     "users": target_user_id
     });
-    
+
     debug!(%target_user_id, "Opening DM channel via conversations.open");
     let open_start = std::time::Instant::now();
     let response = client
@@ -210,9 +214,9 @@ pub async fn send_request_dm_impl(
             return Err(e);
         }
     };
-    
+
     trace!("Opened conversation with user {target_user_id}");
-    
+
     let json: OpenConversationResponse = response
         .json()
         .await
@@ -223,10 +227,10 @@ pub async fn send_request_dm_impl(
             "Slack conversations.open API returned a non-OK response"
         ));
     }
-    
+
     let channel = json.channel.id;
     debug!(%target_user_id, channel_id = %channel, "DM channel opened successfully");
-    
+
     let blocks = json!([
     {
         "type": "header",
@@ -281,12 +285,12 @@ pub async fn send_request_dm_impl(
         ]
     }
     ]);
-    
+
     let message = json!({
     "channel": channel,
     "blocks": blocks
     });
-    
+
     let message_start = std::time::Instant::now();
     let res = client
         .post("https://slack.com/api/chat.postMessage")
@@ -307,12 +311,12 @@ pub async fn send_request_dm_impl(
             return Err(e);
         }
     };
-    
+
     let json: Value = res
         .json()
         .await
         .context("Failed to convert the chat.postMessage response to json")?;
-    
+
     if json.get("ok") != Some(&json!(true)) {
         error!(
             %target_user_id,

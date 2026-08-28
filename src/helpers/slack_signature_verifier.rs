@@ -19,7 +19,7 @@ pub async fn verify_slack_signature(
 ) -> Response {
     trace!("Received request to verify signature");
     let (parts, body) = request.into_parts();
-    
+
     let request_bytes = match axum::body::to_bytes(body, 1024 * 16).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -118,7 +118,7 @@ pub async fn verify_slack_signature(
                 .unwrap();
         }
     };
-    
+
     let request_string = match str::from_utf8(request_bytes.as_ref()) {
         Ok(s) => s,
         Err(error) => {
@@ -133,13 +133,13 @@ pub async fn verify_slack_signature(
                 .unwrap();
         }
     };
-    
+
     let basestring = format!("v0:{timestamp}:{request_string}");
-    
+
     let mut my_signature = HmacSha256::new_from_slice(secret.as_bytes())
         .expect("Whats the point of this error is HMAC can take a key of any size");
     my_signature.update(basestring.as_bytes());
-    
+
     let slack_signature = match slack_signature.strip_prefix("v0=") {
         Some(str) => match hex::decode(str) {
             Ok(hex) => hex,
@@ -167,7 +167,7 @@ pub async fn verify_slack_signature(
                 .unwrap();
         }
     };
-    
+
     match my_signature.verify_slice(&slack_signature) {
         Ok(..) => {
             counter("slack.signature.verification", 1)

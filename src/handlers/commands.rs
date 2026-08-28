@@ -1,7 +1,7 @@
 use super::AppState;
 use crate::Task::{Recipe, Subscriptions};
-use crate::handlers::recipes::validate_recipe;
 use crate::capture_task_context;
+use crate::handlers::recipes::validate_recipe;
 use axum::{
     Form, Json,
     extract::State,
@@ -46,7 +46,7 @@ pub async fn handle_command(
                 return Json(
                     json!({"response_type": "ephemeral", "text": "You didn't enter a recipe!"}),
                 )
-                    .into_response();
+                .into_response();
             }
             let (is_recipe_valid, assumption_text, recipe) = validate_recipe(
                 &payload.text,
