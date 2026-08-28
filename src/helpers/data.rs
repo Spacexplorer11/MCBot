@@ -62,10 +62,14 @@ pub async fn fetch_client_jar(client: &Client) -> ZipFileReader<BufReader<File>>
     client_jar_path.push("assets");
     client_jar_path.push("client.jar");
 
-    trace!(version_path = ?client_jar_version_path, jar_path = ?client_jar_path, "Checking local client.jar cache");
+    trace!(
+        ?client_jar_version_path,
+        ?client_jar_path,
+        "Checking local client.jar cache"
+    );
     match tokio::fs::read_to_string(&client_jar_version_path).await {
         Ok(version) => {
-            debug!(cached_version = %version.trim(), latest_version = %latest_version, "Read cached version file");
+            debug!(cached_version = %version.trim(), %latest_version, "Read cached version file");
             if version.trim() == *latest_version
                 && tokio::fs::metadata(&client_jar_path).await.is_ok()
             {
@@ -74,13 +78,13 @@ pub async fn fetch_client_jar(client: &Client) -> ZipFileReader<BufReader<File>>
                 );
                 version_valid = true;
             } else {
-                warn!(cached_version = %version.trim(), latest_version = %latest_version, "Cached client.jar is outdated, will re-fetch");
+                warn!(cached_version = %version.trim(), %latest_version, "Cached client.jar is outdated, will re-fetch");
                 info!("Initiated step 2 of fetching items (client.jar url)");
             }
         }
-        Err(e) => {
+        Err(error) => {
             warn!(
-                error = ?e,
+                ?error,
                 "An error occurred when reading the version.txt for client.jar. *This error may be expected*. On the first run an error is expected as no version.txt exists."
             )
         }
@@ -92,7 +96,7 @@ pub async fn fetch_client_jar(client: &Client) -> ZipFileReader<BufReader<File>>
         counter("client.jar.fetch", 1)
             .attribute("source", "network")
             .capture();
-        debug!(package_url = %package_url, "Fetching package metadata from Mojang (step 2)");
+        debug!(%package_url, "Fetching package metadata from Mojang (step 2)");
         let response =
             client.get(package_url).send().await.expect(
                 "An error occurred when fetching the package url (Step 2 of item fetching)",
@@ -107,7 +111,7 @@ pub async fn fetch_client_jar(client: &Client) -> ZipFileReader<BufReader<File>>
             .expect("Client jar url not a string???");
 
         info!("Step 2 complete, client.jar url successfully fetched");
-        info!(client_jar_url = %client_jar_url, "Initiated step 3 of fetching items (client.jar itself)");
+        info!(%client_jar_url, "Initiated step 3 of fetching items (client.jar itself)");
 
         let response = client
             .get(*client_jar_url)
@@ -155,9 +159,9 @@ pub async fn fetch_client_jar(client: &Client) -> ZipFileReader<BufReader<File>>
                     }
                 }
             }
-            Err(e) => {
+            Err(error) => {
                 warn!(
-                    error = ?e,
+                    ?error,
                     "An error occurred saving the client.jar to the local disk. The items will now only be in memory and will need to be redownloaded on restart."
                 )
             }

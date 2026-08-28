@@ -1,7 +1,9 @@
 use axum::{extract::Request, middleware::Next, response::Response};
-use sentry::integrations::tracing::EventFilter;
-use sentry::metrics::{counter, distribution};
-use sentry::protocol::Unit;
+use sentry::{
+    integrations::tracing::EventFilter,
+    metrics::{counter, distribution},
+    protocol::Unit,
+};
 use std::time::Instant;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
