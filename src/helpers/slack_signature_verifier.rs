@@ -22,8 +22,12 @@ pub async fn verify_slack_signature(
 
     let request_bytes = match axum::body::to_bytes(body, 1024 * 16).await {
         Ok(bytes) => bytes,
-        Err(e) => {
-            error!("Failed to read request body: {e}");
+        Err(error) => {
+            counter("slack.signature.verification", 1)
+                .attribute("result", "failure")
+                .attribute("reason", "body_read_error")
+                .capture();
+            error!(?error, "Failed to read request body");
             return Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body("Failed to read request body".into())
@@ -35,6 +39,10 @@ pub async fn verify_slack_signature(
             let ts = match ts.to_str() {
                 Ok(s) => s,
                 Err(..) => {
+                    counter("slack.signature.verification", 1)
+                        .attribute("result", "failure")
+                        .attribute("reason", "invalid_timestamp")
+                        .capture();
                     error!("Slack request timestamp header not a string");
                     return Response::builder()
                         .status(StatusCode::UNAUTHORIZED)
@@ -45,6 +53,10 @@ pub async fn verify_slack_signature(
             let ts = match ts.parse::<i64>() {
                 Ok(s) => s,
                 Err(..) => {
+                    counter("slack.signature.verification", 1)
+                        .attribute("result", "failure")
+                        .attribute("reason", "invalid_timestamp")
+                        .capture();
                     error!("Slack request timestamp header not a number");
                     return Response::builder()
                         .status(StatusCode::UNAUTHORIZED)
@@ -55,6 +67,10 @@ pub async fn verify_slack_signature(
             let now = Utc::now().timestamp();
             let allowed_skew = 60 * 5;
             if ts < now - allowed_skew || ts > now + allowed_skew {
+                counter("slack.signature.verification", 1)
+                    .attribute("result", "failure")
+                    .attribute("reason", "timestamp_expired")
+                    .capture();
                 error!("Slack request timestamp is too old");
                 return Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
@@ -64,6 +80,10 @@ pub async fn verify_slack_signature(
             ts.to_string()
         }
         None => {
+            counter("slack.signature.verification", 1)
+                .attribute("result", "failure")
+                .attribute("reason", "missing_timestamp_header")
+                .capture();
             error!("Slack request timestamp header not found");
             return Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
@@ -75,6 +95,10 @@ pub async fn verify_slack_signature(
         Some(sig) => match sig.to_str() {
             Ok(s) => s,
             Err(..) => {
+                counter("slack.signature.verification", 1)
+                    .attribute("result", "failure")
+                    .attribute("reason", "invalid_signature_format")
+                    .capture();
                 error!("Slack signature header not a string");
                 return Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
@@ -83,6 +107,10 @@ pub async fn verify_slack_signature(
             }
         },
         None => {
+            counter("slack.signature.verification", 1)
+                .attribute("result", "failure")
+                .attribute("reason", "missing_signature_header")
+                .capture();
             error!("Slack signature header not found");
             return Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
@@ -93,8 +121,12 @@ pub async fn verify_slack_signature(
 
     let request_string = match str::from_utf8(request_bytes.as_ref()) {
         Ok(s) => s,
-        Err(e) => {
-            error!("Slack request body not valid utf-8: {e}");
+        Err(error) => {
+            counter("slack.signature.verification", 1)
+                .attribute("result", "failure")
+                .attribute("reason", "invalid_body_encoding")
+                .capture();
+            error!(?error, "Slack request body not valid utf-8");
             return Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body("Slack request body not valid utf-8".into())
@@ -112,6 +144,10 @@ pub async fn verify_slack_signature(
         Some(str) => match hex::decode(str) {
             Ok(hex) => hex,
             Err(..) => {
+                counter("slack.signature.verification", 1)
+                    .attribute("result", "failure")
+                    .attribute("reason", "invalid_signature_format")
+                    .capture();
                 error!("Slack request signature not valid hex");
                 return Response::builder()
                     .status(StatusCode::FORBIDDEN)
@@ -120,6 +156,10 @@ pub async fn verify_slack_signature(
             }
         },
         None => {
+            counter("slack.signature.verification", 1)
+                .attribute("result", "failure")
+                .attribute("reason", "invalid_signature_format")
+                .capture();
             error!("Slack request signature didn't begin with v0=");
             return Response::builder()
                 .status(StatusCode::FORBIDDEN)
@@ -132,16 +172,18 @@ pub async fn verify_slack_signature(
         Ok(..) => {
             counter("slack.signature.verification", 1)
                 .attribute("result", "success")
+                .attribute("reason", "success")
                 .capture();
             trace!("Slack signature verification successful");
             next.run(Request::from_parts(parts, Body::from(request_bytes)))
                 .await
         }
-        Err(e) => {
+        Err(error) => {
             counter("slack.signature.verification", 1)
                 .attribute("result", "failure")
+                .attribute("reason", "hmac_mismatch")
                 .capture();
-            warn!("Slack signature verification failed: {e}");
+            warn!(?error, "Slack signature verification failed");
             Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body("Slack signature verification failed".into())

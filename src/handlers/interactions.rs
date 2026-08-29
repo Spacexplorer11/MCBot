@@ -12,7 +12,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sentry::{integrations::anyhow::capture_anyhow, metrics::counter};
+use sentry::{Hub, SentryFutureExt, integrations::anyhow::capture_anyhow, metrics::counter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::query;
@@ -140,11 +140,11 @@ pub async fn handle_interactions(
     trace!("Received an interaction at /slack/interactions");
     let interaction: SlackInteraction = match serde_json::from_str(&payload.payload) {
         Ok(i) => i,
-        Err(e) => {
+        Err(error) => {
             counter("slack.interaction", 1)
                 .attribute("action", "parse_error")
                 .capture();
-            error!("Failed to parse interaction payload: {e}");
+            error!(?error, "Failed to parse interaction payload");
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
@@ -198,18 +198,28 @@ pub async fn handle_interactions(
                         let id = match value.parse::<i64>() {
                             Ok(id) => id,
                             Err(..) => {
-                                error!("Failed to parse id as i64 (id = {value})");
+                                error!(%value, "Failed to parse id as i64");
                                 return StatusCode::OK.into_response();
                             }
                         };
-                        match query!(
+                        let query_start = std::time::Instant::now();
+                        let remove_subscription_result = query!(
                             "DELETE FROM subscriptions WHERE id = $1 and subscriber_id = $2",
                             id,
                             user.id
                         )
                         .execute(&state.sqlx_pool)
-                        .await
-                        {
+                        .await;
+                        logging::record_db_query_metric(
+                            "subscriptions_delete_by_id",
+                            query_start,
+                            if remove_subscription_result.is_ok() {
+                                "ok"
+                            } else {
+                                "error"
+                            },
+                        );
+                        match remove_subscription_result {
                             Ok(..) => {
                                 info!(user_id = %user.id, subscription_id = id, "Subscription removed from database");
                                 trace!("Successfully deleted row from database");
@@ -276,7 +286,7 @@ pub async fn handle_interactions(
                             "dispatch_action": true,
                             "hint": {
                                 "type": "plain_text",
-                                "text": "How this works: After selecting and confirming the user, a DM will be sent which asks for approval from the user you selected. Their decision will be relayed back to you via a DM and if it's a yes, you will automatically start receiving DM updates when they join/leave the hackclub minecraft server."
+                                "text": "How this works: After selecting and confirming the user, a DM will be sent which asks for approval from the user you selected. Their decision will be relayed back to you via a DM and if it's a yes, you will automatically start receiving DM updates when the join/leave the hackclub minecraft server."
                             },
                             "block_id": "users_select"
                         });
@@ -374,7 +384,8 @@ pub async fn handle_interactions(
                 }
                 ActionId::UserSelect { selected_user } => {
                     if let Some(view) = &mut view {
-                        debug!(user_id = %user.id, %selected_user, "User selected a target for subscription");
+                        debug!(user_id = %user.id, selected_user = %selected_user, "User selected a target for subscription");
+                        let query_start = std::time::Instant::now();
                         let existing_subscription = query!(
                     "SELECT 1 as exists FROM subscriptions WHERE subscriber_id = $1 AND target_id = $2",
                     user.id,
@@ -382,11 +393,20 @@ pub async fn handle_interactions(
                     )
                             .fetch_optional(&state.sqlx_pool)
                             .await;
+                        logging::record_db_query_metric(
+                            "subscriptions_exists_check_block_action",
+                            query_start,
+                            if existing_subscription.is_ok() {
+                                "ok"
+                            } else {
+                                "error"
+                            },
+                        );
 
                         let existing_subscription = match existing_subscription {
                             Ok(row) => row.is_some(),
-                            Err(e) => {
-                                error!("Failed to check for existing subscription: {e}");
+                            Err(error) => {
+                                error!(?error, "Failed to check for existing subscription");
                                 return StatusCode::OK.into_response();
                             }
                         };
@@ -483,15 +503,24 @@ pub async fn handle_interactions(
                 ActionId::DeclineSubscription { value }
                 | ActionId::ApproveSubscription { value } => {
                     debug!(%user.id, subscriber_id = %value, action = ?actions.action_id, "Processing subscription approval/decline action");
-                    if query!(
+                    let query_start = std::time::Instant::now();
+                    let approval_request_lookup = query!(
                         "SELECT * FROM subscriptions WHERE target_id = $1 AND subscriber_id = $2",
                         user.id,
                         value
                     )
                     .fetch_optional(&state.sqlx_pool)
-                    .await
-                    .is_ok_and(|result| result.is_none())
-                    {
+                    .await;
+                    logging::record_db_query_metric(
+                        "subscriptions_exists_check_approval",
+                        query_start,
+                        if approval_request_lookup.is_ok() {
+                            "ok"
+                        } else {
+                            "error"
+                        },
+                    );
+                    if approval_request_lookup.is_ok_and(|result| result.is_none()) {
                         return if let Some(response_url) = response_url {
                             send_and_log_on_failure(
                                 state
@@ -527,14 +556,24 @@ pub async fn handle_interactions(
                                 "Successfully declined request to track join/leave updates for the hackclub minecraft server from <@{value}>"
                             );
 
-                            if let Err(e) = query!(
+                            let query_start = std::time::Instant::now();
+                            let decline_delete_result = query!(
                         "DELETE FROM subscriptions WHERE target_id = $1 AND subscriber_id = $2",
                         user.id,
                         value
                     )
                                 .execute(&state.sqlx_pool)
-                                .await
-                            {
+                                .await;
+                            logging::record_db_query_metric(
+                                "subscriptions_delete_decline",
+                                query_start,
+                                if decline_delete_result.is_ok() {
+                                    "ok"
+                                } else {
+                                    "error"
+                                },
+                            );
+                            if let Err(e) = decline_delete_result {
                                 error!(error=?e, "An error occurred when deleting a subscription row from the database where the target_id was {} and the subscriber_id was {value}", user.id);
                                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                             }
@@ -549,14 +588,24 @@ pub async fn handle_interactions(
                                 "Successfully notified <@{value}> that you have approved their request!"
                             );
 
-                            if let Err(e) = query!(
+                            let query_start = std::time::Instant::now();
+                            let approve_update_result = query!(
                         "UPDATE subscriptions SET active = true WHERE target_id = $1 AND subscriber_id = $2",
                         user.id,
                         value
                     )
                                 .execute(&state.sqlx_pool)
-                                .await
-                            {
+                                .await;
+                            logging::record_db_query_metric(
+                                "subscriptions_activate_approve",
+                                query_start,
+                                if approve_update_result.is_ok() {
+                                    "ok"
+                                } else {
+                                    "error"
+                                },
+                            );
+                            if let Err(e) = approve_update_result {
                                 error!(error=?e, "An error occurred when setting a subscription to active from the database where the target_id was {} and the subscriber_id was {value}", user.id);
                                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                             }
@@ -690,6 +739,7 @@ pub async fn handle_interactions(
                             }
                         };
 
+                    let query_start = std::time::Instant::now();
                     let existing_subscription = query!(
                     "SELECT 1 as exists FROM subscriptions WHERE subscriber_id = $1 AND target_id = $2",
                     user.id,
@@ -697,11 +747,20 @@ pub async fn handle_interactions(
                     )
                         .fetch_optional(&state.sqlx_pool)
                         .await;
+                    logging::record_db_query_metric(
+                        "subscriptions_exists_check_view_submission",
+                        query_start,
+                        if existing_subscription.is_ok() {
+                            "ok"
+                        } else {
+                            "error"
+                        },
+                    );
 
                     let existing_subscription = match existing_subscription {
                         Ok(row) => row.is_some(),
-                        Err(e) => {
-                            error!("Failed to check for existing subscription: {e}");
+                        Err(error) => {
+                            error!(?error, "Failed to check for existing subscription");
                             return build_inline_error_response(
                                 "users_select",
                                 "Internal error: failed to check for existing subscription.",
@@ -749,7 +808,7 @@ pub async fn handle_interactions(
                             "This player does not play on the hackclub minecraft server. If this is incorrect please ask them to join the server, go through the linking flow and then try again. If this still persists please contact <@U08D22QNUVD>.",
                         );
                     } else if !response_from_hc_api.status().is_success() {
-                        error!(status=%response_from_hc_api.status(), %target_user_id, trigger_user=%user.id, "The hackclub API returned an non-404 error.");
+                        error!(status=%response_from_hc_api.status(), target=%target_user_id, trigger_user=%user.id, "The hackclub API returned an non-404 error.");
                         return build_inline_error_response(
                             "users_select",
                             "Internal: The API returned an error when fetching information for this player.",
@@ -776,27 +835,47 @@ pub async fn handle_interactions(
                         mc_usernames.push(block.nick.name)
                     }
 
-                    if let Err(e) =
+                    let query_start = std::time::Instant::now();
+                    let insert_user_result =
                         query!("INSERT INTO users (slack_id, mc_usernames) VALUES ($1, $2) ON CONFLICT (slack_id) DO NOTHING", target_user_id, &mc_usernames)
                             .execute(&state.sqlx_pool)
-                            .await
-                    {
-                        error!("Failed to insert user into database: {e}");
+                            .await;
+                    logging::record_db_query_metric(
+                        "users_insert",
+                        query_start,
+                        if insert_user_result.is_ok() {
+                            "ok"
+                        } else {
+                            "error"
+                        },
+                    );
+                    if let Err(error) = insert_user_result {
+                        error!(?error, "Failed to insert user into database");
                         return build_inline_error_response(
                             "users_select",
                             "Internal error: Failed to insert user into database.",
                         );
                     }
 
-                    if let Err(e) = query!(
+                    let query_start = std::time::Instant::now();
+                    let insert_subscription_result = query!(
                         "INSERT INTO subscriptions (subscriber_id, target_id) VALUES ($1, $2)",
                         user.id,
                         target_user_id
                     )
                     .execute(&state.sqlx_pool)
-                    .await
-                    {
-                        error!("Failed to insert new subscription: {e}");
+                    .await;
+                    logging::record_db_query_metric(
+                        "subscriptions_insert",
+                        query_start,
+                        if insert_subscription_result.is_ok() {
+                            "ok"
+                        } else {
+                            "error"
+                        },
+                    );
+                    if let Err(error) = insert_subscription_result {
+                        error!(?error, "Failed to insert new subscription");
                         return build_inline_error_response(
                             "users_select",
                             "Internal error: failed to create new subscription in database.",
@@ -810,6 +889,10 @@ pub async fn handle_interactions(
 
                     let target_user_id = target_user_id.clone();
 
+                    // Detached from the request: bind this request's Hub explicitly so the
+                    // (possibly multi-second, due to retries) background work still reports
+                    // breadcrumbs/errors under the right request context instead of whatever
+                    // Hub happens to be current on the executing thread once we've returned.
                     tokio::spawn(async move {
                         let mut last_err = None;
                         for attempt in 1..=5 {
@@ -819,7 +902,7 @@ pub async fn handle_interactions(
                                 &target_user_id,
                                 &user,
                             )
-                            .await
+                                .await
                             {
                                 Ok(_) => {
                                     debug!("Request DM delivered on attempt {attempt}");
@@ -839,7 +922,7 @@ pub async fn handle_interactions(
                                             metadata.page,
                                             user.id.clone(),
                                         )
-                                        .await
+                                            .await
                                         {
                                             Ok(view) => {
                                                 counter("subscriptions.modal", 1)
@@ -857,6 +940,7 @@ pub async fn handle_interactions(
                                                     .capture();
                                                 capture_anyhow(&e);
                                                 error!(
+                                                    already_reported = true,
                                                     error = ?e,
                                                     "An error occurred fetching and building the modal view"
                                                 );
@@ -896,14 +980,24 @@ pub async fn handle_interactions(
                             ?last_err,
                             "Approval DM failed after 5 attempts; removing subscription row for retry"
                         );
-                        if let Err(e) = query!(
+                        let query_start = std::time::Instant::now();
+                        let rollback_delete_result = query!(
                             "DELETE FROM subscriptions WHERE subscriber_id = $1 AND target_id = $2",
                             user.id,
                             target_user_id
                         )
-                        .execute(&state.sqlx_pool)
-                        .await
-                        {
+                            .execute(&state.sqlx_pool)
+                            .await;
+                        logging::record_db_query_metric(
+                            "subscriptions_delete_rollback",
+                            query_start,
+                            if rollback_delete_result.is_ok() {
+                                "ok"
+                            } else {
+                                "error"
+                            },
+                        );
+                        if let Err(e) = rollback_delete_result {
                             // Worst case: stuck row. Log everything needed to clean up manually.
                             error!(
                                 subscriber_id = %user.id,
@@ -912,7 +1006,7 @@ pub async fn handle_interactions(
                                 "MANUAL CLEANUP NEEDED: failed to remove stuck subscription row"
                             );
                         }
-                    });
+                    }.bind_hub(Hub::current()));
                 }
             }
             StatusCode::OK.into_response()

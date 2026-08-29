@@ -1,5 +1,5 @@
 use super::AppState;
-use crate::{Task::UpdateDMs, helpers::messages::send_message};
+use crate::{Task::UpdateDMs, capture_task_context, helpers::messages::send_message, logging};
 use axum::{
     Json,
     body::Body,
@@ -7,6 +7,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use sentry::integrations::anyhow::capture_anyhow;
 use sentry::metrics::counter;
 use serde::Deserialize;
 use serde_json::json;
@@ -88,13 +89,23 @@ pub async fn handle_event(
                                     let text = event.text.split_ascii_whitespace().map(|part| part.to_string()).collect::<Vec<String>>();
 
                                     let username = text.first().expect("This is a deterministic message. If this has changed then that is requires immediate attention.").replace('*', "");
+                                    let joining = event.text.contains("joined");
 
-                                    let slack_id = match query!(
+                                    debug!(timestamp = %event.ts, %username, joining, "Processing join/leave notification, looking up subscriber's slack id");
+
+                                    let query_start = std::time::Instant::now();
+                                    let user_lookup_result = query!(
                                         "SELECT * FROM users WHERE $1 = ANY(mc_usernames)",
                                         username
                                     )
                                         .fetch_optional(&state.sqlx_pool)
-                                        .await
+                                        .await;
+                                    logging::record_db_query_metric(
+                                        "users_lookup_by_mc_username_join_leave",
+                                        query_start,
+                                        if user_lookup_result.is_ok() { "ok" } else { "error" },
+                                    );
+                                    let slack_id = match user_lookup_result
                                     {
                                         Ok(row) => {
                                             if let Some(row) = row {
@@ -105,12 +116,17 @@ pub async fn handle_event(
                                             }
                                         },
                                         Err(error) => {
-                                            error!(?error, timestamp=%event.ts, text=%event.text, ?username, "MANUAL APOLOGY REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FOR THE JOIN/LEAVE FROM THE DATABASE.");
+                                            let error = anyhow::Error::from(error);
+                                            capture_anyhow(&error);
+                                            error!(already_reported = true, ?error, timestamp=%event.ts, text=%event.text, ?username, "MANUAL APOLOGY REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FOR THE JOIN/LEAVE FROM THE DATABASE.");
                                             return StatusCode::OK.into_response();
                                         }
                                     };
 
-                                    let subscribed_people = match query!(
+                                    debug!(timestamp = %event.ts, %username, %slack_id, "Found subscriber's slack id, looking up active subscriptions");
+
+                                    let query_start = std::time::Instant::now();
+                                    let subscribed_people_result = query!(
                                         "SELECT *
                                         FROM subscriptions
                                         WHERE target_id = $1
@@ -118,28 +134,40 @@ pub async fn handle_event(
                                         slack_id
                                     )
                                         .fetch_all(&state.sqlx_pool)
-                                        .await
-                                    {
+                                        .await;
+                                    logging::record_db_query_metric(
+                                        "subscriptions_lookup_by_target",
+                                        query_start,
+                                        if subscribed_people_result.is_ok() { "ok" } else { "error" },
+                                    );
+                                    let subscribed_people = match subscribed_people_result {
                                         Ok(rows) => rows.into_iter().map(|row| row.subscriber_id).collect::<Vec<String>>(),
                                         Err(error) => {
-                                            error!(?error, timestamp=%event.ts, text=%event.text, ?slack_id, ?username, "MANUAL APOLOGY REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FROM THE DATABASE.");
+                                            let error = anyhow::Error::from(error);
+                                            capture_anyhow(&error);
+                                            error!(already_reported = true, ?error, timestamp=%event.ts, text=%event.text, ?slack_id, ?username, "MANUAL APOLOGY REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FROM THE DATABASE.");
                                             return StatusCode::OK.into_response();
                                         }
                                     };
 
-                                    let joining = event.text.contains("joined");
-
+                                    let (hub, parent_span) = capture_task_context();
                                     match state.mpsc.try_send(
                                         UpdateDMs {
                                             people: subscribed_people,
                                             joining,
                                             slack_and_mc: (slack_id.clone(), username.to_string()),
                                             bot_token: state.bot_token.clone(),
-                                            queued_at: std::time::Instant::now()
+                                            queued_at: std::time::Instant::now(),
+                                            hub,
+                                            parent_span,
                                         }
                                     ) {
                                         Ok(..) => info!("Successfully sent the update DM's task to the mpsc queue"),
-                                        Err(error) => error!(?error, timestamp=%event.ts, text=%event.text, ?slack_id, ?username, "MANUAL APOLOGY REQUIRED. AN ERROR OCCURRED WHEN SENDING THE UPDATE DMS TASK TO THE MPSC QUEUE")
+                                        Err(error) => {
+                                            let error = anyhow::Error::from(error);
+                                            capture_anyhow(&error);
+                                            error!(already_reported = true, ?error, timestamp=%event.ts, text=%event.text, ?slack_id, ?username, "MANUAL APOLOGY REQUIRED. AN ERROR OCCURRED WHEN SENDING THE UPDATE DMS TASK TO THE MPSC QUEUE")
+                                        }
                                     }
 
                                     StatusCode::OK.into_response()
@@ -150,12 +178,21 @@ pub async fn handle_event(
                                     let old_nick = text.first().expect("This is a deterministic message. If this has changed then that is requires immediate attention.");
                                     let new_nick = text.last().expect("This is a deterministic message. If this has changed then that is requires immediate attention.");
 
-                                    let row = match query!(
+                                    debug!(timestamp = %event.ts, %old_nick, %new_nick, "Processing nickname change notification, looking up user by old mc username");
+
+                                    let query_start = std::time::Instant::now();
+                                    let nickname_row_result = query!(
                                         "SELECT * FROM users WHERE $1 = ANY(mc_usernames)",
                                         old_nick
                                     )
                                         .fetch_optional(&state.sqlx_pool)
-                                        .await
+                                        .await;
+                                    logging::record_db_query_metric(
+                                        "users_lookup_by_mc_username_nickname",
+                                        query_start,
+                                        if nickname_row_result.is_ok() { "ok" } else { "error" },
+                                    );
+                                    let row = match nickname_row_result
                                     {
                                         Ok(row) => {
                                             if let Some(row) = row {
@@ -166,7 +203,9 @@ pub async fn handle_event(
                                             }
                                         },
                                         Err(error) => {
-                                            error!(?error, timestamp=%event.ts, text=%event.text, ?old_nick, ?new_nick, "MANUAL INPUT REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FOR NICKNAME UPDATES FROM THE DATABASE.");
+                                            let error = anyhow::Error::from(error);
+                                            capture_anyhow(&error);
+                                            error!(already_reported = true, ?error, timestamp=%event.ts, text=%event.text, ?old_nick, ?new_nick, "MANUAL INPUT REQUIRED. AN ERROR OCCURRED WHEN FETCHING THE ROW FOR NICKNAME UPDATES FROM THE DATABASE.");
                                             return StatusCode::OK.into_response();
                                         }
                                     };
@@ -175,13 +214,26 @@ pub async fn handle_event(
                                     mc_usernames.retain(|user| user != old_nick);
                                     mc_usernames.push(new_nick.clone());
 
-                                    match query!("UPDATE users SET mc_usernames = $1 WHERE slack_id = $2", &mc_usernames, row.slack_id).execute(&state.sqlx_pool).await {
+                                    debug!(timestamp = %event.ts, %old_nick, %new_nick, slack = %row.slack_id, "Found user row, updating mc_usernames");
+
+                                    let query_start = std::time::Instant::now();
+                                    let nickname_update_result = query!("UPDATE users SET mc_usernames = $1 WHERE slack_id = $2", &mc_usernames, row.slack_id).execute(&state.sqlx_pool).await;
+                                    logging::record_db_query_metric(
+                                        "users_update_nickname",
+                                        query_start,
+                                        if nickname_update_result.is_ok() { "ok" } else { "error" },
+                                    );
+                                    match nickname_update_result {
                                         Ok(..) => {
                                             info!(slack=%row.slack_id,"Successfully updated nick from {old_nick} to {new_nick}.");
                                             counter("nickname.update", 1)
                                                 .capture();
                                         },
-                                        Err(e) => error!(error=?e, timestamp=%event.ts, text=%event.text, %old_nick, %new_nick, slack=%row.slack_id, "MANUAL INPUT REQUIRED. AN ERROR OCCURRED WHEN UPDATING THE DATABASE IN THE FINAL STEP OF UPDATING A NICKNAME.")
+                                        Err(e) => {
+                                            let e = anyhow::Error::from(e);
+                                            capture_anyhow(&e);
+                                            error!(already_reported = true, error=?e, timestamp=%event.ts, text=%event.text, %old_nick, %new_nick, slack=%row.slack_id, "MANUAL INPUT REQUIRED. AN ERROR OCCURRED WHEN UPDATING THE DATABASE IN THE FINAL STEP OF UPDATING A NICKNAME.")
+                                        }
                                     }
 
                                     StatusCode::OK.into_response()

@@ -1,5 +1,6 @@
 use super::AppState;
 use crate::Task::{Recipe, Subscriptions};
+use crate::capture_task_context;
 use crate::handlers::recipes::validate_recipe;
 use axum::{
     Form, Json,
@@ -56,6 +57,7 @@ pub async fn handle_command(
                 counter("recipe.request", 1)
                     .attribute("result", "valid")
                     .capture();
+                let (hub, parent_span) = capture_task_context();
                 match state.mpsc.try_send(Recipe {
                     item_name: recipe.clone(),
                     response_url: Some(payload.response_url),
@@ -64,6 +66,8 @@ pub async fn handle_command(
                     thread_ts: None,
                     bot_token: state.bot_token.clone(),
                     queued_at: std::time::Instant::now(),
+                    hub,
+                    parent_span,
                 }) {
                     Ok(..) => {
                         info!(
@@ -74,12 +78,12 @@ pub async fn handle_command(
                             json!({"response_type": "ephemeral", "text": format!("Gathering images and sewing 'em up, hang on a second! {assumption_text}")}),
                         ).into_response()
                     }
-                    Err(e) => {
+                    Err(error) => {
                         counter("task.queue.full", 1)
                             .attribute("task", "recipe")
                             .capture();
-                        error!("Error occurred sending task to generate image: {e}");
-                        match e {
+                        error!(?error, "Error occurred sending task to generate image");
+                        match error {
                             TrySendError::Full(..) => Json(
                                 json!({"response_type": "ephemeral", "text": "Too many people have requested recipes at the moment. Please try again later."}),
                             ).into_response(),
@@ -94,8 +98,9 @@ pub async fn handle_command(
                     .attribute("result", "invalid")
                     .capture();
                 warn!(
-                    "User {} tried to get recipe {recipe} but it was invalid",
-                    payload.user_id
+                    user_id = %payload.user_id,
+                    %recipe,
+                    "User tried to get an invalid recipe"
                 );
                 Json(
                     json!({"response_type": "ephemeral", "text": format!("Sorry your recipe {recipe} was invalid.")}),
@@ -103,22 +108,25 @@ pub async fn handle_command(
             }
         }
         "/mc-subs-config" => {
+            let (hub, parent_span) = capture_task_context();
             match state.mpsc.try_send(Subscriptions {
                 user_id: payload.user_id.clone(),
                 trigger_id: payload.trigger_id,
                 bot_token: state.bot_token.clone(),
                 queued_at: std::time::Instant::now(),
+                hub,
+                parent_span,
             }) {
                 Ok(..) => {
                     info!("Configuring updates for {}", payload.user_id);
                     StatusCode::OK.into_response()
                 }
-                Err(e) => {
+                Err(error) => {
                     counter("task.queue.full", 1)
                         .attribute("task", "subscriptions")
                         .capture();
-                    error!("Error occurred sending task to generate image: {e}");
-                    match e {
+                    error!(?error, "Error occurred sending task to generate image");
+                    match error {
                         TrySendError::Full(..) => Json(
                             json!({"response_type": "ephemeral", "text": "Too many people are using MCBot at the moment. Please try again later."}),
                         ).into_response(),

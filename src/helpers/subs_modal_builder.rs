@@ -1,3 +1,4 @@
+use crate::logging;
 use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -22,8 +23,9 @@ pub async fn fetch_and_build_subs_modal_view(
     page: i64,
     user_id: String,
 ) -> anyhow::Result<Value> {
-    trace!(%user_id, page, "Fetching subscriptions from database for modal view");
-    let subs = match query_as!(
+    trace!(user_id = %user_id, page = page, "Fetching subscriptions from database for modal view");
+    let query_start = std::time::Instant::now();
+    let subs_result = query_as!(
         Subscription,
         "SELECT s.id, s.active, s.target_id, u.mc_usernames
 FROM subscriptions AS s
@@ -35,14 +37,19 @@ LIMIT 6 OFFSET $2",
         page * 5
     )
     .fetch_all(sqlx_pool)
-    .await
-    {
+    .await;
+    logging::record_db_query_metric(
+        "subscriptions_fetch_page",
+        query_start,
+        if subs_result.is_ok() { "ok" } else { "error" },
+    );
+    let subs = match subs_result {
         Ok(subs) => {
-            debug!(%user_id, page, count = subs.len(), "Subscriptions fetched from database");
+            debug!(user_id = %user_id, page = page, count = subs.len(), "Subscriptions fetched from database");
             subs
         }
         Err(e) => {
-            error!(error = ?e, %user_id, page, "Failed to fetch subscriptions from database");
+            error!(error = ?e, user_id = %user_id, page = page, "Failed to fetch subscriptions from database");
             return Err(anyhow!("Failed to fetch subscriptions. Error: {e}"));
         }
     };

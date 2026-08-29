@@ -26,9 +26,9 @@ pub async fn send_message(json: &Value, client: &Client, bot_token: &str) -> Res
             logging::record_slack_api_metric("chat.postMessage", start, "ok");
             StatusCode::OK.into_response()
         }
-        Err(e) => {
+        Err(error) => {
             logging::record_slack_api_metric("chat.postMessage", start, "request_error");
-            error!("Error occurred sending message: {e}");
+            error!(?error, "Error occurred sending message");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -73,7 +73,7 @@ pub async fn send_dm(
 }
 
 #[tracing::instrument(name = "dm_sending_pipeline", skip(client, bot_token))]
-async fn send_dm_impl(
+pub async fn send_dm_impl(
     client: &Client,
     bot_token: &str,
     target_user_id: &str,
@@ -84,7 +84,7 @@ async fn send_dm_impl(
     "users": target_user_id
     });
 
-    debug!(%target_user_id, "Opening DM channel via conversations.open");
+    debug!(target_user_id = %target_user_id, "Opening DM channel via conversations.open");
     let open_start = std::time::Instant::now();
     let response = client
         .post("https://slack.com/api/conversations.open")
@@ -120,7 +120,7 @@ async fn send_dm_impl(
     }
 
     let channel = json.channel.id;
-    debug!(%target_user_id, %channel, "DM channel opened successfully");
+    debug!(%target_user_id, channel_id = %channel, "DM channel opened successfully");
 
     let message = json!({
     "channel": channel,
@@ -181,7 +181,7 @@ pub async fn send_request_dm(
     result
 }
 
-async fn send_request_dm_impl(
+pub async fn send_request_dm_impl(
     client: &Client,
     bot_token: &str,
     target_user_id: &str,

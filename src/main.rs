@@ -25,6 +25,7 @@ use helpers::{
     subs_modal_builder::fetch_and_build_subs_modal_view,
 };
 use reqwest::Client;
+use sentry::{Hub, SentryFutureExt, TransactionContext, TransactionOrSpan};
 use sentry::{
     integrations::{
         anyhow::capture_anyhow,
@@ -52,12 +53,16 @@ pub enum Task {
         thread_ts: Option<String>,
         bot_token: Arc<str>,
         queued_at: std::time::Instant,
+        hub: Arc<Hub>,
+        parent_span: Option<TransactionOrSpan>,
     },
     Subscriptions {
         user_id: String,
         trigger_id: String,
         bot_token: Arc<str>,
         queued_at: std::time::Instant,
+        hub: Arc<Hub>,
+        parent_span: Option<TransactionOrSpan>,
     },
     UpdateDMs {
         people: Vec<String>,
@@ -65,7 +70,31 @@ pub enum Task {
         slack_and_mc: (String, String),
         bot_token: Arc<str>,
         queued_at: std::time::Instant,
+        hub: Arc<Hub>,
+        parent_span: Option<TransactionOrSpan>,
     },
+}
+
+/// Captures the enqueuing request's Hub (for breadcrumb continuity) and its active
+/// span/transaction (so the task's later processing can continue the same Sentry trace
+/// instead of showing up as a disconnected event).
+fn capture_task_context() -> (Arc<Hub>, Option<TransactionOrSpan>) {
+    let hub = Hub::current();
+    let parent_span = hub.configure_scope(|scope| scope.get_span());
+    (hub, parent_span)
+}
+
+/// Transactions aren't sent to Sentry until `finish()` is called, and there's no `Drop`
+/// impl to do it automatically. This guarantees it happens on every exit path (including
+/// early `return`s inside a task's processing) without having to call it manually at each one.
+struct FinishTransactionOnDrop(Option<sentry::Transaction>);
+
+impl Drop for FinishTransactionOnDrop {
+    fn drop(&mut self) {
+        if let Some(transaction) = self.0.take() {
+            transaction.finish();
+        }
+    }
 }
 
 fn main() -> io::Result<()> {
@@ -142,7 +171,9 @@ fn main() -> io::Result<()> {
             {
                 Ok(()) => info!("All startup assets loaded successfully"),
                 Err(e) => {
-                    capture_anyhow(&e);
+                    // No capture_anyhow here: this is a fatal startup panic, and Sentry's panic
+                    // hook already reports it (the `{e:?}` panic message carries the full anyhow
+                    // chain), so an explicit capture would just double-report the same failure.
                     panic!("Failed to fetch recipes: {e:?}");
                 }
             }
@@ -183,6 +214,17 @@ fn main() -> io::Result<()> {
 
             tokio::spawn(async move {
                 while let Some(task) = queue_output.recv().await {
+                    // Fork this task's Hub from the *enqueuing request's* Hub (not the
+                    // background thread's own), so it inherits that request's breadcrumbs
+                    // (e.g. "signature verified", "command matched") instead of starting
+                    // blank, and so its breadcrumbs/events don't bleed into whatever other
+                    // tasks this long-lived background loop processes before or after it.
+                    let task_hub = match &task {
+                        Recipe { hub, .. } | Subscriptions { hub, .. } | UpdateDMs { hub, .. } => {
+                            hub.clone()
+                        }
+                    };
+                    async {
                     trace!("Received task in async thread");
 
                     match task {
@@ -194,7 +236,22 @@ fn main() -> io::Result<()> {
                             thread_ts,
                             bot_token,
                             queued_at,
+                            hub: _,
+                            parent_span,
                         } => {
+                            // Continues the enqueuing request's trace as a new, linked
+                            // transaction, so Sentry shows this async processing as connected
+                            // to the HTTP request that triggered it instead of a bare event.
+                            let transaction = sentry::start_transaction(
+                                TransactionContext::continue_from_span(
+                                    "task.recipe",
+                                    "queue.process",
+                                    parent_span,
+                                ),
+                            );
+                            Hub::current().configure_scope(|scope| scope.set_span(Some(transaction.clone().into())));
+                            let _txn_guard = FinishTransactionOnDrop(Some(transaction));
+
                             distribution("task.queue.delay", queued_at.elapsed().as_millis() as f64)
                                 .unit(Unit::Millisecond)
                                 .capture();
@@ -220,30 +277,40 @@ fn main() -> io::Result<()> {
                                     counter("recipe.processed", 1)
                                         .attribute("result", "error")
                                         .capture();
-                                    capture_anyhow(&error);
-                                    if error
+                                    let is_unsupported_recipe_type = error
                                         .to_string()
-                                        .eq("Unable to convert the json to MCRecipe type")
-                                    {
+                                        .eq("Unsupported recipe");
+                                    let is_rate_limited =
+                                        error.to_string().starts_with("Slack rate-limited");
+                                    if is_unsupported_recipe_type {
+                                        // Expected: user asked for a non-crafting item. No capture_anyhow — this isn't a bug.
                                         warn!("Recipe could not be processed because it was not a crafting recipe");
+                                    } else if is_rate_limited {
+                                        // Expected under load: Slack itself rejected the send.
+                                        // No capture_anyhow — this isn't a bug in our code.
+                                        warn!(%item_name, %user_id, "Recipe image failed to send because Slack rate-limited the request");
                                     } else {
-                                        error!(
-                                                                            ?error,
-                                                                            %item_name,
-                                                                            %user_id,
-                                                                            "Failed to fulfil recipe task processing pipeline"
-                                                                        );
+                                    capture_anyhow(&error);
+                                    error!(
+                                        already_reported = true,
+                                        ?error,
+                                        %item_name,
+                                        %user_id,
+                                        "Failed to fulfil recipe task processing pipeline"
+                                    );
                                     }
                                     warn!(%item_name, %user_id, "Sending user-friendly error message to Slack");
 
                                     if let Some(response_url) = response_url {
-                                        let polite_msg = if error
-                                            .to_string()
-                                            .eq("Unable to convert the json to MCRecipe type")
-                                        {
+                                        let polite_msg = if is_unsupported_recipe_type {
                                             json!({
                                                 "response_type": "ephemeral",
                                                 "text": "Uh oh, that type of recipe isn't supported! This bot currently only supports crafting recipes. If that was supposed to work, please contact <@U08D22QNUVD> or email akaal@akaalroop.com"
+                                            })
+                                        } else if is_rate_limited {
+                                            json!({
+                                                "response_type": "ephemeral",
+                                                "text": "Whoa, lots of people are using MCBot right now! Please try again in a moment."
                                             })
                                         } else {
                                             json!({
@@ -279,14 +346,17 @@ fn main() -> io::Result<()> {
                                             }
                                         }
                                     } else if let Some(thread_ts) = thread_ts {
-                                        let polite_msg = if error
-                                            .to_string()
-                                            .eq("Unable to convert the json to MCRecipe type")
-                                        {
+                                        let polite_msg = if is_unsupported_recipe_type {
                                             json!({
                                                 "channel": channel_id,
                                                 "thread_ts": thread_ts,
                                                 "text": "Uh oh, that type of recipe isn't supported! This bot currently only supports crafting recipes. If that was supposed to work, please contact <@U08D22QNUVD> or email akaal@akaalroop.com"
+                                            })
+                                        } else if is_rate_limited {
+                                            json!({
+                                                "channel": channel_id,
+                                                "thread_ts": thread_ts,
+                                                "text": "Whoa, lots of people are using MCBot right now! Please try again in a moment."
                                             })
                                         } else {
                                             json!({
@@ -340,7 +410,19 @@ fn main() -> io::Result<()> {
                             trigger_id,
                             bot_token,
                             queued_at,
+                            hub: _,
+                            parent_span,
                         } => {
+                            let transaction = sentry::start_transaction(
+                                TransactionContext::continue_from_span(
+                                    "task.subscriptions",
+                                    "queue.process",
+                                    parent_span,
+                                ),
+                            );
+                            Hub::current().configure_scope(|scope| scope.set_span(Some(transaction.clone().into())));
+                            let _txn_guard = FinishTransactionOnDrop(Some(transaction));
+
                             distribution("task.queue.delay", queued_at.elapsed().as_millis() as f64)
                                 .unit(Unit::Millisecond)
                                 .capture();
@@ -366,8 +448,8 @@ fn main() -> io::Result<()> {
                                         .capture();
                                     capture_anyhow(&error);
                                     error!(
-?error, "An error occurred fetching and building the modal view");
-                                    continue;
+already_reported = true, ?error, "An error occurred fetching and building the modal view");
+                                    return;
                                 }
                             };
 
@@ -393,7 +475,19 @@ fn main() -> io::Result<()> {
                             slack_and_mc,
                             bot_token,
                             queued_at,
+                            hub: _,
+                            parent_span,
                         } => {
+                            let transaction = sentry::start_transaction(
+                                TransactionContext::continue_from_span(
+                                    "task.update_dms",
+                                    "queue.process",
+                                    parent_span,
+                                ),
+                            );
+                            Hub::current().configure_scope(|scope| scope.set_span(Some(transaction.clone().into())));
+                            let _txn_guard = FinishTransactionOnDrop(Some(transaction));
+
                             distribution("task.queue.delay", queued_at.elapsed().as_millis() as f64)
                                 .unit(Unit::Millisecond)
                                 .capture();
@@ -410,16 +504,19 @@ fn main() -> io::Result<()> {
                                     let client = client.clone();
                                     let bot_token = bot_token.clone();
                                     let text_to_send = text_to_send.clone();
-                                    set.spawn(async move {
-                                        send_dm(&client, &bot_token, &person, &text_to_send).await
-                                    });
+                                    set.spawn(
+                                        async move {
+                                            send_dm(&client, &bot_token, &person, &text_to_send).await
+                                        }
+                                        .bind_hub(Hub::current()),
+                                    );
                                 }
 
                                 while let Some(result) = set.join_next().await {
                                     if let Ok(result) = result {
                                         if let Err(error) = result {
                                             capture_anyhow(&error);
-                                            error!(?error, "MANUAL APOLOGY REQUIRED! AN ERROR OCCURRED WHEN SENDING THE UPDATE DM");
+                                            error!(already_reported = true, ?error, "MANUAL APOLOGY REQUIRED! AN ERROR OCCURRED WHEN SENDING THE UPDATE DM");
                                         } else {
                                             info!("Update DM successfully sent!");
                                         }
@@ -430,27 +527,37 @@ fn main() -> io::Result<()> {
                                     Ok(..) => info!("Update DM successfully sent!"),
                                     Err(error) => {
                                         capture_anyhow(&error);
-                                        error!(?error, "MANUAL APOLOGY REQUIRED! AN ERROR OCCURRED WHEN SENDING THE UPDATE DM");
+                                        error!(already_reported = true, ?error, "MANUAL APOLOGY REQUIRED! AN ERROR OCCURRED WHEN SENDING THE UPDATE DM");
                                     }
                                 }
                             }
                         }
                     }
+                    }
+                    .bind_hub(Hub::new_from_top(&task_hub))
+                    .await;
                 }
             });
 
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+                let mut interval = tokio::time::interval(Duration::from_secs(5 * 60));
                 loop {
                     interval.tick().await;
 
                     let depth = task_queue_capacity - metrics_queue.capacity();
                     gauge("task.queue.depth", depth as f64).capture();
 
-                    match query!("SELECT count(*) AS count FROM subscriptions WHERE active = true")
-                        .fetch_one(&metrics_pool)
-                        .await
-                    {
+                    let query_start = std::time::Instant::now();
+                    let active_count_result =
+                        query!("SELECT count(*) AS count FROM subscriptions WHERE active = true")
+                            .fetch_one(&metrics_pool)
+                            .await;
+                    logging::record_db_query_metric(
+                        "subscriptions_active_count",
+                        query_start,
+                        if active_count_result.is_ok() { "ok" } else { "error" },
+                    );
+                    match active_count_result {
                         Ok(row) => {
                             gauge("subscriptions.count", row.count.unwrap_or(0) as f64)
                                 .attribute("status", "active")
@@ -462,12 +569,18 @@ fn main() -> io::Result<()> {
                         ),
                     }
 
-                    match query!(
+                    let query_start = std::time::Instant::now();
+                    let pending_count_result = query!(
                         "SELECT count(*) AS count FROM subscriptions WHERE active = false"
                     )
-                        .fetch_one(&metrics_pool)
-                        .await
-                    {
+                    .fetch_one(&metrics_pool)
+                    .await;
+                    logging::record_db_query_metric(
+                        "subscriptions_pending_count",
+                        query_start,
+                        if pending_count_result.is_ok() { "ok" } else { "error" },
+                    );
+                    match pending_count_result {
                         Ok(row) => {
                             gauge("subscriptions.count", row.count.unwrap_or(0) as f64)
                                 .attribute("status", "pending")
@@ -508,10 +621,13 @@ fn main() -> io::Result<()> {
             let uptime_router =
                 axum::Router::new().route("/status/uptime", get(uptime));
 
-            let router = axum::Router::new()
+            // Sentry Hub binding + transaction creation apply only to the Slack-facing routes.
+            // /status/uptime is excluded so a health-check monitor polling it doesn't burn a
+            // full Sentry transaction on every ping — it still gets the http.requests metric via
+            // the metric_response middleware applied to the whole router below.
+            let instrumented_router = axum::Router::new()
                 .merge(mcbot_router)
                 .merge(mcrecipes_router)
-                .merge(uptime_router)
                 .layer(
                     ServiceBuilder::new()
                         // Bind a Sentry Hub to each request so errors
@@ -524,7 +640,11 @@ fn main() -> io::Result<()> {
                             SentryHttpLayer::new()
                                 .enable_transaction(),
                         ),
-                )
+                );
+
+            let router = axum::Router::new()
+                .merge(instrumented_router)
+                .merge(uptime_router)
                 .layer(axum::middleware::from_fn(logging::metric_response));
 
             let listener = TcpListener::bind("0.0.0.0:4598")
