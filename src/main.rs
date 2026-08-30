@@ -35,6 +35,7 @@ use sentry::{
     protocol::Unit,
 };
 use serde_json::json;
+use sqlx::postgres::PgPoolOptions;
 use sqlx::query;
 use std::time::Duration;
 use std::{collections::HashMap, env, io, sync::Arc};
@@ -178,9 +179,10 @@ fn main() -> io::Result<()> {
                 }
             }
 
-            let sqlx_pool = sqlx::Pool::connect(
-                &env::var("DATABASE_URL").expect("DATABASE_URL NOT FOUND"),
-            )
+            let sqlx_pool = PgPoolOptions::new()
+                .max_connections(20)
+                .acquire_timeout(Duration::from_secs(5))
+                .connect(&env::var("DATABASE_URL").expect("DATABASE_URL NOT FOUND"))
                 .await
                 .expect("Failed to connect to database");
             info!("Connected to the PostgreSQL database");
