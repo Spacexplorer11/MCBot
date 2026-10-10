@@ -180,8 +180,11 @@ fn main() -> io::Result<()> {
             }
 
             let sqlx_pool = PgPoolOptions::new()
-                .max_connections(20)
-                .acquire_timeout(Duration::from_secs(5))
+                .max_connections(5)
+                .acquire_timeout(Duration::from_secs(10))
+                .idle_timeout(Duration::from_secs(60))
+                .max_lifetime(Duration::from_secs(10 * 60))
+                .test_before_acquire(true)
                 .connect(&env::var("DATABASE_URL").expect("DATABASE_URL NOT FOUND"))
                 .await
                 .expect("Failed to connect to database");
