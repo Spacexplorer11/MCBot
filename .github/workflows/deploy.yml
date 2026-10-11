@@ -19,7 +19,6 @@ jobs:
       REMOTE_BIN: /home/akaalroopsingh/mcbot/mcbot
       REMOTE_TMP_BIN: /home/akaalroopsingh/mcbot/mcbot_new
       ENV_FILE: /home/akaalroopsingh/mcbot/.env.deploy
-      REVISION: ${{ github.sha }}
     steps:
       - name: Checkout code
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -28,13 +27,18 @@ jobs:
           clean: false
           fetch-depth: 0
 
+      - name: Compute release name
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "REVISION=mcbot@${VERSION}+${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
+
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.97.0 --profile minimal
+        run: rustup toolchain install 1.99.0 --profile minimal
 
       - name: Build
         env:
           SQLX_OFFLINE: "true"
-        run: cargo +1.97.0 build --release
+        run: cargo +1.99.0 build --release
 
       - name: Sentry release and symbols
         env:
@@ -53,7 +57,9 @@ jobs:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           SENTRY_ORG: akaalroop-singh
           SENTRY_PROJECT: mcbot
-        run: sentry-cli releases deploys "$REVISION" new -e production
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          sentry-cli releases deploys "$REVISION" new -e production -n "v${VERSION} - ${REVISION:0:7}"
 
       - name: Deploy and restart
         run: |

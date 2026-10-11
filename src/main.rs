@@ -121,8 +121,6 @@ fn main() -> io::Result<()> {
                     Some(release.unwrap().into())
                 }
             })
-            .enable_logs(true)
-            .enable_metrics(true)
             .traces_sample_rate(1.0)
             .auto_session_tracking(true)
             .session_mode(sentry::SessionMode::Request),
