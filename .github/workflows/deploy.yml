@@ -26,12 +26,34 @@ jobs:
         with:
           persist-credentials: false
           clean: false
+	  fetch-depth: 0
 
       - name: Install Rust toolchain
         run: rustup toolchain install 1.97.0 --profile minimal
 
       - name: Build
+        env:
+          SQLX_OFFLINE: "true"
         run: cargo +1.97.0 build --release
+
+      - name: Sentry release and symbols
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: akaalroop-singh
+          SENTRY_PROJECT: mcbot
+        run: |
+          set -euo pipefail
+          sentry-cli debug-files upload --include-sources target/release/mcbot
+          sentry-cli releases new "$REVISION"
+          sentry-cli releases set-commits "$REVISION" --auto
+          sentry-cli releases finalize "$REVISION"
+
+      - name: Mark Sentry deploy
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: akaalroop-singh
+          SENTRY_PROJECT: mcbot
+        run: sentry-cli releases deploys "$REVISION" new -e production
 
       - name: Deploy and restart
         run: |
