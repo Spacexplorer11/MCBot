@@ -107,7 +107,7 @@ pub async fn handle_command(
                 ).into_response()
             }
         }
-        "/mc-subs-config" => {
+        "/mc-notify" => {
             let (hub, parent_span) = capture_task_context();
             match state.mpsc.try_send(Subscriptions {
                 user_id: payload.user_id.clone(),
