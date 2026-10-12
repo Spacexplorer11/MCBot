@@ -141,9 +141,7 @@ pub async fn handle_command(
             trace!("Received /mc-help command");
             counter("help.command", 1).capture();
             Json(
-                json!({"response_type": "ephemeral", "text": "Available commands/functions: \n
-                1. /mcrecipe [recipe] - ask for any crafting recipe!\
-                2. /mc-notify - opens a modal for you to configure your notifications!"}),
+                json!({"response_type": "ephemeral", "text": "Available commands/functions: \n1. /mcrecipe [recipe] - ask for any crafting recipe! \n2. /mc-notify - opens a modal for you to configure your notifications!"}),
             )
             .into_response()
         }
