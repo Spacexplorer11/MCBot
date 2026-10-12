@@ -137,6 +137,16 @@ pub async fn handle_command(
                 }
             }
         }
+        "/mc-help" => {
+            trace!("Received /mc-help command");
+            counter("help.command", 1).capture();
+            Json(
+                json!({"response_type": "ephemeral", "text": "Available commands/functions: \n
+                1. /mcrecipe [recipe] - ask for any crafting recipe!\
+                2. /mc-notify - opens a modal for you to configure your notifications!"}),
+            )
+            .into_response()
+        }
         _ => {
             warn!(
                 "User {} ran an unsupported command {}",
