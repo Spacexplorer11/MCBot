@@ -8,6 +8,7 @@ You can test this in [#akaalroop-bot-testing](https://hackclub.enterprise.slack.
 ## What commands/features are available:
 - `/mcrecipe [recipe]` - you can use this command to get the crafting recipe for any minecraft item, even super new ones!
 - `/mc-notify` - this opens a modal so you can configure notifications! You can add users and then receive instant DM's when they leave or join the hackclub minecraft server!
+- `/mc-help` - tells you about the available functions/commands!
 
 ## Anything else?
 This bot is now the backend for [@MCRecipes](https://github.com/spacexplorer11/mcrecipes) so if you do @MCRecipes \[item\] it will give you the recipe as well!
