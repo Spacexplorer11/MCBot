@@ -80,7 +80,7 @@ pub async fn handle_event(
                 .capture();
             trace!(event_type = ?event.event_type, ?event, "Received event");
             match event.event_type {
-                SlackEvents::AppMention => send_message(&json!({"channel": event.channel, "text": "Hi! I'm MCBot, made by <@U08D22QNUVD>! :) \nUse /mcrecipe to get crafting recipes!", "thread_ts": event.ts}), &state.client, &state.bot_token).await,
+                SlackEvents::AppMention => send_message(&json!({"channel": event.channel, "text": "Hi! I'm MCBot, made by <@U08D22QNUVD>! :) \nUse /mc-help to get find out what I can do!", "thread_ts": event.ts}), &state.client, &state.bot_token).await,
                 SlackEvents::Message => {
                     if let Some(bot_id) = event.bot_id {
                         if bot_id.to_uppercase().eq("B04SB2PQLS1") {
