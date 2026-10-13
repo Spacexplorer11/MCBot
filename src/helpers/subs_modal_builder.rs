@@ -58,7 +58,7 @@ LIMIT 6 OFFSET $2",
 
     let mut blocks: Vec<Value> = Vec::new();
 
-    blocks.push(json!({"type": "section", "text": {"type": "mrkdwn", "text": "Configure your update subscriptions below"}})); // Title
+    blocks.push(json!({"type": "section", "text": {"type": "mrkdwn", "text": "Configure your notifications below"}})); // Title
     blocks.push(json!({"type": "divider"}));
     blocks.push(json!({
         "type": "section",

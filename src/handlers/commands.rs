@@ -107,7 +107,7 @@ pub async fn handle_command(
                 ).into_response()
             }
         }
-        "/mc-subs-config" => {
+        "/mc-subs-config" | "/mc-notify" => {
             let (hub, parent_span) = capture_task_context();
             match state.mpsc.try_send(Subscriptions {
                 user_id: payload.user_id.clone(),
@@ -136,6 +136,14 @@ pub async fn handle_command(
                     }
                 }
             }
+        }
+        "/mc-help" => {
+            trace!("Received /mc-help command");
+            counter("help.command", 1).capture();
+            Json(
+                json!({"response_type": "ephemeral", "text": "Available commands/functions: \n1. /mcrecipe [recipe] - ask for any crafting recipe! \n2. /mc-notify - opens a modal for you to configure your notifications! \n3. /mc-help - sends this message!"}),
+            )
+            .into_response()
         }
         _ => {
             warn!(
