@@ -123,7 +123,8 @@ fn main() -> io::Result<()> {
             })
             .traces_sample_rate(1.0)
             .auto_session_tracking(true)
-            .session_mode(sentry::SessionMode::Request),
+            .session_mode(sentry::SessionMode::Request)
+            .in_app_include(vec!["mcbot"]),
     );
 
     debug!("Initialising logging");
